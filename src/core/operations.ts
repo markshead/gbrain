@@ -1500,6 +1500,14 @@ const list_pages: Operation = {
       description: 'Sort order. Default updated_desc (matches pre-v0.29). Options: updated_desc, updated_asc, created_desc, slug.',
     },
     include_deleted: { type: 'boolean', description: 'v0.26.5: include soft-deleted pages (default: false). Used by restore workflows and operator diagnostics.' },
+    // Surface the engine's slugPrefix filter (already implemented in
+    // PageFilters + every engine) at the op layer. Before this, the param was
+    // never forwarded, so a prefix arg was silently dropped and callers got the
+    // default updated_desc top-N regardless. `prefix` accepted as an alias.
+    slug_prefix: {
+      type: 'string',
+      description: 'Return only pages whose slug starts with this prefix (e.g. "wiki/people/"). Indexed range scan; LIKE metacharacters are treated literally.',
+    },
   },
   handler: async (ctx, p) => {
     // Whitelist the sort enum at the handler before passing to the engine.
@@ -1555,6 +1563,9 @@ const list_pages: Operation = {
       offset,
       includeDeleted: (p.include_deleted as boolean) === true,
       updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
+      slugPrefix: typeof p.slug_prefix === 'string' ? p.slug_prefix
+        : typeof p.prefix === 'string' ? p.prefix
+        : undefined,
       sort,
       ...scope,
     });

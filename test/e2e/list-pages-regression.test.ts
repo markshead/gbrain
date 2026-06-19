@@ -10,6 +10,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { operationsByName } from '../../src/core/operations.ts';
 
 let engine: PGLiteEngine;
 
@@ -90,5 +91,39 @@ describe('v0.29 — list_pages sort enum threads through the engine', () => {
     const rows = await engine.listPages({ limit: 10, sort: 'whatever' as any });
     // Engine PAGE_SORT_SQL[unknown] is undefined → falls back to default desc.
     expect(rows.length).toBeGreaterThan(0);
+  });
+});
+
+describe('list_pages OPERATION forwards slug_prefix (silent-drop regression)', () => {
+  // The engine has supported slugPrefix since Issue #13, but the list_pages OP
+  // handler never declared or forwarded it — so a prefix arg was silently
+  // dropped and callers got the default updated_desc top-N regardless. Guard the
+  // wiring at the op layer, not just the engine.
+  beforeAll(async () => {
+    for (let i = 0; i < 3; i++) {
+      await engine.putPage(`beta/doc-${i}`, { type: 'note', title: `Beta ${i}`, compiled_truth: 'body' });
+    }
+  });
+
+  // Handler only reads ctx.engine + source scope (none here → unscoped).
+  const ctx = () => ({ engine, remote: false } as any);
+
+  test('slug_prefix narrows to the matching subtree', async () => {
+    const rows = await operationsByName['list_pages'].handler(ctx(), { slug_prefix: 'alpha/', limit: 100 }) as any[];
+    expect(rows.length).toBe(5);
+    expect(rows.every((r: any) => r.slug.startsWith('alpha/'))).toBe(true);
+  });
+
+  test('prefix is accepted as an alias for slug_prefix', async () => {
+    const rows = await operationsByName['list_pages'].handler(ctx(), { prefix: 'beta/', limit: 100 }) as any[];
+    expect(rows.length).toBe(3);
+    expect(rows.every((r: any) => r.slug.startsWith('beta/'))).toBe(true);
+  });
+
+  test('omitting the prefix is unaffected (back-compat: returns all subtrees)', async () => {
+    const rows = await operationsByName['list_pages'].handler(ctx(), { limit: 100 }) as any[];
+    const slugs = rows.map((r: any) => r.slug);
+    expect(slugs.some((s: string) => s.startsWith('alpha/'))).toBe(true);
+    expect(slugs.some((s: string) => s.startsWith('beta/'))).toBe(true);
   });
 });
