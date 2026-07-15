@@ -854,6 +854,22 @@ export function queryBasenameIndex(idx: Map<string, string[]>, name: string): st
   if (!name || typeof name !== 'string') return [];
   const trimmed = name.trim();
   if (!trimmed) return [];
+  // Path-shaped name (`[[cl-crm/design-decisions]]`): the index is keyed by
+  // basename tails, so the full text can never be a key. Query by the tail,
+  // then keep only slugs whose trailing path segments match the whole name —
+  // exact slug or `.../<name>`. Conservative on purpose: a slash-qualified
+  // wikilink names a specific page; tail-only matches would fan out to every
+  // same-basename page (e.g. `[[cl-crm/index]]` must not hit every `*/index`).
+  if (trimmed.includes('/')) {
+    const tail = trimmed.slice(trimmed.lastIndexOf('/') + 1);
+    const candidates = idx.get(tail) ?? idx.get(tail.toLowerCase()) ?? idx.get(normalizeBasename(tail)) ?? [];
+    const lower = trimmed.toLowerCase();
+    const matched = candidates.filter((s) => {
+      const sl = s.toLowerCase();
+      return sl === lower || sl.endsWith(`/${lower}`);
+    });
+    return matched.sort(basenameSort);
+  }
   const hit = idx.get(trimmed) ?? idx.get(trimmed.toLowerCase()) ?? idx.get(normalizeBasename(trimmed));
   return hit ? [...hit].sort(basenameSort) : [];
 }

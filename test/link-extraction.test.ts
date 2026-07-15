@@ -1239,3 +1239,36 @@ describe("v0.18.0 migration v22 — links_resolution_type", () => {
   });
 });
 
+
+// Slash-qualified wikilinks ([[dir/slug]] outside DIR_PATTERN) must resolve
+// to the exact page (or path-suffix match), never fan out to every page
+// sharing the basename tail. Regression for the gbx consolidation finding:
+// [[cl-crm/design-decisions]] was silently dropped and [[cl-crm/index]]
+// would otherwise match every */index hub.
+describe('queryBasenameIndex path-shaped names', () => {
+  const { buildBasenameIndex, queryBasenameIndex } = require('../src/core/link-extraction.ts');
+  const idx = buildBasenameIndex([
+    'cl-crm/index', 'infra/index', 'xeric-libs/index', 'index',
+    'cl-crm/design-decisions', 'a/b/deep-page',
+  ]);
+
+  test('exact slash path resolves to exactly that page', () => {
+    expect(queryBasenameIndex(idx, 'cl-crm/design-decisions')).toEqual(['cl-crm/design-decisions']);
+    expect(queryBasenameIndex(idx, 'cl-crm/index')).toEqual(['cl-crm/index']);
+  });
+
+  test('path suffix matches deeper slugs, case-insensitively', () => {
+    expect(queryBasenameIndex(idx, 'b/deep-page')).toEqual(['a/b/deep-page']);
+    expect(queryBasenameIndex(idx, 'CL-CRM/Design-Decisions')).toEqual(['cl-crm/design-decisions']);
+  });
+
+  test('nonexistent slash path returns empty, not tail fan-out', () => {
+    expect(queryBasenameIndex(idx, 'nope/design-decisions')).toEqual([]);
+    expect(queryBasenameIndex(idx, 'nope/index')).toEqual([]);
+  });
+
+  test('bare basename behavior unchanged (still fans out across dirs)', () => {
+    expect(queryBasenameIndex(idx, 'design-decisions')).toEqual(['cl-crm/design-decisions']);
+    expect(queryBasenameIndex(idx, 'index').length).toBeGreaterThan(1);
+  });
+});
