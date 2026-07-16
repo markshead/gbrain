@@ -86,6 +86,8 @@ interface SourceListEntry {
   federated: boolean;
   page_count: number;
   last_sync_at: string | null;
+  /** v0.42.x — set only when the source's config declares a slug_prefix. */
+  slug_prefix?: string;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -119,7 +121,8 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   if (!id) {
     console.error(
       'Usage: gbrain sources add <id> [--path <path> | --url <https-url>] ' +
-        '[--name <display>] [--federated|--no-federated] [--clone-dir <path>]',
+        '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] ' +
+        '[--slug-prefix <prefix>]',
     );
     process.exit(2);
   }
@@ -129,6 +132,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   let displayName: string | undefined;
   let federated: boolean | null = null;
   let cloneDir: string | undefined;
+  let slugPrefix: string | undefined;
 
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
@@ -138,6 +142,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
     if (a === '--federated') { federated = true; continue; }
     if (a === '--no-federated') { federated = false; continue; }
     if (a === '--clone-dir') { cloneDir = args[++i]; continue; }
+    if (a === '--slug-prefix') { slugPrefix = args[++i]; continue; }
     console.error(`Unknown flag: ${a}`);
     process.exit(2);
   }
@@ -157,6 +162,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
     remoteUrl,
     federated,
     cloneDir,
+    slugPrefix,
   });
 
   const fed = isFederated(created.config);
@@ -175,6 +181,10 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
   console.log(
     `  federated: ${fed}${fed ? ' — appears in cross-source default search' : ' — only searched when explicitly named via --source'}`,
   );
+  const finalSlugPrefix = (created.config as Record<string, unknown>).slug_prefix;
+  if (typeof finalSlugPrefix === 'string' && finalSlugPrefix.length > 0) {
+    console.log(`  slug prefix: ${finalSlugPrefix}/ — synced pages mount under this namespace`);
+  }
 }
 
 // ── Subcommand: list ────────────────────────────────────────
@@ -190,6 +200,10 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
   const entries: SourceListEntry[] = [];
   for (const r of rows) {
     const pageCount = await countPages(engine, r.id);
+    // v0.42.x: surface config.slug_prefix when set. Display-only — read the
+    // raw value without validation so a (historically) bad value is still
+    // visible here rather than crashing the listing.
+    const rawPrefix = parseConfig(r.config).slug_prefix;
     entries.push({
       id: r.id,
       name: r.name,
@@ -197,6 +211,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       federated: isFederated(r.config),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
+      ...(typeof rawPrefix === 'string' && rawPrefix.length > 0 ? { slug_prefix: rawPrefix } : {}),
     });
   }
 
@@ -214,6 +229,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
     const sync = e.last_sync_at ? `last sync ${e.last_sync_at}` : 'never synced';
     console.log(`  ${e.id.padEnd(20)}  ${fedMark.padEnd(12)}  ${String(e.page_count).padStart(6)} pages  ${sync}`);
     if (e.local_path) console.log(`  ${' '.repeat(22)}${pathStr}`);
+    if (e.slug_prefix) console.log(`  ${' '.repeat(22)}slug prefix: ${e.slug_prefix}/`);
   }
   if (entries.length === 0) console.log('  (no sources registered)');
 }
@@ -1181,8 +1197,13 @@ function printHelp(): void {
   console.log(`gbrain sources — manage multi-source brain configuration (v0.26.5)
 
 Subcommands:
-  add <id> --path <p> [--name <n>] [--federated|--no-federated]
-                                    Register a new source.
+  add <id> --path <p> [--name <n>] [--federated|--no-federated] [--slug-prefix <prefix>]
+                                    Register a new source. --slug-prefix mounts
+                                    every synced page under <prefix>/ (e.g.
+                                    "news-server" → news-server/agents) instead
+                                    of the brain's top level. Prefix shape:
+                                    lowercase alnum-hyphen segments separated
+                                    by single slashes, no leading/trailing "/".
   list [--json]                     List registered sources with page counts.
   remove <id> [--confirm-destructive] [--dry-run]
                                     Permanently delete a source and all its data.

@@ -282,6 +282,14 @@ export async function importFromContent(
      * leave it unset → markers preserved (the gate + CLI own them).
      */
     remote?: boolean;
+    /**
+     * v0.42.x per-source slug namespacing. importFromContent does NOT apply
+     * this to `slug` (the caller — importFromFile — already resolved the
+     * final, prefixed slug). It is used only to derive doc↔impl code-link
+     * targets: a prefixed source's code pages live at
+     * `${slugPrefix}/<code-slug>`, so the edges must point there too.
+     */
+    slugPrefix?: string;
   } = {},
 ): Promise<ImportResult> {
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
@@ -843,7 +851,11 @@ export async function importFromContent(
       ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
       : undefined;
     for (const ref of codeRefs) {
-      const codeSlug = slugifyCodePath(ref.path);
+      // v0.42.x: within a slug-prefixed source, code pages mount under the
+      // prefix — point the edge at the prefixed code slug so it resolves.
+      const codeSlug = opts.slugPrefix
+        ? `${opts.slugPrefix}/${slugifyCodePath(ref.path)}`
+        : slugifyCodePath(ref.path);
       // Forward: markdown guide → code page (this guide documents that code)
       try {
         await tx.addLink(
@@ -918,6 +930,15 @@ export async function importFromFile(
      * never per file (codex perf finding #7).
      */
     activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
+    /**
+     * v0.42.x per-source slug namespacing: when set (from the source's
+     * `config.slug_prefix`), the final resolved slug is `${slugPrefix}/<slug>`.
+     * Applied AFTER all resolution logic (path-derived AND frontmatter
+     * fallback) so the prefix is uniform; the anti-spoof frontmatter check
+     * still compares UNprefixed slugs (files declare slugs relative to their
+     * repo, not the mount point). Unset = today's behavior exactly.
+     */
+    slugPrefix?: string;
   } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
@@ -938,6 +959,7 @@ export async function importFromFile(
     return importCodeFile(engine, relativePath, content, {
       noEmbed: opts.noEmbed,
       sourceId: opts.sourceId,
+      slugPrefix: opts.slugPrefix,
     });
   }
 
@@ -1001,6 +1023,15 @@ export async function importFromFile(
     };
   }
 
+  // v0.42.x per-source slug namespacing: prepend the source's slug_prefix
+  // AFTER all resolution logic (including the frontmatter-fallback branch) so
+  // the prefix applies uniformly. This is the ONLY place the prefix touches
+  // the markdown import path; the source_path stored below stays the raw
+  // repo-relative path, so DB lookups (resolveSlugsByPaths) are unaffected.
+  if (opts.slugPrefix) {
+    resolvedSlug = `${opts.slugPrefix}/${resolvedSlug}`;
+  }
+
   // Emit the dual-channel audit entry AFTER we know we're not going to
   // short-circuit, so we don't log noise for failed imports.
   if (usedFrontmatterFallback) {
@@ -1046,9 +1077,14 @@ export async function importCodeFile(
   engine: BrainEngine,
   relativePath: string,
   content: string,
-  opts: { noEmbed?: boolean; force?: boolean; sourceId?: string } = {},
+  opts: { noEmbed?: boolean; force?: boolean; sourceId?: string; slugPrefix?: string } = {},
 ): Promise<ImportResult> {
-  const slug = slugifyCodePath(relativePath);
+  // v0.42.x per-source slug namespacing: same uniform-prefix rule as the
+  // markdown path — the flattened code slug mounts under the prefix
+  // (`news-server/src-core-foo-ts`), matching resolveSlugForPath(path, prefix).
+  const slug = opts.slugPrefix
+    ? `${opts.slugPrefix}/${slugifyCodePath(relativePath)}`
+    : slugifyCodePath(relativePath);
   const lang = detectCodeLanguage(relativePath) || 'unknown';
   const title = `${relativePath} (${lang})`;
   const sourceId = opts.sourceId;
@@ -1506,6 +1542,12 @@ export interface ImportImageOptions {
    * with sourceId would TS-error on the importImageFile branch.
    */
   sourceId?: string;
+  /**
+   * v0.42.x per-source slug namespacing: when set, the image page slug is
+   * `${slugPrefix}/<relative-path>` so images from a prefixed source mount
+   * under the same namespace as its markdown/code pages.
+   */
+  slugPrefix?: string;
 }
 
 /** Module-level limiter so concurrent imports across files share the budget. */
@@ -1543,7 +1585,9 @@ export async function importImageFile(
   // Image slug includes the extension (otherwise foo.png and foo.jpg collide
   // and slugifyPath would already preserve it). Recompute with the file
   // extension preserved so the page slug is stable + collision-free.
-  const imageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
+  // v0.42.x: mounts under the source's slug_prefix when one is configured.
+  const rawImageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
+  const imageSlug = opts.slugPrefix ? `${opts.slugPrefix}/${rawImageSlug}` : rawImageSlug;
   const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 

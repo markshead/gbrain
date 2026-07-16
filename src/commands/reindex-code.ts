@@ -254,6 +254,17 @@ export async function runReindexCode(
   let offset = 0;
   let budgetExhausted: BudgetExhausted | null = null;
 
+  // v0.42.x per-source slug namespacing: when scoped to a source that has
+  // config.slug_prefix, thread it so re-import lands on the same (prefixed)
+  // slug instead of forking an unprefixed duplicate. Unscoped runs (no
+  // --source) match existing behavior: importCodeFile is called without a
+  // sourceId there too, so no prefix applies.
+  let sourceSlugPrefix: string | undefined;
+  if (opts.sourceId) {
+    const { getSourceSlugPrefix } = await import('../core/sources-load.ts');
+    sourceSlugPrefix = await getSourceSlugPrefix(engine, opts.sourceId);
+  }
+
   // F3: when --max-cost is set, run the body inside withBudgetTracker so
   // every gateway.embed() call inside importCodeFile composes with the cap.
   // On BudgetExhausted, we catch + persist what's been imported so far,
@@ -300,6 +311,7 @@ export async function runReindexCode(
                 noEmbed: opts.noEmbed,
                 force: opts.force,
                 sourceId: opts.sourceId,
+                slugPrefix: sourceSlugPrefix,
               });
               if (result.status === 'imported') reindexed++;
               else if (result.status === 'skipped') skipped++;

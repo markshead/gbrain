@@ -57,6 +57,7 @@ import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
 
 export type SourceOpErrorCode =
   | 'invalid_id'
+  | 'invalid_slug_prefix'
   | 'source_id_taken'
   | 'overlapping_path'
   | 'invalid_remote_url'
@@ -145,6 +146,14 @@ export interface AddSourceOpts {
    * Only honored when remoteUrl is set.
    */
   cloneDir?: string;
+  /**
+   * v0.42.x per-source slug namespacing: stored as `config.slug_prefix`.
+   * Every page synced/imported from this source mounts under
+   * `${slugPrefix}/` (e.g. prefix "news-server" → slug "news-server/agents").
+   * Must match SLUG_PREFIX_RE (lowercase alnum-hyphen segments, single
+   * slashes, no leading/trailing slash); invalid values are rejected loudly.
+   */
+  slugPrefix?: string;
 }
 
 export interface RemoveSourceOpts {
@@ -326,6 +335,22 @@ export async function addSource(
 ): Promise<SourceRow> {
   validateSourceId(opts.id);
 
+  // v0.42.x: validate the slug prefix BEFORE any clone/DB work so a bad
+  // value never lands in sources.config (sync fails loudly on invalid
+  // config, so rejecting at registration is the friendlier surface).
+  if (opts.slugPrefix !== undefined) {
+    const { validateSlugPrefix } = await import('./sync.ts');
+    try {
+      validateSlugPrefix(opts.slugPrefix, '--slug-prefix');
+    } catch (e) {
+      throw new SourceOpError(
+        'invalid_slug_prefix',
+        e instanceof Error ? e.message : String(e),
+        e,
+      );
+    }
+  }
+
   // Q4: pre-flight collision check before any clone work.
   const existing = await engine.executeRaw<{ id: string }>(
     `SELECT id FROM sources WHERE id = $1`,
@@ -403,6 +428,9 @@ export async function addSource(
     if (opts.federated !== null && opts.federated !== undefined) {
       config.federated = opts.federated;
     }
+    if (opts.slugPrefix !== undefined) {
+      config.slug_prefix = opts.slugPrefix;
+    }
     const displayName = opts.name ?? opts.id;
 
     try {
@@ -450,6 +478,9 @@ export async function addSource(
     const config: Record<string, unknown> = {};
     if (opts.federated !== null && opts.federated !== undefined) {
       config.federated = opts.federated;
+    }
+    if (opts.slugPrefix !== undefined) {
+      config.slug_prefix = opts.slugPrefix;
     }
     const displayName = opts.name ?? opts.id;
     await engine.executeRaw(

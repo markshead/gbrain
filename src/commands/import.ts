@@ -44,7 +44,21 @@ export interface RunImportResult {
 export async function runImport(
   engine: BrainEngine,
   args: string[],
-  opts: { commit?: string; strategy?: SyncStrategy; sourceId?: string; managedBookmark?: boolean } = {},
+  opts: {
+    commit?: string;
+    strategy?: SyncStrategy;
+    sourceId?: string;
+    managedBookmark?: boolean;
+    /**
+     * v0.42.x per-source slug namespacing. Programmatic callers
+     * (performFullSync) pass the already-resolved prefix. CLI callers can
+     * force one via `--slug-prefix <prefix>`; otherwise, when the import
+     * routes to a named source, that source's `config.slug_prefix` is
+     * honored automatically (so `gbrain import <dir> --source-id x` derives
+     * the same slugs as `gbrain sync --source x`).
+     */
+    slugPrefix?: string;
+  } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
@@ -143,6 +157,25 @@ export async function runImport(
       if (nudge) process.stderr.write(nudge + '\n');
     }
   }
+  // v0.42.x per-source slug namespacing. Precedence: --slug-prefix flag >
+  // opts.slugPrefix (programmatic, e.g. performFullSync) > the resolved
+  // source's config.slug_prefix > none. Validation is loud in all cases.
+  const slugPrefixIdx = args.indexOf('--slug-prefix');
+  const flagSlugPrefix = slugPrefixIdx !== -1 ? args[slugPrefixIdx + 1] : null;
+  let slugPrefix: string | undefined = flagSlugPrefix ?? opts.slugPrefix;
+  const { validateSlugPrefix } = await import('../core/sync.ts');
+  if (slugPrefix !== undefined) {
+    try {
+      validateSlugPrefix(slugPrefix, flagSlugPrefix ? '--slug-prefix' : 'slugPrefix');
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+  } else if (sourceId) {
+    const { getSourceSlugPrefix } = await import('../core/sources-load.ts');
+    slugPrefix = await getSourceSlugPrefix(engine, sourceId);
+  }
+
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
@@ -160,10 +193,11 @@ export async function runImport(
   const flagValues = new Set<number>();
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
   if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
+  if (slugPrefixIdx !== -1) flagValues.add(slugPrefixIdx + 1);
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--slug-prefix <prefix>] [--json]');
     process.exit(1);
   }
   const dir: string = dirArg;  // narrowed; survives closure capture
@@ -237,8 +271,8 @@ export async function runImport(
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
       const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
-        ? await importImageFile(eng, filePath, relativePath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, relativePath, { noEmbed, sourceId, activePack: importActivePack });
+        ? await importImageFile(eng, filePath, relativePath, { noEmbed, sourceId, slugPrefix })
+        : await importFile(eng, filePath, relativePath, { noEmbed, sourceId, activePack: importActivePack, slugPrefix });
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
