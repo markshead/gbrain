@@ -11,6 +11,8 @@ import {
   unsyncableReason,
   matchesAnyGlob,
   resolveSlugForPath,
+  slugPrefixFromSourceConfig,
+  validateSlugPrefix,
   unacknowledgedSyncFailures,
   acknowledgeFailures,
   loadSyncFailures,
@@ -741,6 +743,18 @@ export interface SyncOpts {
    * pre-v0.17 global-config path unchanged.
    */
   sourceId?: string;
+  /**
+   * v0.42.x per-source slug namespacing. Normally NOT set by callers:
+   * `performSyncInner` resolves it from the source row's
+   * `config.slug_prefix` when `sourceId` is set (validated; invalid config
+   * fails the sync loudly before any import work). When set, every slug this
+   * sync derives — imports (markdown/code/image) AND the path-derived
+   * delete/rename fallbacks — is mounted under `${slugPrefix}/`. Slugs
+   * resolved via `pages.source_path` DB lookup are returned as stored
+   * (they already carry the prefix from import time; never re-prefixed).
+   * Explicit values (internal/test callers) win over the source config.
+   */
+  slugPrefix?: string;
   /** Multi-repo: sync strategy override (markdown, code, auto). */
   strategy?: 'markdown' | 'code' | 'auto';
   /**
@@ -857,11 +871,16 @@ export interface SyncOpts {
  *
  * Returns the actual stored slug when source_path matches a row, or the
  * path-derived slug when there's no match (normal-case path-derived pages).
+ *
+ * v0.42.x: `slugPrefix` (the source's `config.slug_prefix`, when set) applies
+ * ONLY to the derived fallback — a stored slug already carries the prefix
+ * from import time, so re-prefixing it would double-apply.
  */
 export async function resolveSlugByPathOrSourcePath(
   engine: BrainEngine,
   path: string,
   sourceId?: string,
+  slugPrefix?: string,
 ): Promise<string> {
   // v0.41.19.0 (D8): when sourceId is set, delegate to the new batch
   // resolveSlugsByPaths so single-call and batched paths share one SQL
@@ -886,7 +905,7 @@ export async function resolveSlugByPathOrSourcePath(
     // Fall through — best-effort. Pre-migration brains or query errors
     // shouldn't break delete/rename for path-derived pages.
   }
-  return resolveSlugForPath(path);
+  return resolveSlugForPath(path, slugPrefix);
 }
 
 /**
@@ -1783,6 +1802,12 @@ function buildPartialResult(opts: {
 }
 
 async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<SyncResult> {
+  // v0.42.x per-source slug namespacing: an explicitly-passed prefix is
+  // validated up front regardless of source routing. The config-driven
+  // resolution (the normal path) lives in the sourceId block below.
+  if (opts.slugPrefix !== undefined) {
+    validateSlugPrefix(opts.slugPrefix, 'SyncOpts.slugPrefix');
+  }
   // v0.41.8.0 (D9 / #1342): phase breadcrumbs. The #1342 reporter saw
   // ZERO stderr output before their sync hang, which made the bug
   // impossible to triage. Mirror the existing `[gbrain phase] sync.git_pull`
@@ -1844,6 +1869,26 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       typeof cfgRows[0]?.config === 'string'
         ? (JSON.parse(cfgRows[0].config as string) as Record<string, unknown>)
         : ((cfgRows[0]?.config ?? {}) as Record<string, unknown>);
+
+    // v0.42.x per-source slug namespacing: resolve `config.slug_prefix` from
+    // the source row ONCE, up front, so every downstream slug derivation
+    // (imports + delete/rename fallbacks + performFullSync's runImport)
+    // agrees. Invalid config fails the sync loudly HERE — before any page is
+    // written to an unprefixed slug. Explicit opts.slugPrefix (internal/test
+    // callers) wins over the source config. NOTE: the `opts` reassignment
+    // happens at the END of this block (after the remoteUrl handling) so the
+    // `opts.sourceId` narrowing the rest of the block relies on stays intact.
+    // Read the prefix through parseSourceConfig (#2829/#3334's bounded
+    // unwrap), NOT the single-layer `cfg` above: a historically re-wrapped
+    // config would make `cfg` a bare string and silently drop the prefix —
+    // exactly the fail-quiet this feature is built to avoid.
+    const cfgSlugPrefix = opts.slugPrefix === undefined
+      ? slugPrefixFromSourceConfig(
+          (await import('../core/sources-load.ts')).parseSourceConfig(cfgRows[0]?.config),
+          `source "${opts.sourceId}" config.slug_prefix`,
+        )
+      : undefined;
+
     const remoteUrl = typeof cfg.remote_url === 'string' ? cfg.remote_url : null;
     if (remoteUrl) {
       const ownSrc = {
@@ -1887,6 +1932,60 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           );
       }
     }
+
+    // A slug_prefix is meant to be chosen at `sources add` time and left
+    // alone. If it is added (or changed) after the source already has pages,
+    // slugs FORK: existing rows keep their stored slug (delete/rename resolve
+    // them through pages.source_path and must never be re-prefixed), while
+    // any re-imported file lands on the new prefixed slug — leaving a stale
+    // duplicate behind. There is no supported CLI surface to mutate the
+    // prefix, so this only happens via a hand-edited config, but it is
+    // silent, so say it out loud. Best-effort: a failed probe must never
+    // block a sync.
+    //
+    // Two deliberate narrowings, both from adversarial review:
+    //   - `source_path IS NOT NULL` — only FILE-BACKED rows can drift. A
+    //     `put_page` / MCP row in the same source legitimately lives outside
+    //     the mount and is not evidence of a changed prefix; counting those
+    //     made the warning fire on every sync forever, which trains operators
+    //     to ignore it (and with it the real drift).
+    //   - `LIMIT` + "N+" instead of `COUNT(*)` — `NOT LIKE` cannot use the
+    //     (source_id, slug) index, so an unbounded count scans every live row
+    //     of the source on every sync for a best-effort stderr line.
+    // Known limitation (not fixable with a LIKE probe): narrowing a prefix to
+    // one of its own ancestors — `repos/news` → `repos` — leaves every old
+    // slug still matching `repos/%`, so this cannot detect it. Detecting that
+    // needs the prefix the source was populated under to be persisted.
+    if (cfgSlugPrefix) {
+      try {
+        const PROBE_LIMIT = 5;
+        const drift = await engine.executeRaw<{ slug: string }>(
+          `SELECT slug FROM pages
+             WHERE source_id = $1 AND deleted_at IS NULL AND source_path IS NOT NULL
+               AND slug NOT LIKE $2 ESCAPE '\\'
+             LIMIT ${PROBE_LIMIT + 1}`,
+          [opts.sourceId, cfgSlugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '/%'],
+        );
+        if (drift.length > 0) {
+          const count = drift.length > PROBE_LIMIT ? `${PROBE_LIMIT}+` : String(drift.length);
+          const examples = drift.slice(0, 3).map(r => r.slug).join(', ');
+          serr(
+            `[gbrain] WARNING: source "${opts.sourceId}" declares slug_prefix ` +
+            `"${cfgSlugPrefix}" but ${count} file-backed page(s) are NOT under it ` +
+            `(e.g. ${examples}). The prefix looks like it was added or changed ` +
+            `after this source was populated; re-imported files will land on ` +
+            `prefixed slugs and leave the un-prefixed rows behind as duplicates. ` +
+            `Pick the prefix at 'gbrain sources add' time, or re-sync the source ` +
+            `from empty.`,
+          );
+        }
+      } catch { /* best-effort probe — never block a sync */ }
+    }
+
+    // Adopt the config-resolved slug prefix (see comment above). Last
+    // statement in this block by design — reassigning `opts` invalidates the
+    // `opts.sourceId` narrowing everything above depends on.
+    if (cfgSlugPrefix) opts = { ...opts, slugPrefix: cfgSlugPrefix };
   }
 
   // #753/#774: discover the git root instead of requiring `.git` at repoPath
@@ -2390,7 +2489,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // pages every time their materialized file landed in a commit.
     const reason = unsyncableReason(path, syncOpts);
     if (reason === 'metafile' || reason === 'pruned-dir') continue;
-    const slug = await resolveSlugByPathOrSourcePath(engine, path, opts.sourceId);
+    const slug = await resolveSlugByPathOrSourcePath(engine, path, opts.sourceId, opts.slugPrefix);
     try {
       const existing = await engine.getPage(slug, pageOpts);
       if (existing) {
@@ -2713,7 +2812,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           // semantics.
           pathSlugMap = new Map();
         }
-        const slugs = batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p));
+        const slugs = batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p, opts.slugPrefix));
 
         // Phase B: batch delete (1 round-trip per batch).
         try {
@@ -2759,7 +2858,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           progress.finish();
           return await partial('timeout');
         }
-        const slug = await resolveSlugByPathOrSourcePath(engine, path, undefined);
+        const slug = await resolveSlugByPathOrSourcePath(engine, path, undefined, opts.slugPrefix);
         try {
           await engine.deletePage(slug, deleteOpts);
           pagesAffected.push(slug);
@@ -2818,7 +2917,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           m = new Map();
         }
         for (const p of batch) {
-          fromSlugByPath.set(p, m.get(p) ?? resolveSlugForPath(p));
+          fromSlugByPath.set(p, m.get(p) ?? resolveSlugForPath(p, opts.slugPrefix));
         }
       }
     }
@@ -2832,10 +2931,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         return await partial('timeout');
       }
       const oldSlug = opts.sourceId
-        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
-        : await resolveSlugByPathOrSourcePath(engine, from, undefined);
+        ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from, opts.slugPrefix))
+        : await resolveSlugByPathOrSourcePath(engine, from, undefined, opts.slugPrefix);
       // The new path doesn't yet have a row, so resolve from path only.
-      const newSlug = resolveSlugForPath(to);
+      const newSlug = resolveSlugForPath(to, opts.slugPrefix);
       try {
         await engine.updateSlug(oldSlug, newSlug, renameOpts);
       } catch {
@@ -2854,7 +2953,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       const filePath = join(gitContextRoot, to);
       if (existsSync(filePath) && isPathSafe(filePath, gitContextRoot)) {
         try {
-          const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+          const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack, slugPrefix: opts.slugPrefix });
           if (result.status === 'imported') chunksCreated += result.chunks;
           else if (result.status === 'skipped' && (result as { error?: string }).error) {
             failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
@@ -3061,7 +3160,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // 'default' was applied even for non-default sources, fabricating
         // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
         const result = await observed(pacer, () =>
-          importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
+          importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack, slugPrefix: opts.slugPrefix }));
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);
@@ -3605,6 +3704,10 @@ async function performFullSync(
     sourceId: opts.sourceId,
     exclude: opts.exclude,
     slugRoot,
+    // v0.42.x: performSyncInner already resolved (and validated) the source's
+    // config.slug_prefix into opts; thread it so the full-walk import derives
+    // the same prefixed slugs as the incremental path.
+    slugPrefix: opts.slugPrefix,
     // issue #1939: performFullSync owns the failure ledger + bookmark via the
     // shared gate below; don't let runImport double-record or write its own.
     managedBookmark: true,

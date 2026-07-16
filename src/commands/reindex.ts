@@ -187,6 +187,21 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   const BATCH = 100;
   const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
 
+  // v0.42.x per-source slug namespacing: the disk-backed re-import path below
+  // re-derives the slug from source_path, so a source with config.slug_prefix
+  // must thread it — otherwise reindex would fork an UNprefixed duplicate of
+  // every prefixed page. Lazy per-source cache (one config read per source
+  // per run). The DB-backed branch re-imports by the stored slug (already
+  // prefixed) and needs nothing.
+  const slugPrefixCache = new Map<string, string | undefined>();
+  async function slugPrefixFor(sid: string): Promise<string | undefined> {
+    if (!slugPrefixCache.has(sid)) {
+      const { getSourceSlugPrefix } = await import('../core/sources-load.ts');
+      slugPrefixCache.set(sid, await getSourceSlugPrefix(engine, sid));
+    }
+    return slugPrefixCache.get(sid);
+  }
+
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
     const batchSize = Math.min(BATCH, remaining);
@@ -217,6 +232,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
                 sourceId: row.source_id,
                 inferFrontmatter: false,
                 forceRechunk: true,
+                slugPrefix: await slugPrefixFor(row.source_id),
               });
               reindexed++;
               return;

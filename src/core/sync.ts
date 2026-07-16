@@ -494,6 +494,60 @@ export function resolveSlugForPath(filePath: string, repoPrefix?: string): strin
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Per-source slug prefix (sources.config.slug_prefix)
+// ─────────────────────────────────────────────────────────────────
+//
+// A source may declare `config.slug_prefix = "news-server"` so every page it
+// syncs mounts under that namespace (`news-server/agents`) instead of
+// polluting the brain's top level. The prefix is applied ONCE, at slug
+// derivation time (importFromFile / importCodeFile and the path-derived
+// delete/rename fallbacks in commands/sync.ts). Slugs resolved from the DB
+// (pages.source_path lookups) already carry the prefix and are never
+// re-prefixed.
+
+/**
+ * Valid slug prefix: one or more lowercase alnum-hyphen segments separated by
+ * single slashes. No leading/trailing slash, no uppercase, no empty segments.
+ * Examples: "news-server", "repos/news-server".
+ */
+export const SLUG_PREFIX_RE = /^[a-z0-9][a-z0-9-]*(\/[a-z0-9][a-z0-9-]*)*$/;
+
+/**
+ * Validate a slug prefix; returns it unchanged when valid, throws a loud,
+ * actionable Error otherwise. `context` names where the bad value came from
+ * (e.g. `source "news-server" config.slug_prefix`).
+ */
+export function validateSlugPrefix(prefix: string, context = 'slug_prefix'): string {
+  if (!SLUG_PREFIX_RE.test(prefix)) {
+    throw new Error(
+      `Invalid ${context}: "${prefix}". Must be lowercase alnum-hyphen segments ` +
+      `separated by single slashes, with no leading/trailing slash ` +
+      `(e.g. "news-server" or "repos/news-server").`,
+    );
+  }
+  return prefix;
+}
+
+/**
+ * Extract + validate `slug_prefix` from a parsed `sources.config` object.
+ * Returns undefined when unset (the default for every existing source —
+ * behavior is bit-for-bit unchanged). Throws on any present-but-invalid
+ * value (wrong type, empty string, bad shape) — fail loudly rather than
+ * silently importing to unprefixed slugs.
+ */
+export function slugPrefixFromSourceConfig(
+  config: Record<string, unknown>,
+  context = 'config.slug_prefix',
+): string | undefined {
+  const raw = config.slug_prefix;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') {
+    throw new Error(`Invalid ${context}: expected a string, got ${typeof raw}.`);
+  }
+  return validateSlugPrefix(raw, context);
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Sync failure ledger — moved to ./sync-failure-ledger.ts (issue #1939)
 // ─────────────────────────────────────────────────────────────────
 //

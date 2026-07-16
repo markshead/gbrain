@@ -99,8 +99,8 @@ export async function writePageThrough(
     //      git repo (the reported bug). Skip instead.
     let filePath: string;
     let writeRoot: string;
-    const srcRows = await engine.executeRaw<{ local_path: string | null }>(
-      `SELECT local_path FROM sources WHERE id = $1`,
+    const srcRows = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
+      `SELECT local_path, config FROM sources WHERE id = $1`,
       [sourceId],
     );
     const sourceLocalPath = srcRows[0]?.local_path ?? null;
@@ -108,7 +108,30 @@ export async function writePageThrough(
       if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
         return { written: false, skipped: 'repo_not_found' };
       }
-      filePath = join(sourceLocalPath, `${slug}.md`);
+      // v0.42.x per-source slug namespacing: for a source with
+      // `config.slug_prefix`, the STORED slug is `${prefix}/<repo-relative
+      // path>` but the file on disk lives at the repo-relative path (that is
+      // what `pages.source_path` holds, and what the importer reads back).
+      // Writing `${slug}.md` would mirror the page into a `<prefix>/`
+      // directory INSIDE the synced tree, and the next full sync would
+      // re-import that artifact under a DOUBLED prefix
+      // (`news-server/news-server/agents/foo`) — silently, once per
+      // put+commit+sync cycle. Strip the mount point so the mirror round-trips.
+      // Only this branch needs it: the `sync.repo_path` branch below writes
+      // under `.sources/<id>/`, outside any synced working tree.
+      let repoRelSlug = slug;
+      try {
+        const { parseSourceConfig } = await import('./sources-load.ts');
+        const { slugPrefixFromSourceConfig } = await import('./sync.ts');
+        const prefix = slugPrefixFromSourceConfig(parseSourceConfig(srcRows[0]?.config));
+        if (prefix && slug.startsWith(`${prefix}/`)) {
+          repoRelSlug = slug.slice(prefix.length + 1);
+        }
+      } catch {
+        // Unreadable / invalid prefix config: fall back to the slug path
+        // (prior behavior). The containment check below still applies.
+      }
+      filePath = join(sourceLocalPath, `${repoRelSlug}.md`);
       writeRoot = sourceLocalPath;
     } else {
       const repoPath = await engine.getConfig('sync.repo_path');

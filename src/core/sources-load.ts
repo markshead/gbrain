@@ -184,6 +184,26 @@ export async function fetchSource(
   }
 }
 
+/**
+ * Load + validate a source's `config.slug_prefix` (v0.42.x per-source slug
+ * namespacing). Returns undefined when the source doesn't exist or has no
+ * prefix configured (the default — zero behavior change). Throws loudly on a
+ * present-but-invalid value so a typo'd prefix can't silently import pages to
+ * unprefixed slugs.
+ */
+export async function getSourceSlugPrefix(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<string | undefined> {
+  const { slugPrefixFromSourceConfig } = await import('./sync.ts');
+  const row = await fetchSource(engine, sourceId);
+  if (!row) return undefined;
+  return slugPrefixFromSourceConfig(
+    parseSourceConfig(row.config),
+    `source "${sourceId}" config.slug_prefix`,
+  );
+}
+
 /** Driver-tolerant 42703 detector. Mirrors src/core/utils.ts pattern. */
 function isUndefinedColumnError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;

@@ -66,6 +66,19 @@ export async function runImport(
      * `wiki/page1` consistently across full and incremental sync.
      */
     slugRoot?: string;
+    /**
+     * v0.42.x per-source slug namespacing. Programmatic callers
+     * (performFullSync) pass the already-resolved prefix. CLI callers can
+     * force one via `--slug-prefix <prefix>`; otherwise, when the import
+     * routes to a named source, that source's `config.slug_prefix` is
+     * honored automatically (so `gbrain import <dir> --source-id x` derives
+     * the same slugs as `gbrain sync --source x`).
+     *
+     * Composes with `slugRoot`: slugRoot decides WHAT the repo-relative slug
+     * is; slugPrefix mounts that slug under a namespace. Applied last, in
+     * importFromFile / importCodeFile.
+     */
+    slugPrefix?: string;
   } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
@@ -165,6 +178,53 @@ export async function runImport(
       if (nudge) process.stderr.write(nudge + '\n');
     }
   }
+  // v0.42.x per-source slug namespacing. Precedence: --slug-prefix flag >
+  // opts.slugPrefix (programmatic, e.g. performFullSync) > the resolved
+  // source's config.slug_prefix > none. Validation is loud in all cases.
+  const slugPrefixIdx = args.indexOf('--slug-prefix');
+  const flagSlugPrefix = slugPrefixIdx !== -1 ? args[slugPrefixIdx + 1] : null;
+  // A valueless trailing `--slug-prefix` must NOT fall through to the source
+  // config — that would import to a different namespace than the operator
+  // asked for, silently. The whole point of this flag is loud failure.
+  if (slugPrefixIdx !== -1 && flagSlugPrefix === undefined) {
+    console.error('--slug-prefix requires a value (e.g. --slug-prefix news-server).');
+    process.exit(1);
+  }
+  let slugPrefix: string | undefined = flagSlugPrefix ?? opts.slugPrefix;
+  const { validateSlugPrefix } = await import('../core/sync.ts');
+  if (slugPrefix !== undefined) {
+    try {
+      validateSlugPrefix(slugPrefix, flagSlugPrefix ? '--slug-prefix' : 'slugPrefix');
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+  } else if (sourceId) {
+    const { getSourceSlugPrefix } = await import('../core/sources-load.ts');
+    slugPrefix = await getSourceSlugPrefix(engine, sourceId);
+  }
+  // Refuse an explicit `--slug-prefix` that CONTRADICTS the target source's
+  // configured one. Both namespaces derive from the same raw `source_path`,
+  // so importing under the wrong one forks every page: two rows, same
+  // source_path, and `resolveSlugsByPaths` has no deterministic preference
+  // between them — delete/rename afterwards can resolve to either. A one-off
+  // prefix for a source that has none configured is still allowed; only a
+  // mismatch is rejected. (`performSyncInner` resolves the config value into
+  // `opts.slugPrefix` before calling here, so the sync path compares equal.)
+  if (flagSlugPrefix !== null && sourceId) {
+    const { getSourceSlugPrefix } = await import('../core/sources-load.ts');
+    const configured = await getSourceSlugPrefix(engine, sourceId);
+    if (configured !== undefined && configured !== flagSlugPrefix) {
+      console.error(
+        `--slug-prefix "${flagSlugPrefix}" contradicts source "${sourceId}"'s ` +
+        `configured slug_prefix "${configured}". Importing under a second ` +
+        `namespace would fork every page in this source (two rows per file). ` +
+        `Drop the flag to use the source's own prefix.`,
+      );
+      process.exit(1);
+    }
+  }
+
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
@@ -182,10 +242,11 @@ export async function runImport(
   const flagValues = new Set<number>();
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
   if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
+  if (slugPrefixIdx !== -1) flagValues.add(slugPrefixIdx + 1);
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--slug-prefix <prefix>] [--json]');
     process.exit(1);
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -293,8 +354,11 @@ export async function runImport(
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
       const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
-        ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack });
+        // #774: the slug base is importRelPath (git-root-relative under a
+        // monorepo subdir source); slugPrefix then mounts that under the
+        // source's namespace inside importFile/importImageFile.
+        ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId, slugPrefix })
+        : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, slugPrefix });
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
