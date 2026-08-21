@@ -44,7 +44,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 12 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825)', () => {
+  test('version is 21 (…; 16→17 degradation stamp; 17→18 autocut weak-top floor #1863; 18→19 autocut minKeep floor #3621; 19→20 pre-fusion pool floor #3002; 20→21 recency fallback re-key #895)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -64,7 +64,22 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // pre-fix document-side query vectors must not be served.
     // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
     // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // #3430: 13→14 — the compiled_truth boost no longer applies at
+    // detail=medium. Results are cached after fusion, so rows ranked under
+    // the old boost semantics must not be served under the new ones.
+    // FTS language: 14→15 to fold the resolved GBRAIN_FTS_LANGUAGE config
+    // name (fts=). It retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language
+    // must not survive a `reindex-search-vector` language switch.
+    // #3515: 15→16 to fold the effective detail level (det=) — a detail=low
+    // write must not be served to a detail=medium lookup.
+    // WP2/T3: 16→17 degradation-stamp epoch — cache rows now carry
+    // degraded[]/retrieved_count; pre-stamp rows must not claim clean.
+    // #3621: 18→19 ack= (autocut minKeep floor) — the floor changes how many
+    // rows survive the cut, so writes and lookups must agree on it.
+    // D-3002: 19→20 pre-fusion pool floor — innerLimit widens the candidate
+    // pool for identical knobs (no new key part; version-only invalidation).
+    expect(KNOBS_HASH_VERSION).toBe(21);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

@@ -26,11 +26,11 @@
  *   ze_switch_declined_at     : ISO ts when user said "never ask again"
  *   ze_switch_previous_snapshot : JSON snapshot for --undo (D16)
  *
- * State diagram:
+ * RETIRED state machine (historical — no CLI path reaches it anymore):
  *
  *   [fresh brain]
  *        |
- *        |  user picks "s" or runs `gbrain ze-switch`
+ *        |  (pre-v0.46.3) forward switch requested
  *        v
  *   prompt_shown=true, requested=true
  *        |
@@ -40,35 +40,44 @@
  *        |
  *        |  config writes (embedding_model, dim, reranker)
  *        v
- *   applied=true  -> stable. Re-embed via `gbrain embed --stale` or autopilot.
+ *   applied=true  -> stable.
  *
- *   Crash between schema and config writes:
- *     requested=true, applied=false, schema is at target width.
- *     Doctor's `embedding_width_consistency` detects + suggests `--resume`.
- *
- *   "Never ask again" path:
- *     prompt_shown=true, declined_at=<iso>. Re-asked after 90 days (C3).
- *
- *   Undo path:
- *     ze_switch_previous_snapshot JSON drives reverse schema + config.
+ * Every arrow above is CLI-unreachable today: `gbrain ze-switch` is a pure
+ * refusal/redirect shim (the sunset refusal landed in v0.46.3; the undo/
+ * dry-run actions were retired in the interim ZE cleanup because apply/undo
+ * write DB-plane config the post-v0.37 file-plane-canonical runtime never
+ * reads). The functions below survive ONLY as test vehicles — they carry the
+ * multimodal-column preservation pins and the env-override gate cases until
+ * the v0.47 removal deletes this file wholesale.
  *
  * The planner is intentionally NOT a migration in the MIGRATIONS array.
- * Migrations are forward-only and run for every brain on every upgrade.
- * The ZE switch is conditional (user-requested), idempotent (re-runnable),
- * and reversible (--undo). Mixing it into MIGRATIONS would muddy the
- * ledger semantics (see plan D12 for full rationale).
+ * Migrations are forward-only and run for every brain on every upgrade;
+ * this machine was conditional, idempotent, and reversible (see plan D12).
  */
 
 import type { BrainEngine } from './engine.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { lookupEmbeddingPrice, estimateCostFromChars } from './embedding-pricing.ts';
 import { computeReembedEstimate } from './post-upgrade-reembed.ts';
+import {
+  detectEnvOverride,
+  formatEnvOverrideWarning,
+  runSchemaTransition,
+  type EnvOverrideWarning,
+} from './embedding-migration.ts';
+import { readContentChunksEmbeddingDim } from './embedding-dim-check.ts';
+
+// Back-compat re-exports: these primitives moved to embedding-migration.ts
+// (the v0.47 survivor module) so the ZE removal wave can delete this file
+// wholesale. Existing importers (ze-switch, tests) keep working until then.
+export { detectEnvOverride, formatEnvOverrideWarning, runSchemaTransition };
+export type { EnvOverrideWarning };
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/** v0.36.0.0 cutover target: ZeroEntropy zembed-1 at 1024d via Matryoshka. */
+/** v0.36.0.0 cutover target: ZeroEntropy zembed-1 at 1280d via Matryoshka. */
 export const ZE_TARGET_EMBEDDING_MODEL = 'zeroentropyai:zembed-1';
 export const ZE_TARGET_EMBEDDING_DIM = 1280;
 export const ZE_TARGET_RERANKER_MODEL = 'zeroentropyai:zerank-2';
@@ -145,78 +154,6 @@ export type ApplyResult =
   | { status: 'planned'; plan: RetrievalUpgradeState }
   | { status: 'refused'; plan: RetrievalUpgradeState; reason: 'env_override'; warning: EnvOverrideWarning }
   | { status: 'failed'; plan: RetrievalUpgradeState; reason: string };
-
-/**
- * v0.41.2.1 — env-override safety gate.
- *
- * `process.env.GBRAIN_EMBEDDING_MODEL` and `GBRAIN_EMBEDDING_DIMENSIONS`
- * win over DB+file config in `loadConfig()`. The 716K-chunk damage
- * incident (PR #1421) shipped because ze-switch wrote DB config but
- * the env override silently kept the old model active at embed time —
- * schema migrated to 2560d while embeds still produced 1536d vectors.
- *
- * detectEnvOverride is a pure read of process.env (or an injected env
- * for tests). triggered:true means refusal is required unless the
- * caller passes ignoreEnvOverride:true (mirrors --ignore-missing-key).
- */
-export interface EnvOverrideWarning {
-  triggered: boolean;
-  vars: Array<{ name: string; current: string; target: string }>;
-}
-
-export function detectEnvOverride(
-  targetModel: string,
-  targetDim: number,
-  env: NodeJS.ProcessEnv = process.env,
-): EnvOverrideWarning {
-  const vars: EnvOverrideWarning['vars'] = [];
-  const envModel = env.GBRAIN_EMBEDDING_MODEL?.trim();
-  if (envModel && envModel !== targetModel) {
-    vars.push({ name: 'GBRAIN_EMBEDDING_MODEL', current: envModel, target: targetModel });
-  }
-  const envDimRaw = env.GBRAIN_EMBEDDING_DIMENSIONS?.trim();
-  if (envDimRaw) {
-    const envDim = Number(envDimRaw);
-    if (!Number.isFinite(envDim) || envDim !== targetDim) {
-      vars.push({
-        name: 'GBRAIN_EMBEDDING_DIMENSIONS',
-        current: envDimRaw,
-        target: String(targetDim),
-      });
-    }
-  }
-  return { triggered: vars.length > 0, vars };
-}
-
-/**
- * ASCII box rendering (repo convention D10 v0.22.11 — no Unicode box
- * drawing). Pure function; CLI calls this and writes to stderr.
- * Line width <= 78 cols for safe rendering in any terminal or log
- * aggregator.
- */
-export function formatEnvOverrideWarning(w: EnvOverrideWarning): string {
-  const lines: string[] = [];
-  lines.push('+----------------------------------------------------------------------------+');
-  lines.push('| ENV OVERRIDE DETECTED - ACTION REQUIRED                                    |');
-  lines.push('+----------------------------------------------------------------------------+');
-  for (const v of w.vars) {
-    lines.push(`| ${v.name} is set in your environment:`.padEnd(77) + '|');
-    lines.push(`|   Current env: ${v.current}`.padEnd(77) + '|');
-    lines.push(`|   Switch target: ${v.target}`.padEnd(77) + '|');
-    lines.push('|                                                                            |');
-  }
-  lines.push('| The env var takes HIGHEST PRECEDENCE and will override this switch.        |');
-  lines.push('| Update your .env file or shell environment before retrying:                |');
-  lines.push('|                                                                            |');
-  const unsetCmd = `   unset ${w.vars.map(v => v.name).join(' ')}`;
-  // Match the other content-line pattern: `|` + 76 chars + `|` = 78 total.
-  lines.push(`|${unsetCmd.padEnd(76)}|`);
-  lines.push('|                                                                            |');
-  lines.push('| Without this change, the switch has NO EFFECT at runtime.                  |');
-  lines.push('| Pass --ignore-env-override to apply anyway (advanced; you know why).       |');
-  lines.push('+----------------------------------------------------------------------------+');
-  return lines.join('\n');
-}
 
 /**
  * v0.41.2.1 — Apply/resume opts. ignoreEnvOverride mirrors the existing
@@ -345,8 +282,9 @@ export async function planRetrievalUpgrade(engine: BrainEngine): Promise<Retriev
  *   5. Set ze_switch_applied = true
  *
  * Crash between (3) and (4) leaves the schema at the target width but the
- * config at the source. Doctor's `embedding_width_consistency` detects this
- * and suggests `gbrain ze-switch --resume`.
+ * config at the source. Doctor's `embedding_width_consistency` detects the
+ * drift and prints the engine-branched recovery recipe (there is no CLI
+ * resume anymore — the ze-switch shim refuses everything).
  */
 export async function applyRetrievalUpgrade(
   engine: BrainEngine,
@@ -467,10 +405,15 @@ export async function resumeRetrievalUpgrade(
 
   // requested=true, applied=false. Either schema is at target and config
   // still says source, or schema crashed mid-DDL. Re-run schema transition
-  // (idempotent via CREATE INDEX IF NOT EXISTS + ALTER COLUMN no-op semantics)
   // then write config + mark applied.
   try {
-    await runSchemaTransition(engine, targetDim);
+    // Width guard: the transition is DROP COLUMN + ADD COLUMN — a same-width
+    // re-run still DELETES every stored vector. Resume must only rebuild when
+    // the column genuinely isn't at the target width yet.
+    const col = await readContentChunksEmbeddingDim(engine);
+    if (col.dims !== targetDim) {
+      await runSchemaTransition(engine, targetDim);
+    }
     await engine.setConfig('embedding_model', ZE_TARGET_EMBEDDING_MODEL);
     await engine.setConfig('embedding_dimensions', String(targetDim));
     await engine.setConfig('search.reranker.enabled', 'true');
@@ -513,7 +456,12 @@ export async function undoRetrievalUpgrade(engine: BrainEngine): Promise<
   }
 
   try {
-    await runSchemaTransition(engine, snapshot.embedding_dimensions);
+    // Width guard (mirrors resume): a same-width DROP+ADD still deletes every
+    // vector — only rebuild when the column isn't at the snapshot width.
+    const col = await readContentChunksEmbeddingDim(engine);
+    if (col.dims !== snapshot.embedding_dimensions) {
+      await runSchemaTransition(engine, snapshot.embedding_dimensions);
+    }
     await engine.setConfig('embedding_model', snapshot.embedding_model);
     await engine.setConfig('embedding_dimensions', String(snapshot.embedding_dimensions));
     await engine.setConfig('search.reranker.enabled', snapshot.search_reranker_enabled ? 'true' : 'false');
@@ -535,68 +483,10 @@ export async function undoRetrievalUpgrade(engine: BrainEngine): Promise<
 }
 
 // ============================================================================
-// Schema transition (D18)
+// Schema transition — MOVED to embedding-migration.ts (re-exported above).
+// This file is deleted wholesale in the v0.47 ZE removal wave; the survivor
+// module owns the DDL now.
 // ============================================================================
-
-/**
- * The atomic DROP + ALTER + CREATE INDEX sequence for content_chunks.
- * Both engines accept identical SQL (PGLite uses pgvector via WASM, same
- * grammar). Wrapped in engine.transaction so a partial failure rolls back.
- *
- * Index names verified against:
- *   src/schema.sql:163  -> idx_chunks_embedding
- *   src/core/pglite-schema.ts:127 -> idx_chunks_embedding
- *   src/schema.sql:169  -> idx_chunks_embedding_image
- *   src/core/pglite-schema.ts:130 -> idx_chunks_embedding_image
- *
- * IF NOT EXISTS on CREATE INDEX makes the operation safe to re-run during
- * `--resume`.
- */
-async function runSchemaTransition(engine: BrainEngine, targetDim: number): Promise<void> {
-  // v0.41 fix: only transition the primary text embedding column.
-  // The embedding_image (v0.27.1) and embedding_multimodal (v0.36 / migration
-  // v78) columns use SEPARATE multimodal models (e.g. voyage-multimodal-3 at
-  // 1024d) whose dimensions are independent of the text embedding model.
-  // Dropping and recreating either at targetDim silently breaks multimodal
-  // search by creating a dimension mismatch between the column and the
-  // multimodal provider's output.
-  //
-  // Before this fix, switching text embeddings from OpenAI (1536d) to
-  // ZeroEntropy (1280d) would also change embedding_image from 1024d to
-  // 1280d, making voyage-multimodal-3 unable to write to it. The same
-  // class of bug applies to embedding_multimodal — leave both untouched.
-  await engine.transaction(async (tx) => {
-    // Text embedding column — transition to target dim.
-    await tx.executeRaw(`DROP INDEX IF EXISTS idx_chunks_embedding`);
-    await tx.executeRaw(`ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding`);
-    await tx.executeRaw(`ALTER TABLE content_chunks ADD COLUMN embedding vector(${targetDim})`);
-    await tx.executeRaw(
-      `CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops)`,
-    );
-
-    // Image/multimodal embedding column — rebuild index but preserve
-    // existing dimension. Only create it if it doesn't already exist
-    // (fresh brains may not have it yet). Partial WHERE clause matches
-    // schema.sql:258-260 and pglite-schema.ts:198-200: HNSW footprint
-    // scales with image-chunk count, not table size.
-    const hasImageCol = await tx.executeRaw<{ exists: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1 FROM information_schema.columns
-         WHERE table_schema = 'public'
-           AND table_name = 'content_chunks'
-           AND column_name = 'embedding_image'
-       ) AS exists`,
-    );
-    if (hasImageCol[0]?.exists) {
-      await tx.executeRaw(`DROP INDEX IF EXISTS idx_chunks_embedding_image`);
-      await tx.executeRaw(
-        `CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
-           ON content_chunks USING hnsw (embedding_image vector_cosine_ops)
-           WHERE embedding_image IS NOT NULL`,
-      );
-    }
-  });
-}
 
 // ============================================================================
 // Helpers

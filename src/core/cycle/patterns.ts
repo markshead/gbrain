@@ -20,16 +20,25 @@
 
 import { join, dirname } from 'node:path';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
+import { isQueueQuotaExceededError } from '../minions/admission.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
-import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
+import type { MinionJobInput, MinionJobStatus, SubagentHandlerData } from '../minions/types.ts';
 import { serializeMarkdown } from '../markdown.ts';
+import { truncateUtf8 } from '../text-safe.ts';
 import type { Page, PageType } from '../types.ts';
 // #2415: allow-list + output-root resolution shared with the synthesize
 // phase — both phases must agree on the configured namespace.
-import { loadAllowedSlugPrefixes, loadOutputRoot } from './synthesize.ts';
+// runSubagentsInline is shared too: a job submitted via queue.add() sits in
+// 'waiting' forever unless something drives the claim -> run -> complete
+// loop — on PGLite because no separate worker can open the embedded
+// data-dir, on Postgres because the parent phase itself occupies a worker
+// slot and can deadlock a fully-occupied worker (#2050). synthesize.ts
+// drains its own children the same way.
+import { loadAllowedSlugPrefixes, loadOutputRoot, runSubagentsInline } from './synthesize.ts';
 import { probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
 
@@ -52,6 +61,13 @@ export interface PatternsPhaseOpts {
    * mid-phase and starves every tail phase (#2781).
    */
   deadlineAtMs?: number | null;
+  /**
+   * #1586: the cycle's resolved source. Stamped onto every subagent child as
+   * `source_id` so put_page writes land in this source's rows, and passed to
+   * reverseWriteRefs so getPage/getTags read the correct (source_id, slug)
+   * row. Unset → legacy 'default'. Mirrors synthesize.ts's `sourceId`.
+   */
+  sourceId?: string;
 }
 
 /**
@@ -61,8 +77,13 @@ export interface PatternsPhaseOpts {
  * wait returns and the handler unwinds cleanly before the worker's abort
  * fires: wait poll interval (5s) + worker force-evict grace (30s) + lock
  * and DB cleanup headroom.
+ *
+ * gbrain#4168: the canonical definition moved to base-phase.ts (one home for
+ * every phase); re-exported here so existing imports (tests included) keep
+ * working.
  */
-export const CYCLE_DEADLINE_RESERVE_MS = 60 * 1000;
+import { CYCLE_DEADLINE_RESERVE_MS } from './base-phase.ts';
+export { CYCLE_DEADLINE_RESERVE_MS };
 
 /**
  * Smallest remaining budget worth submitting a subagent for. Below this,
@@ -115,7 +136,7 @@ export async function runPhasePatterns(
     }
 
     // Gather reflections within lookback window.
-    const reflections = await gatherReflections(engine, config.lookbackDays, config.outputRoot);
+    const reflections = await gatherReflections(engine, config.lookbackDays, config.sourceSlugPrefix);
     if (reflections.length < config.minEvidence) {
       return skipped(
         'insufficient_evidence',
@@ -147,10 +168,20 @@ export async function runPhasePatterns(
       return skipped('no_provider', `pattern detection skipped: ${probe.detail}`);
     }
 
-    const allowedSlugPrefixes = await loadAllowedSlugPrefixes(config.outputRoot);
+    const allowedSlugPrefixes = await loadAllowedSlugPrefixes(config.outputRoot, engine);
     if (allowedSlugPrefixes.length === 0) {
       return failed(makeError('InternalError', 'NO_ALLOWLIST',
         'skills/_brain-filing-rules.json missing dream_synthesize_paths.globs'));
+    }
+    // A configured dream.patterns.output_slug_prefix diverging from the
+    // default `${outputRoot}/personal/patterns` composition (e.g. a flat
+    // schema with no personal/ nesting) is not covered by the filing-rules
+    // globs above, which only remap the `wiki/personal/patterns/*` literal
+    // by outputRoot. Add it explicitly so the subagent's put_page allow-list
+    // actually grants write access to wherever it's configured to write.
+    const outputGlob = `${config.outputSlugPrefix}/*`;
+    if (!allowedSlugPrefixes.includes(outputGlob)) {
+      allowedSlugPrefixes.push(outputGlob);
     }
 
     // #2781: budget the subagent from the REMAINING parent-job time, not
@@ -167,21 +198,52 @@ export async function runPhasePatterns(
     }
 
     const queue = new MinionQueue(engine);
+    // #2050: children drain inline on BOTH engines (see runSubagentsInline),
+    // so give this job a private per-run queue: the inline drain must never
+    // claim unrelated 'default'-queue jobs, and a 'default'-queue worker must
+    // never claim a child this parent is about to run itself. Mirrors
+    // synthesize.ts's childQueueName derivation exactly.
+    const childQueueName = `dream-inline-${Date.now()}-${randomUUID().slice(0, 8)}`;
     const data: SubagentHandlerData = {
-      prompt: buildPatternsPrompt(reflections, config.minEvidence, config.outputRoot),
+      prompt: buildPatternsPrompt(reflections, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix),
       model: config.model,
       max_turns: 30,
+      // #4217/CDX-12: a patterns child whose every put_page failed must
+      // dead-letter (its whole purpose is writing pattern pages), not report
+      // completed with zero pages.
+      require_writes: true,
       allowed_slug_prefixes: allowedSlugPrefixes,
+      // #1586: scope every child tool call to the cycle's resolved source so
+      // put_page writes land there instead of the hardcoded 'default'.
+      ...(opts.sourceId ? { source_id: opts.sourceId } : {}),
     };
     const submitOpts: Partial<MinionJobInput> = {
       max_stalled: 3,
       timeout_ms: budgets.timeoutMs,
+      queue: childQueueName,
     };
-    const job = await queue.add('subagent', data as unknown as Record<string, unknown>, submitOpts, {
-      allowProtectedSubmit: true,
-    });
+    let job: Awaited<ReturnType<typeof queue.add>>;
+    try {
+      job = await queue.add('subagent', data as unknown as Record<string, unknown>, submitOpts, {
+        allowProtectedSubmit: true,
+      });
+    } catch (e) {
+      // Admission quota (minions.quota_max_waiting.subagent, config-only): a
+      // rejected submit is a recorded phase SKIP, never a phase crash — the
+      // next cycle retries once the backlog drains.
+      if (isQueueQuotaExceededError(e)) {
+        return skipped('admission_quota', e.message);
+      }
+      throw e;
+    }
 
-    let outcome: string;
+    // Drain this phase's private child queue inline so the parent observes
+    // the terminal state instead of polling waitForCompletion until
+    // subagentWaitTimeoutMs expires. Runs on BOTH engines — on Postgres the
+    // parent job otherwise deadlocks a fully-occupied worker (#2050).
+    await runSubagentsInline(engine, queue, childQueueName, opts.yieldDuringPhase);
+
+    let outcome: MinionJobStatus | 'timeout';
     try {
       const final = await waitForCompletion(queue, job.id, {
         timeoutMs: budgets.waitTimeoutMs,
@@ -210,10 +272,14 @@ export async function runPhasePatterns(
     // Collect refs the subagent wrote (codex finding #2 — query tool exec rows).
     // v0.32.8: refs carry source_id so reverseWriteRefs targets the right
     // (source, slug) row instead of the first DB match.
-    const writtenRefs = await collectChildPutPageSlugs(engine, [job.id]);
+    // #1586: refs carry the cycle's resolved source (children wrote there via
+    // SubagentHandlerData.source_id), so getPage/getTags read the same row the
+    // child wrote, and the reverse-write treats it as the native source.
+    const cycleSourceId = opts.sourceId ?? 'default';
+    const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
 
     // Reverse-write to fs.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs);
+    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
 
     const details = {
       reflections_considered: reflections.length,
@@ -227,7 +293,7 @@ export async function runPhasePatterns(
     // returned status:ok even when the subagent timed out (e.g. no
     // subagent-capable worker slot free for the whole wait window) and zero
     // pattern pages were written — a silent no-op for days.
-    if (outcome !== 'complete') {
+    if (outcome !== 'completed') {
       if (writtenRefs.length === 0) {
         return {
           phase: 'patterns',
@@ -273,6 +339,21 @@ interface PatternsConfig {
   model: string;
   /** #2415: shared output namespace (dream.synthesize.output_root, default 'wiki'). */
   outputRoot: string;
+  /**
+   * Slug prefix `gatherReflections` reads from (SQL `LIKE` scope). Defaults
+   * to `${outputRoot}/personal/reflections`, matching pre-existing behavior.
+   * Config `dream.patterns.source_slug_prefix` overrides it for brains whose
+   * schema has no `personal/reflections/` convention (e.g. a flat
+   * `meetings/` tree) so the phase can read from wherever compiled_truth
+   * excerpts actually live.
+   */
+  sourceSlugPrefix: string;
+  /**
+   * Slug prefix new pattern pages are written under. Defaults to
+   * `${outputRoot}/personal/patterns`, matching pre-existing behavior.
+   * Config `dream.patterns.output_slug_prefix` overrides it.
+   */
+  outputSlugPrefix: string;
   /** #1594-family: subagent job timeout, config `dream.patterns.subagent_timeout_ms`. */
   subagentTimeoutMs: number;
   /** #1594-family: waitForCompletion timeout, config `dream.patterns.subagent_wait_timeout_ms`. */
@@ -289,6 +370,14 @@ async function getNumberConfig(engine: BrainEngine, key: string, fallback: numbe
   return Number.isNaN(value) ? fallback : value;
 }
 
+/** Trims leading/trailing slashes from a config-supplied slug prefix; falls back to `fallback` when unset or empty after trimming. */
+async function getSlugPrefixConfig(engine: BrainEngine, key: string, fallback: string): Promise<string> {
+  const raw = await engine.getConfig(key);
+  if (!raw) return fallback;
+  const trimmed = raw.trim().replace(/^\/+|\/+$/g, '');
+  return trimmed || fallback;
+}
+
 async function loadPatternsConfig(engine: BrainEngine): Promise<PatternsConfig> {
   const enabledStr = await engine.getConfig('dream.patterns.enabled');
   const enabled = enabledStr === null ? true : enabledStr === 'true';
@@ -302,12 +391,19 @@ async function loadPatternsConfig(engine: BrainEngine): Promise<PatternsConfig> 
     tier: 'reasoning',
     fallback: 'sonnet',
   });
+  const outputRoot = await loadOutputRoot(engine);
   return {
     enabled,
     lookbackDays: lookbackStr ? Math.max(1, parseInt(lookbackStr, 10) || 30) : 30,
     minEvidence: minEvidenceStr ? Math.max(1, parseInt(minEvidenceStr, 10) || 3) : 3,
     model,
-    outputRoot: await loadOutputRoot(engine),
+    outputRoot,
+    sourceSlugPrefix: await getSlugPrefixConfig(
+      engine, 'dream.patterns.source_slug_prefix', `${outputRoot}/personal/reflections`,
+    ),
+    outputSlugPrefix: await getSlugPrefixConfig(
+      engine, 'dream.patterns.output_slug_prefix', `${outputRoot}/personal/patterns`,
+    ),
     subagentTimeoutMs: await getNumberConfig(
       engine, 'dream.patterns.subagent_timeout_ms', DEFAULT_PATTERNS_SUBAGENT_TIMEOUT_MS,
     ),
@@ -328,11 +424,11 @@ interface ReflectionRef {
 async function gatherReflections(
   engine: BrainEngine,
   lookbackDays: number,
-  outputRoot = 'wiki',
+  sourceSlugPrefix = 'wiki/personal/reflections',
 ): Promise<ReflectionRef[]> {
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
-  // #2415: reflections live under the configured output root (bound as a
-  // parameter; outputRoot is slug-grammar-validated by loadOutputRoot).
+  // Reflections live under the configured source slug prefix (bound as a
+  // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix).
   const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
     `SELECT slug, title, compiled_truth
        FROM pages
@@ -340,18 +436,27 @@ async function gatherReflections(
         AND updated_at >= $1::timestamptz
       ORDER BY updated_at DESC
       LIMIT 100`,
-    [since, `${outputRoot}/personal/reflections/%`],
+    [since, `${sourceSlugPrefix}/%`],
   );
   return rows.map(r => ({
     slug: r.slug,
     title: r.title ?? r.slug,
-    excerpt: (r.compiled_truth ?? '').slice(0, 600),
+    // A raw UTF-16 slice can split an astral character at the boundary and
+    // leave a lone surrogate. Postgres rejects that when the prompt is bound
+    // into the minion job's JSONB payload. Use the shared safe truncator so a
+    // reflection containing emoji cannot abort the entire patterns phase.
+    excerpt: truncateUtf8(r.compiled_truth ?? '', 600),
   }));
 }
 
 // ── Prompt ────────────────────────────────────────────────────────────
 
-function buildPatternsPrompt(reflections: ReflectionRef[], minEvidence: number, outputRoot = 'wiki'): string {
+function buildPatternsPrompt(
+  reflections: ReflectionRef[],
+  minEvidence: number,
+  sourceSlugPrefix = 'wiki/personal/reflections',
+  outputSlugPrefix = 'wiki/personal/patterns',
+): string {
   const today = new Date().toISOString().slice(0, 10);
   const corpus = reflections
     .map((r, i) => `### ${i + 1}. [[${r.slug}]] — ${r.title}\n${r.excerpt}`)
@@ -361,15 +466,15 @@ function buildPatternsPrompt(reflections: ReflectionRef[], minEvidence: number, 
 
 OUTPUT POLICY
 - Only name a pattern if it appears in at least ${minEvidence} DISTINCT reflections.
-- Each pattern page MUST cite the reflections that constitute its evidence (use [[${outputRoot}/personal/reflections/...]] wikilinks).
+- Each pattern page MUST cite the reflections that constitute its evidence (use [[${sourceSlugPrefix}/...]] wikilinks).
 - Use \`search\` to check whether a similar pattern page already exists; if yes, update it (use the same slug). If no, create a new one.
-- Pattern slug format: \`${outputRoot}/personal/patterns/<topic-slug>\` (lowercase alphanumeric + hyphens; no underscores, no extension, no date).
+- Pattern slug format: \`${outputSlugPrefix}/<topic-slug>\` (lowercase alphanumeric + hyphens; no underscores, no extension, no date).
 - A "pattern" is a recurring theme, anxiety, decision pattern, relationship dynamic, or self-knowledge motif. NOT a single insight. NOT a list of unrelated topics.
 
 DO NOT WRITE
 - A "patterns from today" digest (that's the dream-cycle-summaries page; not your job).
 - Patterns with <${minEvidence} reflections cited.
-- Anything outside ${outputRoot}/personal/patterns/.
+- Anything outside ${outputSlugPrefix}/.
 
 CONTEXT
 - Today: ${today}
@@ -386,13 +491,14 @@ When done, briefly list the pattern slugs you wrote/updated in your final messag
 async function collectChildPutPageSlugs(
   engine: BrainEngine,
   childIds: number[],
+  sourceId = 'default',
 ): Promise<Array<{ slug: string; source_id: string }>> {
   if (childIds.length === 0) return [];
   // v0.32.8: subagent put_page tool schema doesn't expose source_id (subagents
-  // are scoped to a single source). Default to 'default' here; multi-source
-  // dream cycles are a v0.33 follow-up. The point of threading source_id is
-  // so reverseWriteRefs can pass it through getPage and pick the correct
-  // (source_id, slug) row instead of whatever the DB happens to return.
+  // are scoped to a single source). #1586: stamp the cycle's resolved source —
+  // children write there via SubagentHandlerData.source_id — so reverseWriteRefs
+  // can pass it through getPage and pick the correct (source_id, slug) row
+  // instead of whatever the DB happens to return. Unset → legacy 'default'.
   const rows = await engine.executeRaw<{ slug: string }>(
     `SELECT DISTINCT
             COALESCE(input->>'slug', (input #>> '{}')::jsonb->>'slug') AS slug
@@ -406,7 +512,7 @@ async function collectChildPutPageSlugs(
   return rows
     .map(r => r.slug)
     .filter((s): s is string => typeof s === 'string' && s.length > 0)
-    .map(slug => ({ slug, source_id: 'default' }));
+    .map(slug => ({ slug, source_id: sourceId }));
 }
 
 // ── Reverse-write ────────────────────────────────────────────────────
@@ -417,6 +523,7 @@ async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
+  nativeSourceId = 'default',
 ): Promise<number> {
   let count = 0;
   for (const { slug, source_id } of refs) {
@@ -428,11 +535,12 @@ async function reverseWriteRefs(
     const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
       const md = renderPageToMarkdown(page, tags);
-      // v0.32.8 F6: non-default sources land under brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide on disk. Default-source
-      // pages stay at brainDir/<slug>.md so single-source brains see no change.
-      // `.sources/` is a reserved prefix; walkBrainRepo skips dot-dirs.
-      const filePath = source_id === 'default'
+      // v0.32.8 F6: foreign-source pages land under brainDir/.sources/<id>/<slug>.md
+      // so same-slug-different-source pages don't collide on disk. Pages belonging
+      // to the cycle's own source (#1586: brainDir IS that source's checkout —
+      // legacy 'default' when unscoped) stay at brainDir/<slug>.md so single-source
+      // brains see no change. `.sources/` is a reserved prefix; walkBrainRepo skips dot-dirs.
+      const filePath = source_id === nativeSourceId
         ? join(brainDir, `${slug}.md`)
         : join(brainDir, '.sources', source_id, `${slug}.md`);
       mkdirSync(dirname(filePath), { recursive: true });
@@ -490,3 +598,12 @@ function failed(error: PhaseError): PhaseResult {
 function makeError(cls: string, code: string, message: string, hint?: string): PhaseError {
   return hint ? { class: cls, code, message, hint } : { class: cls, code, message };
 }
+
+// `__testing` re-exports otherwise-private helpers so unit tests can pin the
+// source-scoping contract (#1586) without driving a whole dream cycle.
+// Mirrors synthesize.ts's `__testing` block.
+export const __testing = {
+  gatherReflections,
+  collectChildPutPageSlugs,
+  reverseWriteRefs,
+};

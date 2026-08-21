@@ -157,12 +157,35 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Chat sibling of FREE_LOCAL_EMBED_PROVIDERS / FREE_LOCAL_RERANK_PROVIDERS.
+ *
+ * Local inference costs electricity, not tokens, so these providers price at
+ * $0 rather than TX2 hard-failing. Without this a caller that sets ANY cost cap
+ * cannot use a local chat model at all: CANONICAL_PRICING has no `ollama:*`
+ * keys, so `reserve()` throws no_pricing before the first call and every work
+ * item is skipped with `budget_exhausted: true` at $0 spent.
+ *
+ * That is not theoretical — `cycle.extract_atoms` always constructs its tracker
+ * with `maxCostUsd` (config only accepts `n > 0`, so the cap can't be unset),
+ * which made `models.dream.extract_atoms: ollama:*` silently extract nothing.
+ *
+ * `litellm` is excluded on purpose, matching the embed set: a LiteLLM proxy can
+ * front a paid provider, so pricing-unknown is the honest state there.
+ */
+const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
+  'ollama',
+  'llama-server',
+]);
+
+/**
  * Look up `modelId` in the chat or embedding pricing maps. Returns a
  * per-1M-token price tuple, or null when unknown.
  *
  * Strategy:
  *   - Chat: try the bare model id in ANTHROPIC_PRICING first (legacy keys
- *     are bare claude-* ids). Fall back to the provider-prefixed key.
+ *     are bare claude-* ids), then the canonical paid-cloud chat table
+ *     for provider-prefixed OpenAI/Google/DeepSeek/Together ids, then the
+ *     explicit zero-cost local provider set.
  *   - Embed: lookupEmbeddingPrice handles the provider:model form; on a miss,
  *     local-inference providers (FREE_LOCAL_EMBED_PROVIDERS) price at $0 so
  *     `--max-cost` callers don't hard-fail.
@@ -220,7 +243,24 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   // above is only the bare-keyed Claude view.
   const canon = canonicalLookup(modelId);
   if (canon) return canon;
+  // Local-inference chat providers cost electricity, not tokens. Checked AFTER
+  // the canonical table so an explicitly-priced local entry, should one ever be
+  // added, still wins over the blanket zero.
+  if (kind === 'chat' && providerId && FREE_LOCAL_CHAT_PROVIDERS.has(providerId)) {
+    return { input: 0, output: 0 };
+  }
   return null;
+}
+
+/**
+ * True when the budget tracker can price this model, i.e. when setting a cost
+ * cap is meaningful. Callers that apply a *default* cap (rather than one the
+ * user asked for) should skip the cap when this returns false — otherwise
+ * `reserve()` hard-fails with BudgetExhausted(reason:'no_pricing') and the
+ * caller silently does no work.
+ */
+export function isModelPriceable(modelId: string, kind: BudgetKind): boolean {
+  return lookupPricing(modelId, kind) !== null;
 }
 
 function costForUsage(modelId: string, inputTokens: number, outputTokens: number, kind: BudgetKind): number | null {
@@ -293,8 +333,23 @@ export class BudgetTracker {
         // TX2: hard-fail when a cap is set but pricing is missing — without
         // pricing we can't enforce the cap, and silently ignoring it would
         // void the contract.
+        const pricingFile = estimate.kind === 'chat' ? 'model-pricing.ts' : 'embedding-pricing.ts';
         const msg = `${this.opts.label}: no pricing entry for model "${estimate.modelId}" (kind=${estimate.kind}). ` +
-          `Add it to src/core/${estimate.kind === 'embed' ? 'embedding-pricing.ts' : 'anthropic-pricing.ts'} or drop --max-cost.`;
+          `Add it to src/core/${pricingFile} or drop --max-cost.`;
+        appendAuditLine(this.auditPath, {
+          schema_version: 1,
+          ts: new Date().toISOString(),
+          event: 'reserve_no_pricing',
+          label: this.opts.label,
+          kind: estimate.kind,
+          model: estimate.modelId,
+          sub_label: estimate.label,
+          estimated_input_tokens: estimate.estimatedInputTokens,
+          max_output_tokens: estimate.maxOutputTokens,
+          cumulative_cost_usd: this.cumulativeUsd,
+          max_cost_usd: this.opts.maxCostUsd,
+          reason: 'no_pricing',
+        });
         this.fireExhausted();
         throw new BudgetExhausted(msg, {
           reason: 'no_pricing',

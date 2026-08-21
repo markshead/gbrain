@@ -39,9 +39,52 @@ import {
   NON_EXTRACTABLE_AUDIT_SOURCE,
   PER_SEGMENT_SOURCE_PREFIX,
   ALLOWED_TYPES,
+  pageTypesForAllowed,
+  ALLOWED_TYPE_ALIASES,
 } from '../src/commands/extract-conversation-facts.ts';
 import { _resetLlmCacheForTests } from '../src/core/conversation-parser/llm-base.ts';
 import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
+
+// ---------------------------------------------------------------------------
+// pageTypesForAllowed — logical→concrete page-type expansion.
+// ---------------------------------------------------------------------------
+
+describe('pageTypesForAllowed', () => {
+  test('expands slack to canonical + granular collector types', () => {
+    expect(pageTypesForAllowed(['slack'])).toEqual(['slack', 'slack-dm-day', 'slack-thread']);
+  });
+
+  test('expands email to canonical + granular collector types', () => {
+    expect(pageTypesForAllowed(['email'])).toEqual(['email', 'email-digest']);
+  });
+
+  test('canonical-only types pass through unchanged', () => {
+    expect(pageTypesForAllowed(['meeting'])).toEqual(['meeting']);
+    expect(pageTypesForAllowed(['conversation'])).toEqual(['conversation']);
+  });
+
+  test('canonical name is always first so consolidated brains keep working', () => {
+    expect(pageTypesForAllowed(['slack'])[0]).toBe('slack');
+    expect(pageTypesForAllowed(['email'])[0]).toBe('email');
+  });
+
+  test('multiple logical types flatten and de-duplicate', () => {
+    const got = pageTypesForAllowed(['slack', 'email', 'meeting']);
+    expect(got).toEqual(['slack', 'slack-dm-day', 'slack-thread', 'email', 'email-digest', 'meeting']);
+    // no duplicates
+    expect(new Set(got).size).toBe(got.length);
+  });
+
+  test('every ALLOWED_TYPE_ALIASES entry lists its canonical name first', () => {
+    for (const [canonical, concretes] of Object.entries(ALLOWED_TYPE_ALIASES)) {
+      expect(concretes[0]).toBe(canonical);
+    }
+  });
+
+  test('empty input yields empty output', () => {
+    expect(pageTypesForAllowed([])).toEqual([]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Fixture helpers.
@@ -101,6 +144,24 @@ describe('parseConversationMessages', () => {
 test('conversation-facts allowlist includes native iMessage page types (#2756)', () => {
   expect(ALLOWED_TYPES).toContain('imessage');
   expect(ALLOWED_TYPES).toContain('imessage-daily');
+});
+
+test('parses a markdown-heading turn body (## User / ## Assistant)', () => {
+  const body = [
+    '## User',
+    'What is the capital of France?',
+    '## Assistant',
+    'The capital of France is Paris.',
+    'It is also its largest city.',
+  ].join('\n');
+  const msgs = parseConversationMessages(body, { fallbackDate: '2026-08-11' });
+  expect(msgs).toHaveLength(2);
+  expect(msgs[0].speaker).toBe('User');
+  expect(msgs[0].text).toBe('What is the capital of France?');
+  expect(msgs[1].speaker).toBe('Assistant');
+  expect(msgs[1].text).toBe(
+    'The capital of France is Paris.\nIt is also its largest city.',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -262,6 +323,7 @@ describe('runExtractConversationFactsCore', () => {
   let repoDir: string;
   let chatFailure: Error | null = null;
   let chatHook: (() => Promise<void>) | null = null;
+  let mainChatCalls = 0;
   let chatStopReason: ChatResult['stopReason'] = 'end';
   let chatTextOverride: string | null = null;
   let fallbackCalls = 0;
@@ -317,6 +379,7 @@ describe('runExtractConversationFactsCore', () => {
           providerId: 'stub',
         };
       }
+      mainChatCalls++;
       if (chatFailure) throw chatFailure;
       const hook = chatHook;
       chatHook = null;
@@ -364,6 +427,7 @@ describe('runExtractConversationFactsCore', () => {
   beforeEach(async () => {
     chatFailure = null;
     chatHook = null;
+    mainChatCalls = 0;
     chatStopReason = 'end';
     chatTextOverride = null;
     fallbackCalls = 0;
@@ -617,6 +681,32 @@ describe('runExtractConversationFactsCore', () => {
       expect(result.pages_skipped).toBe(1);
       expect(result.spent_usd).toBeGreaterThan(1);
       expect(fallbackCalls).toBe(1);
+    });
+  });
+
+  test('extraction BudgetExhausted halts the run after one attempt (#3669)', async () => {
+    // Regression: extractFactsFromTurnWithOutcome folds a BudgetExhausted
+    // thrown by the provider into `{ ok: false, error }`; the per-segment
+    // failure branch used to wrap it in a plain Error, stripping the
+    // BUDGET_EXHAUSTED tag. The worker pool's D13 must-abort check never
+    // fired, so every remaining page burned a doomed reserve-denied attempt
+    // instead of the run halting with budget_exhausted = true.
+    chatFailure = new BudgetExhausted('reserve denied', {
+      reason: 'cost',
+      spent: 5,
+      cap: 5,
+    });
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        sleepMs: 0,
+      });
+      // Halted-with-receipt, not a per-page failure loop: exactly ONE
+      // extraction attempt (not one per eligible page), and the partial
+      // result reports the budget stop.
+      expect(result.budget_exhausted).toBe(true);
+      expect(mainChatCalls).toBe(1);
+      expect(result.pages_failed).toBe(0);
     });
   });
 
@@ -1296,5 +1386,144 @@ describe('runExtractConversationFactsCore', () => {
 describe('body cap constant (Eng A2)', () => {
   test('MAX_PAGE_BODY_BYTES is 25MB', () => {
     expect(MAX_PAGE_BODY_BYTES).toBe(25 * 1024 * 1024);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #4136 — folded speaker headings: decline gate, counter, non-terminal skip.
+// Self-contained engine + transport (the main describe resets both in its
+// afterAll, so this block installs its own).
+// ---------------------------------------------------------------------------
+
+describe('#4136 folded speaker headings — decline gate is non-terminal', () => {
+  let engine: PGLiteEngine;
+
+  const FOLDED_BODY = [
+    '## User', '', 'What is the deploy command?', '',
+    '## Claude', '', 'Run the deploy script from the repo root.', '',
+    '## User', '', 'Thanks.',
+  ].join('\n');
+
+  const NOTES_BODY = [
+    '## User', '', 'Journal entry one.', '',
+    '## Notes', '', 'unfenced doc heading inside my own page', '',
+    '## User', '', 'Journal entry two.',
+  ].join('\n');
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    await engine.setConfig('facts.extraction_enabled', 'true');
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'false');
+    __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: '{"facts":[]}',
+      blocks: [{ type: 'text', text: '{"facts":[]}' }],
+      stopReason: 'end',
+      usage: { input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-haiku-4-5-20251001',
+      providerId: 'anthropic',
+    }));
+    await engine.putPage('conversations/folded-claude-example', {
+      type: 'conversation',
+      title: 'Folded transcript',
+      compiled_truth: FOLDED_BODY,
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+    await engine.putPage('conversations/notes-journal-example', {
+      type: 'conversation',
+      title: 'Single-speaker journal with a Notes heading',
+      compiled_truth: NOTES_BODY,
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+  });
+
+  afterAll(async () => {
+    __setChatTransportForTests(null);
+    resetGateway();
+    await engine.disconnect();
+  });
+
+  test('a folded speaker-shaped heading with degenerate speakers DECLINES: counter bumped, zero facts, NO durable audit row', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/folded-claude-example',
+      sleepMs: 0,
+    });
+    expect(result.pages_skipped_unrecognized_speaker).toBe(1);
+    expect(result.facts_inserted).toBe(0);
+    // The single highest-risk line (#4136): a decline must NOT write the
+    // EXTRACTION_NOT_APPLICABLE row — that row is versionToken-keyed and
+    // would skip the page forever, even after the parser learns the label.
+    expect(result.pages_marked_non_extractable).toBe(0);
+    const markers = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session LIKE $2`,
+      [NON_EXTRACTABLE_AUDIT_SOURCE, `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/folded-claude-example:%`],
+    );
+    expect(Number(markers[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('RETRYABLE: a second run re-considers the declined page instead of short-circuiting at the outcome gate', async () => {
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/folded-claude-example',
+      sleepMs: 0,
+    });
+    expect(second.pages_considered).toBe(1);
+    expect(second.pages_skipped_completed).toBe(0);
+    expect(second.pages_skipped_non_extractable).toBe(0);
+    expect(second.pages_skipped_unrecognized_speaker).toBe(1); // declined again — visibly, not silently
+  });
+
+  test('WARN-ONLY branch: a speaker-shaped fold BETWEEN alternating speakers proceeds with the stderr warn (residual risk, visible)', async () => {
+    await engine.putPage('conversations/folded-multispeaker-example', {
+      type: 'conversation',
+      title: 'Folded heading between alternating speakers',
+      compiled_truth: [
+        '## User', '', 'Question one?', '',
+        '## Assistant', '', 'Answer one.', '',
+        '## Claude', '', 'A folded reply.', '',
+        '## User', '', 'Question two?', '',
+        '## Assistant', '', 'Answer two.',
+      ].join('\n'),
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+    const warns: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = (c: string) => {
+      warns.push(String(c));
+      return origWrite(c);
+    };
+    try {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/folded-multispeaker-example',
+        sleepMs: 0,
+      });
+      // Speakers alternate (User + Assistant = 2 distinct) → NOT declined,
+      // extraction proceeds, and the warn names the folded label.
+      expect(result.pages_skipped_unrecognized_speaker).toBe(0);
+      expect(result.pages_processed).toBe(1);
+      expect(warns.some((w) => w.includes('folded unrecognized heading(s) [Claude]') && w.includes('proceeding'))).toBe(true);
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = origWrite;
+    }
+  });
+
+  test('NO REGRESSION: a single-speaker page with an unfenced doc heading (## Notes) is warn-only and still extracts', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/notes-journal-example',
+      sleepMs: 0,
+    });
+    // 'Notes' is stoplisted → not speaker-shaped → no decline, extraction
+    // proceeds through the normal pipeline (eng F3: the bare
+    // "non-empty + degenerate speakers" rule would have false-declined this).
+    expect(result.pages_skipped_unrecognized_speaker).toBe(0);
+    expect(result.pages_processed).toBe(1);
+    expect(result.segments_processed).toBeGreaterThanOrEqual(1);
   });
 });

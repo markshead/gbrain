@@ -1,4 +1,5 @@
 import type { Recipe } from '../types.ts';
+import { openaiModelSupportsPromptCache } from './openai.ts';
 
 /**
  * Private in-process marker header. `gateway.chat()` sets it when the caller
@@ -16,7 +17,12 @@ export const OPENROUTER_CACHE_HEADER = 'x-gbrain-anthropic-prompt-cache';
 
 /**
  * Family-scoped prompt-cache capability (per OpenRouter docs):
- * - OpenAI chat routes cache automatically (no request mutation needed).
+ * - OpenAI chat routes cache automatically, from the generation that shipped
+ *   automatic caching onward. The family test is the SAME predicate the native
+ *   `openai` recipe uses, so a model cannot report different capabilities
+ *   depending on which route reaches it.
+ * - DeepSeek routes cache automatically too (context caching is on by default
+ *   for every account), matching the native `deepseek` recipe.
  * - Anthropic Claude routes cache when the request carries `cache_control`
  *   on a content block (applied by the fetch shim below).
  * Everything else is not marked cacheable — deliberately narrow rather than
@@ -24,7 +30,14 @@ export const OPENROUTER_CACHE_HEADER = 'x-gbrain-anthropic-prompt-cache';
  */
 export function openrouterSupportsPromptCache(modelId: string): boolean {
   const normalized = modelId.trim().toLowerCase();
-  if (normalized.startsWith('openai/gpt-') || /^openai\/o\d/.test(normalized)) return true;
+  if (normalized.startsWith('openai/')) {
+    // OpenRouter appends routing variants (`:online`, `:nitro`, `:floor`, …)
+    // that are not part of the upstream model id. Strip before delegating, or
+    // every variant of a cache-capable model would read as cache-less.
+    const upstreamId = normalized.slice('openai/'.length).split(':', 1)[0] ?? '';
+    return openaiModelSupportsPromptCache(upstreamId);
+  }
+  if (normalized.startsWith('deepseek/')) return true;
   if (normalized.startsWith('anthropic/claude-')) return true;
   return false;
 }
@@ -134,11 +147,13 @@ export const openrouterCompatFetch = (async (
  * downstream agent stacks (OpenClaw deployments, etc.) get their own
  * attribution on OR's leaderboard instead of polluting gbrain's.
  *
- * Subagent loops: `supports_subagent_loop: false` is INFORMATIONAL. The real
- * gate is `isAnthropicProvider()` in `src/core/model-config.ts` which
- * hard-pins gbrain's subagent infra to Anthropic-direct (stable tool_use_id
- * across crashes/replays). OR-proxied Anthropic is rejected at submit time
- * regardless of this flag — relaxing the gate is a deeper architectural
+ * Subagent loops: `supports_subagent_loop: false` is enforced by
+ * `classifyCapabilities()` in `src/core/ai/capabilities.ts` — the subagent
+ * tier refuses OR-proxied models at submit or handler dispatch because tool_use_id
+ * stability across crashes/replays can't be guaranteed through the proxy.
+ * (The legacy Anthropic-direct path additionally gates on
+ * `isAnthropicProvider()` in `src/core/model-config.ts` when
+ * `agent.use_gateway_loop` is off.) Relaxing this is a deeper architectural
  * change tracked in TODOS.md.
  */
 export const openrouter: Recipe = {
@@ -168,7 +183,26 @@ export const openrouter: Recipe = {
   touchpoints: {
     embedding: {
       models: ['openai/text-embedding-3-small'],
-      default_dims: 1536,
+      // #4114: per-model native dims for the catalog the docs invite users to
+      // pick. The old recipe-wide `default_dims: 1536` was only right for
+      // text-embedding-3-small — `migrate embeddings --to openrouter:bge-m3`
+      // planned a 1536-wide column for a model that returns 1024. Slash-form
+      // ids are the lookup key (embeddingDimsForModel strips only a leading
+      // `provider:`, never the org slash). gemini-embedding-2-preview is
+      // deliberately NOT listed: its width is unverified, and a plausible
+      // guess is this exact bug class — unlisted ids resolve to 0, which
+      // forces an explicit --dim / embedding_dimensions with a clear error.
+      model_dims: {
+        'openai/text-embedding-3-small': 1536,
+        'openai/text-embedding-3-large': 3072,
+        'qwen/qwen3-embedding-8b': 4096,
+        'bge-m3': 1024,
+        'baai/bge-m3': 1024,
+      },
+      // OpenRouter proxies arbitrary embedding models with widths we cannot
+      // know ahead of time; 0 = no silent default for unlisted ids.
+      default_dims: 0,
+      trust_custom_dims: true,
       // text-embedding-3-small was trained at MRL breakpoints 512/1024/1536
       // (Weaviate analysis); 768 is a practical intermediate. Users opt into
       // a smaller dim via `gbrain config set embedding_dimensions <N>`.
@@ -179,6 +213,17 @@ export const openrouter: Recipe = {
       // (per-input cap is 8192). This is the AGGREGATE budget the gateway uses
       // to pre-split batches, NOT per-input. Per-input is enforced upstream.
       max_batch_tokens: 300_000,
+    },
+    // Expansion uses the same routed OpenAI-compatible language-model endpoint
+    // as chat. Keep a small cheap/fast advisory set; the openai-compat tier
+    // still accepts any user-configured OpenRouter provider/model ID.
+    expansion: {
+      models: [
+        'anthropic/claude-haiku-4.5',
+        'google/gemini-3-flash-preview',
+        'deepseek/deepseek-chat',
+      ],
+      price_last_verified: '2026-05-20',
     },
     chat: {
       // Curated entry points (verified against OR's catalog 2026-05-20). The
@@ -195,7 +240,7 @@ export const openrouter: Recipe = {
         'deepseek/deepseek-chat',
       ],
       supports_tools: true,
-      // Informational only — real gate is isAnthropicProvider() upstream.
+      // Enforced — classifyCapabilities() refuses the subagent tier on this flag.
       supports_subagent_loop: false,
       // Family-scoped: OpenAI routes cache automatically; Anthropic routes
       // cache via the compat fetch shim's cache_control rewrite.
@@ -231,6 +276,6 @@ export const openrouter: Recipe = {
     },
   },
   setup_hint:
-    'Get an API key at https://openrouter.ai/settings/keys, then `export OPENROUTER_API_KEY=...` and use `openrouter:<provider>/<model>`. Optional overrides: OPENROUTER_BASE_URL (proxy), OPENROUTER_REFERER (attribution URL), OPENROUTER_TITLE (attribution name).',
+    'Get an API key at https://openrouter.ai/settings/keys, then `export OPENROUTER_API_KEY=...` or set `openrouter_api_key` in ~/.gbrain/config.json and use `openrouter:<provider>/<model>`. Optional overrides: OPENROUTER_BASE_URL (proxy), OPENROUTER_REFERER (attribution URL), OPENROUTER_TITLE (attribution name).',
   compat: { fetch: openrouterCompatFetch },
 };

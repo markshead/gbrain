@@ -13,33 +13,27 @@ import { parseModelId } from './ai/model-resolver.ts';
  *
  * Only keys that `buildGatewayConfig` (src/core/ai/build-gateway-config.ts)
  * actually folds from config into the gateway env may appear here.
- * GOOGLE_GENERATIVE_AI_API_KEY is deliberately absent: its config field is NOT
- * threaded to the gateway today, so the producer closures fall through to
- * checking `process.env` ONLY for it. That matches what the gateway can
- * actually use (the recipe reads that key from env). Counting a config-plane
- * google_api_key here would be a false positive: doctor/autopilot would call
- * the provider "configured" and dispatch an embed.stale job that then fails
- * auth at the gateway. When a future change threads google_api_key into
- * buildGatewayConfig, re-add the matching entry here in the same change.
  *
  * VOYAGE_API_KEY → voyage_api_key was the same kind of gap (#2662) until
  * buildGatewayConfig started folding it — now safe to list here too.
+ * GOOGLE_GENERATIVE_AI_API_KEY → google_api_key and DASHSCOPE_API_KEY →
+ * dashscope_api_key joined for the same reason (#3500): both are folded by
+ * buildGatewayConfig now, so a config-plane key is genuinely usable by the
+ * gateway and counting it here is no longer a false positive.
  *
- * Caveat inherited from the existing OPENAI_API_KEY/ZEROENTROPY_API_KEY
- * entries (unchanged by #2662, noted here for anyone extending this map):
- * autopilot's resolveKey resolves these fields via `engine.getConfig()`
- * (DB plane), while `buildGatewayConfig` only folds the FILE-plane
- * (config.json) value. A `gbrain config set voyage_api_key X` with no
- * matching config.json entry can therefore still read "configured" here
- * while the gateway has no key — a pre-existing false-positive class, not
- * introduced or fixed by this change. Closing it requires threading
- * `*_api_key` DB values through `loadConfigWithEngine()` before
- * `buildGatewayConfig`, which is a separate, larger change.
+ * The historical DB-plane/file-plane split for these fields is closed
+ * (#2119 read-side): `loadConfigWithEngine()` sparse-merges every
+ * `DB_MERGED_PROVIDER_KEY_FIELDS` entry from the DB plane (env > file > DB)
+ * before `buildGatewayConfig` folds the merged config into the gateway env,
+ * so a key that reads "configured" via `engine.getConfig()` is genuinely
+ * usable by the gateway on any path that runs the DB merge.
  */
 export const HOSTED_EMBED_KEY_CONFIG: Record<string, string> = {
   OPENAI_API_KEY: 'openai_api_key',
   ZEROENTROPY_API_KEY: 'zeroentropy_api_key',
   VOYAGE_API_KEY: 'voyage_api_key',
+  GOOGLE_GENERATIVE_AI_API_KEY: 'google_api_key',
+  DASHSCOPE_API_KEY: 'dashscope_api_key',
 };
 
 /**
@@ -160,6 +154,14 @@ export interface RecommendationContext {
   chatModel?: string;
   /** Whether the chat provider has a usable API key. */
   hasChatApiKey?: boolean;
+  /**
+   * D12: embedded chunks on pages with NO recorded embedding signature
+   * (unknown provenance — possibly a previous model's space). Probed by the
+   * engine-holding caller (loadRecommendationContext); this module is sync.
+   * When > 0, the embed.stale step widens with includeNullSignature so the
+   * cohort is re-embedded instead of grandfathered forever.
+   */
+  nullSignatureCohort?: number;
 }
 
 /** Triage result for one check. */
@@ -225,14 +227,26 @@ export function computeRecommendations(
   }
 
   // ---------------------------------------------------------------------
-  // embed.stale — missing embeddings. Critical: invisible to vector search
+  // embed.stale — missing embeddings AND/OR the NULL-signature cohort
+  // (unknown-provenance vectors that the grandfather clause would otherwise
+  // keep in a previous model's space forever). Critical: invisible to (or
+  // wrong in) vector search.
   // ---------------------------------------------------------------------
-  if (health.missing_embeddings > 0 && ctx.embeddingProviderConfigured !== false) {
-    const params = { stale: true, sourceId: ctx.sourceId };
+  const nullSigCohort = ctx.nullSignatureCohort ?? 0;
+  if ((health.missing_embeddings > 0 || nullSigCohort > 0) && ctx.embeddingProviderConfigured !== false) {
+    const params = {
+      stale: true,
+      sourceId: ctx.sourceId,
+      // D12: widen only when the cohort exists — the params feed the
+      // idempotency key, so a cohort appearing/clearing is semantically
+      // different work (one-time dedupe miss on transition, accepted).
+      ...(nullSigCohort > 0 && { includeNullSignature: true }),
+    };
     const embedModel = ctx.embeddingModel ?? 'openai:text-embedding-3-large';
     const embedDims = ctx.embeddingDimensions ?? 3072;
-    // Rough char estimate per chunk ~ 1.5k chars (chunker target).
-    const estChars = health.missing_embeddings * 1500;
+    // Rough char estimate per chunk ~ 1.5k chars (chunker target). The
+    // cohort is real re-embed spend too — count it (round-2 #12).
+    const estChars = (health.missing_embeddings + nullSigCohort) * 1500;
     let est_usd_cost = 0;
     try {
       const priceLookup = lookupEmbeddingPrice(embedModel);
@@ -242,17 +256,24 @@ export function computeRecommendations(
     } catch {
       /* unknown model — leave at 0, surface as warning elsewhere */
     }
+    const rationaleParts: string[] = [];
+    if (health.missing_embeddings > 0) {
+      rationaleParts.push(`${health.missing_embeddings} chunk${health.missing_embeddings === 1 ? '' : 's'} invisible to vector search`);
+    }
+    if (nullSigCohort > 0) {
+      rationaleParts.push(`${nullSigCohort} chunk${nullSigCohort === 1 ? '' : 's'} with no recorded embedding signature (unknown provenance)`);
+    }
     out.push({
       id: 'embed.stale',
       job: 'embed',
       params,
       idempotency_key: idemKey(source, 'embed', { ...params, embedModel, embedDims }),
       severity: 'critical',
-      est_seconds: Math.min(3600, 5 + health.missing_embeddings * 0.05),
+      est_seconds: Math.min(3600, 5 + (health.missing_embeddings + nullSigCohort) * 0.05),
       est_usd_cost,
       // sync should run first so embed sees fresh pages.
       depends_on: ctx.repoPath && health.stale_pages > 0 ? ['sync.repo'] : [],
-      rationale: `${health.missing_embeddings} chunk${health.missing_embeddings === 1 ? '' : 's'} invisible to vector search`,
+      rationale: rationaleParts.join('; '),
       status: 'remediable',
     });
   }
@@ -414,8 +435,9 @@ function pickMax(current: number, max: number, status: RemediationStatus | undef
 
 // ---------------------------------------------------------------------
 // Idempotency key construction (D9 — content-hash, no time-slot).
-// Same params produce the same key across runs. Failed-row replay
-// appends `:r<N>` (caller responsibility — handled by --remediate loop).
+// Same params produce the same key across runs. Terminal-row replay
+// (a completed/failed row holds the key forever) rotates the key to
+// `:r:<doctor_run_id>` in the --remediate loop (#3626, remediation/run.ts).
 // ---------------------------------------------------------------------
 
 function idemKey(source: string, job: string, params: Record<string, unknown>): string {

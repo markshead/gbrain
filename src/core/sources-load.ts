@@ -73,6 +73,44 @@ function unwrapConfigLayers(config: unknown): { value: unknown; layers: number }
 }
 
 /**
+ * Recover the canonical object from historical config shapes.
+ *
+ * A naive JSONB `||` merge could turn a string-shaped config plus an object
+ * patch into an array. Those arrays are an ordered sequence of config
+ * fragments, so merge recoverable object fragments left-to-right. This keeps
+ * the latest patch authoritative while preserving keys from older fragments.
+ */
+function coerceSourceConfigObject(config: unknown): {
+  value: Record<string, unknown> | null;
+  layers: number;
+  recoveredArray: boolean;
+} {
+  const root = unwrapConfigLayers(config);
+  if (isPlainObject(root.value)) {
+    return { value: root.value, layers: root.layers, recoveredArray: false };
+  }
+  if (!Array.isArray(root.value)) {
+    return { value: null, layers: root.layers, recoveredArray: false };
+  }
+
+  const merged: Record<string, unknown> = {};
+  let objectFragments = 0;
+  let layers = root.layers;
+  for (const fragment of root.value) {
+    const unwrapped = unwrapConfigLayers(fragment);
+    layers += unwrapped.layers;
+    if (!isPlainObject(unwrapped.value)) continue;
+    Object.assign(merged, unwrapped.value);
+    objectFragments++;
+  }
+  return {
+    value: objectFragments > 0 ? merged : null,
+    layers,
+    recoveredArray: objectFragments > 0,
+  };
+}
+
+/**
  * #2829: coerce a config value to the underlying plain object before it is
  * written back, fully unwrapping any accidental JSON-string nesting so a
  * re-wrapping bug can't keep growing a layer on every write. Returns {} (with a
@@ -82,10 +120,10 @@ function unwrapConfigLayers(config: unknown): { value: unknown; layers: number }
  * object.
  */
 export function normalizeSourceConfig(config: unknown): Record<string, unknown> {
-  const { value } = unwrapConfigLayers(config);
-  if (isPlainObject(value)) return value;
+  const { value } = coerceSourceConfigObject(config);
+  if (value) return value;
   console.warn(
-    `[gbrain] source config was not a JSON object (got ${value === null ? 'null' : typeof value}); ` +
+    `[gbrain] source config was not a recoverable JSON object; ` +
     `storing {} instead. Run 'gbrain doctor' to find affected sources.`,
   );
   return {};
@@ -99,20 +137,49 @@ export function normalizeSourceConfig(config: unknown): Record<string, unknown> 
  * path; two or more means the value was re-wrapped and should be repaired).
  */
 export function parseSourceConfig(config: unknown): Record<string, unknown> {
-  const { value, layers } = unwrapConfigLayers(config);
-  if (layers > 1) {
+  const { value, layers, recoveredArray } = coerceSourceConfigObject(config);
+  if (layers > 1 || recoveredArray) {
+    const shape = recoveredArray ? 'historical JSON array' : `${layers}-layer nested JSON string`;
     console.warn(
-      `[gbrain] source config was stored as a ${layers}-layer nested JSON string; ` +
+      `[gbrain] source config was stored as a ${shape}; ` +
       `it will be repaired on the next config write. Run 'gbrain doctor' to find affected sources.`,
     );
   }
-  return isPlainObject(value) ? value : {};
+  return value ?? {};
+}
+
+/** True iff config declares a non-empty remote URL. */
+export function sourceConfigHasRemoteUrl(config: unknown): boolean {
+  const remoteUrl = parseSourceConfig(config).remote_url;
+  return typeof remoteUrl === 'string' && remoteUrl.trim().length > 0;
 }
 
 /** True iff the source's config.federated field is the literal boolean true. */
 export function isSourceFederated(config: unknown): boolean {
   const parsed = parseSourceConfig(config);
   return parsed.federated === true;
+}
+
+/**
+ * Three-way federation state for display (CLI `sources list`, etc.).
+ *
+ * `isSourceFederated` collapses to a boolean for the inclusion check (does
+ * this source show up in OTHER anchors' unqualified reads?), which is
+ * correctly strict — 'unset' behaves like 'isolated' there. But 'unset' and
+ * 'isolated' are NOT interchangeable for display: only an explicit
+ * `federated: false` (`sources unfederate` / `--no-federated`) opts a source
+ * out of cross-source read mixing in both directions. A source that has
+ * simply never set the flag still widens its OWN unqualified reads to
+ * include the federated set (the #1434 sole-source convenience, pinned
+ * behavior — see test/local-federated-search-scope.test.ts and
+ * test/unfederate-read-scope-2928.test.ts). Labeling it "isolated" overstates
+ * what the flag actually does.
+ */
+export function sourceFederationState(config: unknown): 'federated' | 'isolated' | 'unset' {
+  const raw = parseSourceConfig(config).federated;
+  if (raw === true) return 'federated';
+  if (raw === false) return 'isolated';
+  return 'unset';
 }
 
 /**

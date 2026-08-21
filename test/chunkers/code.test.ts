@@ -16,7 +16,7 @@ describe('CHUNKER_VERSION', () => {
 });
 
 describe('detectCodeLanguage', () => {
-  test('recognizes all 30 supported extensions', () => {
+  test('recognizes supported extensions', () => {
     const cases: Record<string, string> = {
       'foo.ts': 'typescript', 'foo.tsx': 'tsx', 'foo.mts': 'typescript', 'foo.cts': 'typescript',
       'foo.js': 'javascript', 'foo.jsx': 'javascript', 'foo.mjs': 'javascript', 'foo.cjs': 'javascript',
@@ -28,7 +28,7 @@ describe('detectCodeLanguage', () => {
       'foo.scala': 'scala', 'foo.lua': 'lua', 'foo.ex': 'elixir',
       'foo.elm': 'elm', 'foo.ml': 'ocaml', 'foo.dart': 'dart',
       'foo.zig': 'zig', 'foo.sol': 'solidity', 'foo.sh': 'bash',
-      'foo.css': 'css', 'foo.html': 'html', 'foo.vue': 'vue',
+      'foo.css': 'css', 'foo.html': 'html', 'foo.astro': 'html', 'foo.svelte': 'html', 'foo.vue': 'vue',
       'foo.json': 'json', 'foo.yaml': 'yaml', 'foo.toml': 'toml',
       // v0.41 D2 wave: SQL via DerekStride/tree-sitter-sql.
       'foo.sql': 'sql', 'migrations/001_init.sql': 'sql',
@@ -422,5 +422,24 @@ describe('chunkCodeText — empty input', () => {
   test('empty source returns empty array', async () => {
     expect(await chunkCodeText('', 'foo.ts')).toEqual([]);
     expect(await chunkCodeText('   \n  ', 'foo.ts')).toEqual([]);
+  });
+});
+
+describe('chunkCodeText — C# file-scoped namespace (#3601)', () => {
+  test('indexes the class body inside a file-scoped namespace', async () => {
+    const source = `using System;
+namespace Demo;
+
+public class OrderService
+{
+    public decimal ComputeRefund(decimal amount) => amount * 0.9m;
+}
+`;
+
+    const result = await chunkCodeText(source, 'OrderService.cs');
+    const text = result.map(chunk => chunk.text).join('\n');
+
+    expect(text).toContain('OrderService');
+    expect(text).toContain('ComputeRefund');
   });
 });

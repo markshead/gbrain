@@ -72,12 +72,24 @@ export class SlugRegistryError extends Error {
 // SlugRegistry
 // ---------------------------------------------------------------------------
 
-// Shares the page-slug segment grammar (incl. CJK ranges, #738) with
+// Shares the page-slug segment grammar (all scripts, #738/#3417) with
 // validatePageSlug; keeps this site's dir/name shape (>= 2 segments).
-const SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})+$`);
+// `u` flag required by PAGE_SLUG_SEG's \p{...} classes.
+const SLUG_RE = new RegExp(`^${PAGE_SLUG_SEG}(\\/${PAGE_SLUG_SEG})+$`, 'u');
 
 export class SlugRegistry {
-  constructor(private engine: BrainEngine) {}
+  /**
+   * `sourceId` scopes every existence probe to the SAME source the paired
+   * putPage will write to (engine.putPage defaults to 'default' when unset).
+   * Pre-fix the probes were UNSCOPED — getPage matched a slug in ANY source,
+   * so a slug taken only in source B forced a spurious disambiguation (or a
+   * false isFree=false) for a write that was going to land in source A.
+   */
+  constructor(private engine: BrainEngine, private sourceId?: string) {}
+
+  private scope(): { sourceId: string } {
+    return { sourceId: this.sourceId ?? 'default' };
+  }
 
   /**
    * Create a new slug, or disambiguate if taken. Checks engine.getPage(slug)
@@ -92,7 +104,7 @@ export class SlugRegistry {
     }
 
     // Fast path: desired is free
-    const existing = await this.engine.getPage(desiredSlug);
+    const existing = await this.engine.getPage(desiredSlug, this.scope());
     if (!existing) {
       return { slug: desiredSlug, exact: true };
     }
@@ -109,7 +121,7 @@ export class SlugRegistry {
     // append-numeric disambiguation: start at 2 (matches "alice-smith" → "alice-smith-2")
     for (let n = 2; n <= maxDisambiguator; n++) {
       const candidate = `${desiredSlug}-${n}`;
-      const conflict = await this.engine.getPage(candidate);
+      const conflict = await this.engine.getPage(candidate, this.scope());
       if (!conflict) {
         return { slug: candidate, exact: false, disambiguator: n };
       }
@@ -128,7 +140,7 @@ export class SlugRegistry {
    */
   async isFree(slug: string): Promise<boolean> {
     if (!SLUG_RE.test(slug)) return false;
-    const existing = await this.engine.getPage(slug);
+    const existing = await this.engine.getPage(slug, this.scope());
     return !existing;
   }
 

@@ -177,6 +177,31 @@ describe('runEmbed --all (parallel)', () => {
     expect(result.embedded).toBe(0);
   });
 
+  test('#1737 review catch: signal aborted during chunkless-page healing stops before invalidateStaleSignatureEmbeddings', async () => {
+    // Round-3 review finding: embedAllStale must check the abort signal
+    // immediately after the chunkless-page healing sweep, before falling
+    // through into invalidateStaleSignatureEmbeddings (a write path) —
+    // otherwise a caller-cancelled run could still NULL out
+    // signature-drifted embeddings and exit, leaving retrieval degraded.
+    const ac = new AbortController();
+    let invalidateCalled = false;
+    const engine = mockEngine({
+      countChunklessPagesWithContent: async () => 1,
+      listChunklessPagesWithContent: async () => {
+        // Simulate the caller's cancellation firing WHILE the healing sweep
+        // is mid-flight (e.g. worker timeout / lock loss / SIGTERM).
+        ac.abort(new Error('lock-lost'));
+        return [];
+      },
+      invalidateStaleSignatureEmbeddings: async () => { invalidateCalled = true; return 0; },
+      countStaleChunks: async () => 0,
+    });
+
+    await runEmbedCore(engine, { stale: true, signal: ac.signal });
+
+    expect(invalidateCalled).toBe(false);
+  });
+
   test('respects GBRAIN_EMBED_CONCURRENCY=1 (serial)', async () => {
     const pages = Array.from({ length: 5 }, (_, i) => ({ slug: `page-${i}` }));
     const chunksBySlug = new Map(
@@ -278,6 +303,38 @@ describe('runEmbedCore --dry-run never calls the embedding model', () => {
     // countStaleChunks call. pages_processed is 0 because we don't enumerate
     // pages in dry-run (cheaper pre-flight).
     expect(result.pages_processed).toBe(0);
+  });
+
+  test('dry-run --stale emits no page progress, since it processes no pages', async () => {
+    const { runEmbedCore } = await import('../src/commands/embed.ts');
+    const stale = [
+      { slug: 'a', chunk_index: 0, chunk_text: 'a', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+      { slug: 'b', chunk_index: 0, chunk_text: 'b', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 2 },
+      { slug: 'c', chunk_index: 0, chunk_text: 'c', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 3 },
+    ];
+    const engine = mockEngine({
+      countStaleChunks: async () => stale.length,
+      listStaleChunks: async () => stale,
+      listPages: async () => [{ slug: 'a' }, { slug: 'b' }, { slug: 'c' }],
+      getChunks: async () => [],
+    });
+
+    const calls: Array<[number, number]> = [];
+    const result = await runEmbedCore(engine, {
+      stale: true,
+      dryRun: true,
+      onProgress: (done, total) => { calls.push([done, total]); },
+    });
+
+    // The CLI latches its `embed.pages` total from the first callback, so a
+    // synthetic (1, 1) here made the progress stream announce one page while
+    // the summary named every stale chunk. Consistent with pages_processed
+    // above: a dry run enumerates no pages, so it reports no page progress.
+    // docs/progress-events.md permits omitting a total that is not known up
+    // front; it does not permit asserting a wrong one.
+    expect(calls).toEqual([]);
+    expect(result.pages_processed).toBe(0);
+    expect(result.would_embed).toBe(3);
   });
 
   test('dry-run --stale correctly identifies stale chunks (SQL-side path)', async () => {
@@ -567,7 +624,7 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
     }
   });
 
-  test('case 4: non-rate-limit error rethrows immediately without retry', async () => {
+  test('case 4: non-retriable error rethrows immediately without retry', async () => {
     const { embedBatchWithBackoff } = await import('../src/commands/embed.ts');
     let calls = 0;
     embedBatchBehavior = async () => {
@@ -575,8 +632,31 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
       throw new Error('500 internal server error');
     };
     await expect(embedBatchWithBackoff(['x'])).rejects.toThrow('500 internal server error');
-    // Single attempt — no retries on non-429.
+    // Single attempt — no retries on non-gateway 5xx (#3966 keeps 500 fatal).
     expect(calls).toBe(1);
+  });
+
+  test('case 4b: 502 Bad Gateway retries then succeeds (#3966)', async () => {
+    const { embedBatchWithBackoff, detectGatewayErrorFromCause } = await import('../src/commands/embed.ts');
+    expect(detectGatewayErrorFromCause({ cause: { status: 502 } })).toBe(true);
+    expect(detectGatewayErrorFromCause({ cause: { status: 503 } })).toBe(true);
+    expect(detectGatewayErrorFromCause({ cause: { status: 504 } })).toBe(true);
+    expect(detectGatewayErrorFromCause({ cause: { status: 500 } })).toBe(false);
+
+    let calls = 0;
+    embedBatchBehavior = async () => {
+      calls++;
+      if (calls === 1) {
+        // NIM-style wrap: status on cause; parseable delay keeps the test fast.
+        const err = new Error('[embed(nvidia:nvidia/nv-embed-v1)] Bad Gateway — try again in 10ms');
+        (err as any).cause = { status: 502 };
+        throw err;
+      }
+      return [new Float32Array(1536)];
+    };
+    const result = await embedBatchWithBackoff(['x']);
+    expect(calls).toBe(2);
+    expect(result).toHaveLength(1);
   });
 
   test('case 5: jitter range — same parsed delay produces non-identical sleeps across runs', async () => {
@@ -615,7 +695,7 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
   });
 
   test('case 7: AITransientError-shaped wrap with 429 cause triggers retry; 500 cause does not', async () => {
-    const { embedBatchWithBackoff, detect429FromCause } = await import('../src/commands/embed.ts');
+    const { embedBatchWithBackoff, detect429FromCause, detectGatewayErrorFromCause } = await import('../src/commands/embed.ts');
 
     // Pure helper checks first.
     expect(detect429FromCause({ cause: { status: 429 } })).toBe(true);
@@ -624,6 +704,7 @@ describe('embedBatchWithBackoff (D2/D4/D4a/D8)', () => {
     expect(detect429FromCause({ status: 500 })).toBe(false);
     expect(detect429FromCause(undefined)).toBe(false);
     expect(detect429FromCause(null)).toBe(false);
+    expect(detectGatewayErrorFromCause({ cause: { cause: { status: 502 } } })).toBe(true);
     // Deep wrap (defensive — current normalizeAIError wraps once).
     expect(detect429FromCause({ cause: { cause: { status: 429 } } })).toBe(true);
 
@@ -905,5 +986,78 @@ describe('runEmbed preserves code-chunk metadata across re-embed (regression for
     expect(upsertChunkArgs).not.toBeNull();
     expect(upsertChunkArgs!).toHaveLength(1);
     expect(metadataOf(upsertChunkArgs![0])).toEqual(metadataOf(fullCodeChunk));
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// #3507 — `embed --stale` must reproduce the page's STORED
+// contextual-retrieval wrapping convention instead of embedding raw
+// chunk_text (which silently stripped contextual prefixes on every
+// re-embed, including the normal post-model-migration path).
+// ────────────────────────────────────────────────────────────────
+
+describe('embed --stale contextual-retrieval wrapping (#3507)', () => {
+  const wrapChunks = [
+    { chunk_index: 0, chunk_text: 'prose chunk', chunk_source: 'compiled_truth', embedded_at: null, token_count: 1 },
+    { chunk_index: 1, chunk_text: 'const x = 1;', chunk_source: 'fenced_code', embedded_at: null, token_count: 1 },
+  ];
+  const wrapStale = [
+    { slug: 'wrapped', chunk_index: 0, chunk_text: 'prose chunk', chunk_source: 'compiled_truth' as const, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+    { slug: 'wrapped', chunk_index: 1, chunk_text: 'const x = 1;', chunk_source: 'fenced_code' as any, model: null, token_count: 1, source_id: 'default', page_id: 1 },
+  ];
+
+  function wrappingHarness(mode: string | null) {
+    const seen: string[] = [];
+    const restamps: any[][] = [];
+    embedBatchBehavior = async (texts: string[]) => {
+      seen.push(...texts);
+      return texts.map(() => new Float32Array(1536));
+    };
+    const engine = mockEngine({
+      countStaleChunks: async () => 2,
+      listStaleChunks: async () => wrapStale,
+      getPage: async () => ({
+        slug: 'wrapped',
+        title: 'Widget Notes',
+        source_id: 'default',
+        compiled_truth: 'x',
+        timeline: '',
+        contextual_retrieval_mode: mode,
+      }),
+      getChunks: async () => wrapChunks,
+      upsertChunks: async () => {},
+      updatePageContextualRetrievalState: async (...args: any[]) => { restamps.push(args); },
+    });
+    return { engine, seen, restamps };
+  }
+
+  test('title-mode page: stale re-embed wraps prose with the title prefix; fenced_code stays raw', async () => {
+    const { engine, seen, restamps } = wrappingHarness('title');
+    const result = await runEmbedCore(engine, { stale: true });
+    expect(result.embedded).toBe(2);
+    expect(seen).toContain('<context>Widget Notes\n</context>\nprose chunk');
+    expect(seen).toContain('const x = 1;');
+    expect(restamps).toHaveLength(0); // title tier: stamp already honest
+  });
+
+  test('per_chunk_synopsis page: fully re-embedded page restamps to the title tier', async () => {
+    const { engine, seen, restamps } = wrappingHarness('per_chunk_synopsis');
+    const result = await runEmbedCore(engine, { stale: true });
+    expect(result.embedded).toBe(2);
+    expect(seen).toContain('<context>Widget Notes\n</context>\nprose chunk');
+    expect(restamps).toHaveLength(1);
+    const [slug, sourceId, newMode] = restamps[0];
+    expect(slug).toBe('wrapped');
+    expect(sourceId).toBe('default');
+    expect(newMode).toBe('title');
+  });
+
+  test('page with no stored CR mode embeds raw chunk_text (convention preserved)', async () => {
+    const { engine, seen, restamps } = wrappingHarness(null);
+    const result = await runEmbedCore(engine, { stale: true });
+    expect(result.embedded).toBe(2);
+    expect(seen).toContain('prose chunk');
+    expect(seen.some((t) => t.startsWith('<context>'))).toBe(false);
+    expect(restamps).toHaveLength(0);
   });
 });

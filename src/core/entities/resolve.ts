@@ -22,6 +22,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { normalizeAlias } from '../search/alias-normalize.ts';
+import { isUndefinedTableError } from '../utils.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -55,6 +57,13 @@ export async function resolveEntitySlug(
     if (exact) return exact;
   }
 
+  // 1.5. Alias-exact (v0.46.15 identity wave, #3730): an unambiguous
+  //      page_aliases hit resolves BEFORE prefix expansion / fuzzy — the
+  //      alias table is curated ground truth ("saoirse" → people/saoirse-x)
+  //      while fuzzy is a guess. Live-page verified (page_aliases has no FK).
+  const aliased = await tryAliasExact(engine, source_id, trimmed);
+  if (aliased) return aliased;
+
   // 2. Prefix-expansion match: when the input looks like a bare first name
   //    (no slash, no prefix, slugifies to a single short token), try
   //    `people/<token>-%` then `companies/<token>-%`. Short bare names
@@ -74,7 +83,54 @@ export async function resolveEntitySlug(
   }
 
   // 4. Fallback: deterministic slugify.
+  return fallbackSlugify(trimmed);
+}
+
+/**
+ * #3447 — shared fallback for both resolvers. slugify()'s `[^a-z0-9]+ → '-'`
+ * rule rewrites the path separator, so running slug-shaped input through it
+ * corrupts a well-formed slug (`people/alice-example` → `people-alice-example`)
+ * into one no page can ever have — and the flattened slug never resolves, so
+ * every re-extraction re-mints it. Path-shaped input is slugified PER SEGMENT
+ * (identity for already-well-formed slugs); display names keep plain slugify.
+ */
+function fallbackSlugify(trimmed: string): string {
+  if (trimmed.includes('/')) {
+    return trimmed.split('/').map(slugify).filter(Boolean).join('/');
+  }
   return slugify(trimmed);
+}
+
+/**
+ * Alias-exact arm (v0.46.15, #3730): unambiguous single-slug page_aliases hit,
+ * verified against LIVE pages — page_aliases has no FK to pages, so stale
+ * alias rows for deleted/renamed pages linger (outside-voice R2-8).
+ * Liveness is filtered BEFORE uniqueness (codex ship-review): a stale sibling
+ * row must not veto the sole live target — that fall-through would land on
+ * fuzzy/slugify and could recreate a phantom slug on a WRITE path.
+ * Fail-open on undefined-table (pre-v110 brains have no page_aliases table);
+ * other errors warn once per process so degradation isn't silent.
+ */
+let aliasExactWarned = false;
+async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
+  const norm = normalizeAlias(raw);
+  if (!norm) return null;
+  try {
+    const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
+    if (!hits.length) return null;
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])`,
+      [source_id, [...new Set(hits.map((h) => h.slug))]],
+    );
+    const live = [...new Set(rows.map((r) => r.slug))];
+    return live.length === 1 ? live[0] : null;
+  } catch (err) {
+    if (!isUndefinedTableError(err) && !aliasExactWarned) {
+      aliasExactWarned = true;
+      console.error(`[gbrain] alias-exact resolution degraded (falling through to fuzzy): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return null;
+  }
 }
 
 /**
@@ -111,7 +167,7 @@ const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
  * The original `resolveEntitySlug` keeps its existing contract (returns
  * just the slug) for all pre-v0.40 call sites — no caller-side churn.
  */
-export type ResolutionSource = 'exact_page' | 'fuzzy_match' | 'fallback_slugify';
+export type ResolutionSource = 'exact_page' | 'alias_exact' | 'fuzzy_match' | 'fallback_slugify';
 
 export interface ResolveResult {
   slug: string;
@@ -133,6 +189,9 @@ export async function resolveEntitySlugWithSource(
     if (exact) return { slug: exact, source: 'exact_page' };
   }
 
+  const aliased = await tryAliasExact(engine, source_id, trimmed);
+  if (aliased) return { slug: aliased, source: 'alias_exact' };
+
   if (isBareName(trimmed)) {
     const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
     if (expanded) return { slug: expanded, source: 'fuzzy_match' };
@@ -141,7 +200,7 @@ export async function resolveEntitySlugWithSource(
     if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
   }
 
-  return { slug: slugify(trimmed), source: 'fallback_slugify' };
+  return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
 }
 
 /**

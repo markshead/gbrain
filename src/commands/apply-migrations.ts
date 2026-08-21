@@ -16,9 +16,11 @@ import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
 import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
-
-/** Bug 3 — max consecutive partials before we wedge a migration. */
-const MAX_CONSECUTIVE_PARTIALS = 3;
+import {
+  indexCompletedEntries,
+  statusForVersion as ledgerStatusForVersion,
+  MAX_CONSECUTIVE_PARTIALS,
+} from '../core/migration-ledger.ts';
 
 interface ApplyMigrationsArgs {
   list: boolean;
@@ -108,7 +110,7 @@ Flags:
 
 Exit codes:
   0  Success (including "nothing to do").
-  1  An orchestrator failed.
+  1  An orchestrator failed, or schema migrations are pending (re-run with --yes).
   2  Invalid arguments.
 `);
 }
@@ -117,53 +119,18 @@ interface CompletedIndex {
   byVersion: Map<string, CompletedMigrationEntry[]>;
 }
 
+// Ledger status logic moved to src/core/migration-ledger.ts (shared with the
+// get_health op's migrations block, TODOS:4063) — same semantics, same Bug 3
+// "complete wins / trailing retry overrides / consecutive-partial cap" rules.
 function indexCompleted(entries: CompletedMigrationEntry[]): CompletedIndex {
-  const byVersion = new Map<string, CompletedMigrationEntry[]>();
-  for (const e of entries) {
-    const list = byVersion.get(e.version) ?? [];
-    list.push(e);
-    byVersion.set(e.version, list);
-  }
-  return byVersion.size > 0
-    ? { byVersion }
-    : { byVersion: new Map() };
+  return { byVersion: indexCompletedEntries(entries) };
 }
 
-/**
- * Returns the resolved status for a migration based on its entries.
- *
- * Semantics (Bug 3 — keep "complete wins" safety):
- *   - If the latest entry is `retry`, the version is pending. This is the
- *     explicit escape hatch written by `--force-retry`, and it overrides an
- *     earlier `complete` entry without hand-editing the ledger.
- *   - Otherwise, if any entry is `complete`, the version is complete.
- *   - Otherwise, if any entry is `partial`, the version is partial.
- *   - Otherwise, pending.
- *
- * `complete` never regresses accidentally. A later `partial` append cannot
- * undo a completed migration; only a trailing, explicit `retry` marker can.
- */
 function statusForVersion(
   version: string,
   idx: CompletedIndex,
 ): 'complete' | 'partial' | 'pending' | 'wedged' {
-  const entries = idx.byVersion.get(version) ?? [];
-  if (entries.length === 0) return 'pending';
-  const latest = entries[entries.length - 1];
-  if (latest.status === 'retry') return 'pending';
-  if (entries.some(e => e.status === 'complete')) return 'complete';
-  // Bug 3 attempt cap — count consecutive partials from the end (stopping
-  // at any 'retry' or 'complete'). If we hit MAX_CONSECUTIVE_PARTIALS,
-  // the migration is wedged and needs explicit --force-retry to try again.
-  let consecutive = 0;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.status === 'partial') consecutive++;
-    else break;
-  }
-  if (consecutive >= MAX_CONSECUTIVE_PARTIALS) return 'wedged';
-  if (entries.some(e => e.status === 'partial')) return 'partial';
-  return 'pending';
+  return ledgerStatusForVersion(version, idx.byVersion);
 }
 
 interface Plan {
@@ -258,6 +225,41 @@ function printDryRun(plan: Plan, installed: string): void {
   } else {
     console.log('Re-run without --dry-run to apply. Use --yes to skip prompts.');
   }
+}
+
+/**
+ * #1530: schema-drift pre-flight resolution. When the schema version is
+ * behind, `--yes`/`--non-interactive` runs the schema migrations right there
+ * (the engine is already connected); interactive runs warn and return true so
+ * the caller exits non-zero instead of claiming "All migrations up to date".
+ * All output goes to stderr (migrations never print to stdout).
+ *
+ * Returns true when the schema is STILL behind after this call.
+ */
+async function resolveSchemaBehind(opts: {
+  schemaVer: number;
+  latest: number;
+  autoApply: boolean;
+  run: () => Promise<{ applied: number; current: number }>;
+}): Promise<boolean> {
+  const { schemaVer, latest, autoApply, run } = opts;
+  if (schemaVer >= latest) return false;
+  if (autoApply) {
+    console.error(`Schema version ${schemaVer} is behind latest ${latest}; running schema migrations...`);
+    try {
+      const result = await run();
+      console.error(`Applied ${result.applied} schema migration(s); now at v${result.current}.`);
+      return false;
+    } catch (err) {
+      console.error(`Schema migration failed: ${err instanceof Error ? err.message : String(err)}`);
+      return true;
+    }
+  }
+  console.warn(
+    `\n⚠️  Schema version ${schemaVer} is behind latest ${latest}.\n` +
+    `   Run \`gbrain apply-migrations --yes\` to apply now, or \`gbrain init --migrate-only\`.\n`,
+  );
+  return true;
 }
 
 function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
@@ -355,10 +357,13 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     if (cli.forceAll) return; // both surfaces flushed
   }
 
-  // Pre-flight: warn if schema migrations (migrate.ts) are behind.
-  // apply-migrations runs orchestrator migrations only; schema migrations
-  // run via connectEngine() / initSchema(). Users often expect this CLI
-  // to handle everything (Issue 1 from v0.18.0 field report).
+  // Pre-flight: detect schema migrations (migrate.ts) being behind.
+  // apply-migrations historically ran orchestrator migrations only; schema
+  // migrations run via connectEngine() / initSchema(). Users expect this CLI
+  // to handle everything (Issue 1 from v0.18.0 field report; #1530). With
+  // --yes/--non-interactive we apply them here; otherwise we warn and make
+  // sure the run does NOT report "All migrations up to date" with exit 0.
+  let schemaBehind = false;
   try {
     const { LATEST_VERSION } = await import('../core/migrate.ts');
     const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
@@ -378,14 +383,16 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
         await eng.connect(toEngineConfig(cfg));
         const verStr = await eng.getConfig('version');
         const schemaVer = parseInt(verStr || '1', 10);
+        const { runMigrations } = await import('../core/migrate.ts');
+        schemaBehind = await resolveSchemaBehind({
+          schemaVer,
+          latest: LATEST_VERSION,
+          // --list and --dry-run are read-only surfaces: never mutate schema
+          // even when combined with --yes/--non-interactive.
+          autoApply: (cli.yes || cli.nonInteractive) && !cli.dryRun && !cli.list,
+          run: () => runMigrations(eng),
+        });
         await eng.disconnect();
-        if (schemaVer < LATEST_VERSION) {
-          console.warn(
-            `\n⚠️  Schema version ${schemaVer} is behind latest ${LATEST_VERSION}.\n` +
-            `   Schema migrations run automatically on next connectEngine() / initSchema().\n` +
-            `   To run them now: gbrain init --migrate-only\n`,
-          );
-        }
       }
     }
   } catch {
@@ -420,6 +427,13 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
   const toRun: Migration[] = [...plan.partial, ...plan.pending];
   if (toRun.length === 0) {
+    if (schemaBehind) {
+      console.error(
+        'Orchestrator migrations are up to date, but schema migrations are behind. ' +
+        'Run `gbrain apply-migrations --yes` (or `--force-schema`) to apply them.',
+      );
+      process.exit(1);
+    }
     console.log('All migrations up to date.');
     process.exit(0);
   }
@@ -511,4 +525,5 @@ export const __testing = {
   buildPlan,
   indexCompleted,
   statusForVersion,
+  resolveSchemaBehind,
 };

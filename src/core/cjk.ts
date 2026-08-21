@@ -21,12 +21,35 @@ export const CJK_SLUG_CHARS = '一-鿿぀-ゟ゠-ヿ가-힯';
 export const CJK_RANGES_REGEX = new RegExp(`[${CJK_SLUG_CHARS}]`);
 
 /**
- * Page-slug segment grammar (no anchors): alnum-or-CJK lead char, then
- * alnum/CJK/hyphen continuation. Single source for validatePageSlug
- * (operations.ts), SlugRegistry's SLUG_RE, and the dream-cycle
- * SUMMARY_SLUG_RE so every slug validator shares one grammar (#738).
+ * Slug "word" character class (#3417): every script's letters, not just
+ * Latin + CJK. Unicode property escapes — REQUIRES the `u` flag on any
+ * regex composed from this string (without `u`, `\p{Ll}` silently matches
+ * the literal chars `p`, `L`, `l`, `{`, `}`).
+ *
+ *   \p{Ll} lowercase letters (a-z, Cyrillic/Greek lowercase, đ, …)
+ *   \p{Lm} modifier letters
+ *   \p{Lo} caseless-script letters (Hebrew, Arabic, Thai, CJK, Devanagari, …)
+ *   \p{M}  combining marks that survive the Latin accent-strip pass
+ *          (Hebrew niqqud, Arabic harakat, Thai/Devanagari vowel signs)
+ *   \p{N}  numbers (0-9, Arabic-Indic digits, …)
+ *
+ * Uppercase (\p{Lu}/\p{Lt}) is deliberately excluded: slugifySegment()
+ * lowercases before filtering, so validators stay lowercase-canonical.
+ *
+ * Distinct from CJK_SLUG_CHARS above, which also drives the
+ * countCJKAwareWords density heuristic — do NOT merge the two, or slug
+ * grammar changes silently change chunking behavior.
  */
-export const PAGE_SLUG_SEG = `[a-z0-9${CJK_SLUG_CHARS}][a-z0-9${CJK_SLUG_CHARS}\\-]*`;
+export const SLUG_WORD_CHARS = '\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}\\p{N}';
+
+/**
+ * Page-slug segment grammar (no anchors): word-char lead, then word-char or
+ * hyphen continuation. Single source for validatePageSlug (operations.ts),
+ * SlugRegistry's SLUG_RE, and the dream-cycle SUMMARY_SLUG_RE so every slug
+ * validator shares one grammar (#738). Compose with the `u` flag — see
+ * SLUG_WORD_CHARS.
+ */
+export const PAGE_SLUG_SEG = `[${SLUG_WORD_CHARS}][${SLUG_WORD_CHARS}\\-]*`;
 
 export const CJK_SENTENCE_DELIMITERS = ['。', '！', '？']; // 。！？
 export const CJK_CLAUSE_DELIMITERS = ['；', '：', '，', '、']; // ；：，、
@@ -73,3 +96,19 @@ export function countCJKAwareWords(s: string): number {
 export function escapeLikePattern(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
+
+/**
+ * Splits a CJK query into distinct, non-empty whitespace-delimited terms.
+ *
+ * In Korean and Japanese, word order is flexible and particles attach to nouns,
+ * so the same fact or search intent frequently appears in varying token sequences
+ * (e.g. "김대리 미팅" vs "미팅 김대리"). Splitting into individual terms allows
+ * multi-term conjunction (AND matching) across chunk text regardless of word order.
+ *
+ * Returns deduplicated terms preserving the original order of appearance.
+ */
+export function splitCJKQueryTerms(query: string): string[] {
+  const terms = query.split(/\s+/).filter(t => t.length > 0);
+  return Array.from(new Set(terms));
+}
+

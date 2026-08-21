@@ -35,6 +35,10 @@ describe('CANONICAL_PRICING — table integrity', () => {
     }
   });
 
+  test('Opus 5 present at $5/$25 (same tier as Opus 4.8)', () => {
+    expect(CANONICAL_PRICING['anthropic:claude-opus-5']).toEqual({ input: 5.0, output: 25.0 });
+  });
+
   test('Opus 4.8 present at $5/$25 (closes gbrain#1819)', () => {
     expect(CANONICAL_PRICING['anthropic:claude-opus-4-8']).toEqual({ input: 5.0, output: 25.0 });
   });
@@ -76,8 +80,27 @@ describe('canonicalLookup — id normalization', () => {
     expect(canonicalLookup('gpt-5')).toBeUndefined();
   });
 
-  test('nested OpenRouter id → MISS (markup ≠ native pricing)', () => {
+  test('nested OpenRouter id with NO declared entry → MISS (markup ≠ native pricing)', () => {
     expect(canonicalLookup('openrouter:anthropic/claude-sonnet-4-6')).toBeUndefined();
+  });
+
+  test('OpenRouter id WITH a declared static entry → hit on its own rate, not the vendor alias', () => {
+    // deepseek/deepseek-v4-flash-0731 happens to match deepseek:deepseek-v4-flash
+    // to the cent, but this must resolve via its OWN canonical key, not by
+    // falling through to the bare vendor tail — that fallthrough is exactly
+    // what canonicalLookup's nested-id miss (case above) exists to prevent.
+    expect(canonicalLookup('openrouter:deepseek/deepseek-v4-flash-0731')).toEqual({
+      input: 0.14,
+      output: 0.28,
+    });
+    expect(canonicalLookup('openrouter:qwen/qwen3.7-flash')).toEqual({
+      input: 0.03,
+      output: 0.13,
+    });
+    expect(canonicalLookup('openrouter:qwen/qwen3.6-plus')).toEqual({
+      input: 0.325,
+      output: 1.95,
+    });
   });
 
   test('slash-bearing model tail kept as exact key (together Llama)', () => {
@@ -149,5 +172,29 @@ describe('no heavy import (cycle guard)', () => {
       (m) => m[1],
     );
     expect(relImports).toEqual(['./model-id.ts']);
+  });
+});
+
+describe('canonicalLookup — case-insensitive fallback (#4123 / TODOS case-sensitivity)', () => {
+  test('cased provider prefix resolves', () => {
+    expect(canonicalLookup('ANTHROPIC:claude-opus-4-8')).toEqual({ input: 5.0, output: 25.0 });
+  });
+
+  test('cased model tail resolves', () => {
+    expect(canonicalLookup('anthropic:CLAUDE-OPUS-4-8')).toEqual({ input: 5.0, output: 25.0 });
+  });
+
+  test('nested OpenRouter ids still intentionally MISS (markup never repriced as native)', () => {
+    expect(canonicalLookup('OPENROUTER:anthropic/claude-opus-4-8')).toBeUndefined();
+  });
+
+  test('no two canonical keys collide case-insensitively (folded-view safety pin)', () => {
+    const folded = new Map<string, string>();
+    for (const key of Object.keys(CANONICAL_PRICING)) {
+      const lower = key.toLowerCase();
+      const prior = folded.get(lower);
+      expect(prior === undefined || prior === key).toBe(true);
+      folded.set(lower, key);
+    }
   });
 });

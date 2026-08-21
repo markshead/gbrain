@@ -8,6 +8,11 @@ The orienting idea: **GBrain itself is rounding error; the spend that matters is
 downstream embedding.** These gates exist so a routine sync or enrich can't run up
 an unexpected embedding bill, while never wedging an unattended cron.
 
+**Keyless mode:** if you run with zero provider keys (`gbrain init --no-embedding`,
+the keyless bootstrap posture — see `docs/guides/bootstrap.md` and
+`docs/operations/headless-install.md`), nothing here can spend and none of these
+gates ever fire. This doc applies once you add a key.
+
 ## `spend.posture` — one switch for "cost is not my constraint"
 
 ```bash
@@ -18,7 +23,7 @@ gbrain config set spend.posture gated      # default — gates enforce
 | Value | Effect |
 |-------|--------|
 | `gated` (default) | Every cost gate enforces its limit as documented below. |
-| `tokenmax` | Every cost gate prints its estimate and **proceeds** — informational only. Spend is still recorded to the ledger; posture removes the *ceiling*, not the *accounting*. |
+| `tokenmax` | Every embedding-spend gate in the table below prints its estimate and **proceeds** — informational only. Spend is still recorded to the ledger; posture removes the *ceiling*, not the *accounting*. (Commands with their own LLM cost caps outside this doc's embedding scope — e.g. `extract-conversation-facts --max-cost-usd`, `dream retriage --max-usd` (an estimate-based soft stop) — don't resolve posture; their per-call flags govern.) |
 
 `spend.posture` is deliberately separate from `search.mode=tokenmax` (which governs
 retrieval payload size, not embedding spend). When a gate fires and
@@ -49,6 +54,7 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 | Backfill per-job budget | `embed.backfill_max_usd` | `10` | caps the job's tracker | `off` (`0` → default) | uncapped (still ledgered) |
 | Backfill cooldown | `embed.backfill_cooldown_min` | `10` | skips re-submission inside window | — (latency knob, not spend) | **not** bypassed |
 | `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 2 | `--max-cost off` | informational |
+| `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 2 | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
 | `enrich` / `onboard --auto` | `--max-usd` (per-call) | — | refuse without a cap (non-TTY) | `--max-usd off` | runs uncapped (still ledgered) |
 
 ### Sync inline-embed cost gate
@@ -90,6 +96,13 @@ estimate is `delta + stale backlog`, labeled as such.
 - **Recovery under parallel:** `--skip-failed` / `--retry-failed` work under parallel
   sync (the failure ledger is per-source and lock-serialized) — you no longer have to
   drop to `--serial`, which is what used to arm the inline gate.
+- **Chat-side accounting completeness:** query-expansion and image-OCR calls record
+  on the ambient budget tracker like every other gateway call, including failed
+  attempts (recorded pessimistically). This is record-only — these paths never
+  pre-reserve, so a cap breach from them surfaces on the next reserving call.
+  Practical effect: capped runs (`--max-cost` and friends) that previously
+  under-counted may now hit their ceiling; the new number is the honest one, so
+  raise the cap rather than assuming a regression.
 
 ## Escape hatches at a glance
 

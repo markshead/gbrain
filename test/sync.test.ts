@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
-import { buildSyncManifest, isSyncable, pathToSlug, pruneDir, isCodeFilePath } from '../src/core/sync.ts';
+import { buildSyncManifest, isSyncable, pathToSlug, pruneDir, isCodeFilePath, unquoteGitPath } from '../src/core/sync.ts';
 import { buildAutoEmbedArgs, buildGitInvocation } from '../src/commands/sync.ts';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -31,6 +31,32 @@ describe('buildSyncManifest', () => {
     const output = `R075\tpeople/old.md\tpeople/new.md`;
     const manifest = buildSyncManifest(output);
     expect(manifest.renamed).toEqual([{ from: 'people/old.md', to: 'people/new.md' }]);
+  });
+
+  test('T (typechange) counts as modified — was silently dropped', () => {
+    // file <-> symlink. Reachable with the flags gbrain actually passes
+    // (`--name-status -M`). Dropping it meant the change never reached the
+    // index until some later commit happened to touch the same path.
+    const manifest = buildSyncManifest(`T\tpeople/now-a-symlink.md`);
+    expect(manifest.modified).toEqual(['people/now-a-symlink.md']);
+    expect(manifest.added).toEqual([]);
+    expect(manifest.deleted).toEqual([]);
+  });
+
+  test('U (unmerged) degrades to modified rather than vanishing', () => {
+    // Only reachable in a conflicted worktree, which sync does not run against.
+    // Defensive: re-import beats silently skipping.
+    expect(buildSyncManifest(`U\tpeople/conflicted.md`).modified).toEqual(['people/conflicted.md']);
+  });
+
+  test('C (copy) imports the destination — unreachable today, defensive', () => {
+    // Requires -C/--find-copies, which gbrain does not pass. If the flags ever
+    // change, the copy destination is a NEW path that must be imported, and the
+    // source is untouched — so it is an add, not a rename.
+    const manifest = buildSyncManifest(`C100\tpeople/src.md\tpeople/copy.md`);
+    expect(manifest.added).toEqual(['people/copy.md']);
+    expect(manifest.renamed).toEqual([]);
+    expect(manifest.deleted).toEqual([]);
   });
 
   test('handles empty diff', () => {
@@ -282,6 +308,100 @@ describe('buildSyncManifest edge cases', () => {
 });
 
 // ────────────────────────────────────────────────────────────────
+// C-style-quoted paths. git quotes any path containing `"`, `\` or a
+// control character, unconditionally — core.quotepath=false (#119) only
+// governs octal-escaping of NON-ASCII bytes. Before unquoteGitPath, such
+// an entry ended `.md"`, failed isSyncable(), and was dropped from the
+// manifest silently: no error, no warning, no counter.
+// ────────────────────────────────────────────────────────────────
+
+describe('unquoteGitPath', () => {
+  test('leaves an unquoted path untouched', () => {
+    expect(unquoteGitPath('people/plain-name.md')).toBe('people/plain-name.md');
+    expect(unquoteGitPath('people/Ольга Петрова.md')).toBe('people/Ольга Петрова.md');
+    expect(unquoteGitPath('')).toBe('');
+  });
+
+  test('strips the wrapping quotes and unescapes embedded ones', () => {
+    expect(unquoteGitPath('"people/Jason \\"Jay\\" Strand.md"'))
+      .toBe('people/Jason "Jay" Strand.md');
+  });
+
+  test('unescapes a literal backslash', () => {
+    expect(unquoteGitPath('"people/a\\\\b.md"')).toBe('people/a\\b.md');
+  });
+
+  test('decodes single-character escapes', () => {
+    expect(unquoteGitPath('"people/a\\tb\\nc.md"')).toBe('people/a\tb\nc.md');
+  });
+
+  test('decodes octal escapes as bytes, utf-8 decoding once at the end', () => {
+    // "ы" is U+044B = 0xD1 0x8B — one codepoint, two \NNN escapes. Decoding
+    // per-escape instead of per-byte yields mojibake here.
+    expect(unquoteGitPath('"people/\\321\\213.md"')).toBe('people/ы.md');
+  });
+
+  test('resulting path passes the extension filter', () => {
+    expect(isSyncable(unquoteGitPath('"people/Jason \\"Jay\\" Strand.md"'))).toBe(true);
+  });
+});
+
+describe('buildSyncManifest — C-style-quoted paths', () => {
+  test('unquotes add, modify and delete entries', () => {
+    const output = [
+      'A\t"people/Alice \\"Ace\\" Example.md"',
+      'M\t"companies/ПАО \\"Ростелеком\\".md"',
+      'D\t"people/Jason \\"Jay\\" Strand.md"',
+    ].join('\n');
+    const manifest = buildSyncManifest(output);
+    expect(manifest.added).toEqual(['people/Alice "Ace" Example.md']);
+    expect(manifest.modified).toEqual(['companies/ПАО "Ростелеком".md']);
+    expect(manifest.deleted).toEqual(['people/Jason "Jay" Strand.md']);
+  });
+
+  test('unquotes both sides of a rename', () => {
+    const output = 'R100\t"people/old \\"nick\\".md"\t"people/new \\"nick\\".md"';
+    const manifest = buildSyncManifest(output);
+    expect(manifest.renamed).toEqual([
+      { from: 'people/old "nick".md', to: 'people/new "nick".md' },
+    ]);
+  });
+
+  test('quoted entries survive the syncable filter', () => {
+    const output = 'M\t"people/Christian \\"Raz\\" Kippelt.md"';
+    const manifest = buildSyncManifest(output);
+    expect(manifest.modified.filter(p => isSyncable(p))).toHaveLength(1);
+  });
+
+  test('real git output for a quoted filename reaches the manifest', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-quoted-path-'));
+    try {
+      const name = 'people/Alice "Ace" Example.md';
+      execSync('git init -q .', { cwd: repo });
+      execSync('git config user.email t@t.t && git config user.name t', { cwd: repo, shell: '/bin/bash' });
+      mkdirSync(join(repo, 'people'));
+      writeFileSync(join(repo, name), 'x\n');
+      execSync('git add -A && git commit -q -m one', { cwd: repo, shell: '/bin/bash' });
+      writeFileSync(join(repo, name), 'x\ny\n');
+      execSync('git add -A && git commit -q -m two', { cwd: repo, shell: '/bin/bash' });
+
+      // gbrain's own invocation, quotepath and all.
+      const argv = buildGitInvocation(repo, ['diff', '--name-status', '-M', 'HEAD~1..HEAD']);
+      const out = execSync(`git ${argv.map(a => JSON.stringify(a)).join(' ')}`, { encoding: 'utf-8' });
+
+      // git really does quote it, whatever core.quotepath says.
+      expect(out.trim()).toBe('M\t"people/Alice \\"Ace\\" Example.md"');
+
+      const manifest = buildSyncManifest(out);
+      expect(manifest.modified).toEqual([name]);
+      expect(manifest.modified.filter(p => isSyncable(p))).toHaveLength(1);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
 // performSync dry-run (v0.17 regression guard for full-sync silent writes)
 // ────────────────────────────────────────────────────────────────
 
@@ -422,6 +542,104 @@ describe('performSync dry-run never writes', () => {
     expect(bookmarkAfterDry).toBe(bookmarkAfterReal);
   });
 
+  test('strategy-changing dry-run preserves previously indexed out-of-strategy pages', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+    });
+    const pageBefore = await engine.getPage('people/alice');
+    const bookmarkBefore = await engine.getConfig('sync.last_commit');
+    expect(pageBefore).not.toBeNull();
+    expect(bookmarkBefore).not.toBeNull();
+
+    writeFileSync(join(repoPath, 'people/alice.md'), [
+      '---',
+      'type: person',
+      'title: Alice',
+      '---',
+      '',
+      'Alice changed after the initial sync.',
+    ].join('\n'));
+    execSync('git add -A && git commit -m "update alice"', { cwd: repoPath, stdio: 'pipe' });
+
+    const result = await performSync(engine, {
+      repoPath,
+      strategy: 'code',
+      dryRun: true,
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(result.status).toBe('dry_run');
+    const pageAfter = await engine.getPage('people/alice');
+    expect(pageAfter).not.toBeNull();
+    expect(pageAfter!.compiled_truth).toBe(pageBefore!.compiled_truth);
+    expect(await engine.getConfig('sync.last_commit')).toBe(bookmarkBefore);
+  });
+
+  test('strategy-changing real sync deletes previously indexed out-of-strategy pages', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+    });
+    expect(await engine.getPage('people/alice')).not.toBeNull();
+
+    writeFileSync(join(repoPath, 'people/alice.md'), [
+      '---',
+      'type: person',
+      'title: Alice',
+      '---',
+      '',
+      'Alice changed after the initial sync.',
+    ].join('\n'));
+    execSync('git add -A && git commit -m "update alice"', { cwd: repoPath, stdio: 'pipe' });
+
+    await performSync(engine, {
+      repoPath,
+      strategy: 'code',
+      noPull: true,
+      noEmbed: true,
+    });
+
+    expect(await engine.getPage('people/alice')).toBeNull();
+  });
+
+  test('dry-run does not attempt git pull when origin exists', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const remotePath = mkdtempSync(join(tmpdir(), 'gbrain-sync-dryrun-remote-'));
+
+    try {
+      execSync('git init --bare', { cwd: remotePath, stdio: 'pipe' });
+      execSync(`git remote add origin ${JSON.stringify(remotePath)}`, {
+        cwd: repoPath,
+        stdio: 'pipe',
+      });
+      const messages: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => {
+        messages.push(args.map(String).join(' '));
+      };
+      try {
+        const result = await performSync(engine, {
+          repoPath,
+          dryRun: true,
+          noEmbed: true,
+        });
+        expect(result.status).toBe('dry_run');
+      } finally {
+        console.error = originalError;
+      }
+      expect(messages.some(message => message.includes('sync.git_pull start'))).toBe(false);
+      expect(messages.some(message => message.includes('git pull failed'))).toBe(false);
+    } finally {
+      rmSync(remotePath, { recursive: true, force: true });
+    }
+  });
+
   test('full-sync (--full) dry-run does NOT write to DB or advance the bookmark', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     // Seed the bookmark so we hit the full-sync-with-bookmark path when --full is set.
@@ -462,6 +680,59 @@ describe('performSync dry-run never writes', () => {
     });
     // Structural assertion: the contract includes `embedded: number`.
     expect(typeof result.embedded).toBe('number');
+  });
+
+  test('--include-gitignored imports ignored files even when git HEAD is unchanged', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const first = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(first.status).toBe('first_sync');
+
+    writeFileSync(join(repoPath, '.gitignore'), 'Meetings/\n');
+    execSync('git add .gitignore && git commit -m "ignore generated meetings"', { cwd: repoPath, stdio: 'pipe' });
+    const checkpoint = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(checkpoint.status).toBe('up_to_date');
+
+    mkdirSync(join(repoPath, 'Meetings'), { recursive: true });
+    writeFileSync(join(repoPath, 'Meetings/weekly.md'), [
+      '---',
+      'type: meeting',
+      'title: Weekly',
+      '---',
+      '',
+      'Generated meeting notes.',
+    ].join('\n'));
+
+    const withoutFlag = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(withoutFlag.status).toBe('up_to_date');
+    expect(await engine.getPage('meetings/weekly')).toBeNull();
+
+    const withFlag = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+      includeGitignored: true,
+    });
+    expect(withFlag.added).toBe(1);
+
+    const page = await engine.getPage('meetings/weekly');
+    expect(page).not.toBeNull();
+    expect(page!.title).toBe('Weekly');
   });
 
   test('detached HEAD skips git pull and ingests local working-tree files', async () => {

@@ -69,6 +69,23 @@ export function contentHash(page: PageInput): string {
 }
 
 /**
+ * True when a page body carries no real content (null/undefined/whitespace).
+ *
+ * A routine page edit is a read-modify-write: read the page, change it, put
+ * it back. If the read intermittently returns empty (a store/consistency
+ * hiccup, or a caller that assembled content from a failed read), the "edit"
+ * is applied to nothing and `putPage` persists a blank body OVER real content
+ * — `putPage`'s ON CONFLICT sets `compiled_truth = EXCLUDED.compiled_truth`
+ * unconditionally, so the page is silently destroyed. Observed in production:
+ * a live task/notes page wiped down to just its frontmatter, caught only
+ * because the agent re-read the page and rebuilt it by hand. `isBlankBody`
+ * is the predicate `putPage` uses to refuse that destructive overwrite.
+ */
+export function isBlankBody(body: string | null | undefined): boolean {
+  return body == null || body.trim() === '';
+}
+
+/**
  * Validate a `source_id` is safe for use as a filesystem path segment AND
  * as a SQL identifier value. Used by the per-source disk-layout code in
  * patterns.ts/synthesize.ts before any `join(brainDir, source_id, ...)`
@@ -110,6 +127,12 @@ export function rowToPage(row: Record<string, unknown>): Page {
   const sourceUri = row.source_uri === undefined ? undefined : (row.source_uri as string | null);
   const ingestedVia = row.ingested_via === undefined ? undefined : (row.ingested_via as string | null);
   const ingestedAt = readOptionalDate(row.ingested_at);
+  // #3507: the CR tier the page was last embedded under (three-state, same
+  // pattern as the provenance columns above). Re-embed paths (`embed --stale`
+  // and friends) read this to reproduce the page's stored wrapping convention.
+  const contextualRetrievalMode = row.contextual_retrieval_mode === undefined
+    ? undefined
+    : (row.contextual_retrieval_mode as Page['contextual_retrieval_mode']);
   return {
     id: row.id as number,
     slug: row.slug as string,
@@ -135,6 +158,7 @@ export function rowToPage(row: Record<string, unknown>): Page {
     ...(sourceUri !== undefined && { source_uri: sourceUri }),
     ...(ingestedVia !== undefined && { ingested_via: ingestedVia }),
     ...(ingestedAt !== undefined && { ingested_at: ingestedAt }),
+    ...(contextualRetrievalMode !== undefined && { contextual_retrieval_mode: contextualRetrievalMode }),
     // v0.31.12: propagate source_id so downstream callers (embed, reconcile-links)
     // can thread it through getChunks / upsertChunks without defaulting to 'default'.
     // v0.32.8: Page.source_id is required. Every SELECT feeding rowToPage now
@@ -330,6 +354,9 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     doc_comment: (row.doc_comment as string | null | undefined) ?? null,
     symbol_name_qualified: (row.symbol_name_qualified as string | null | undefined) ?? null,
     modality: (row.modality as 'text' | 'image' | undefined) ?? undefined,
+    // Only present when the SELECT included it (getChunks); undefined elsewhere
+    // so callers can tell "not selected" from "vector present".
+    ...(row.embedding_is_null !== undefined && { embedding_is_null: Boolean(row.embedding_is_null) }),
   };
 }
 

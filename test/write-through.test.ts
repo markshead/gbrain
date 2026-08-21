@@ -14,7 +14,7 @@ import * as os from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { resetGateway } from '../src/core/ai/gateway.ts';
-import { writePageThrough } from '../src/core/write-through.ts';
+import { writePageThrough, isWriteThroughDisabled, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from '../src/core/markdown.ts';
 
@@ -36,6 +36,7 @@ afterAll(async () => {
 beforeEach(async () => {
   await resetPgliteState(engine);
   resetGateway();
+  _resetWriteThroughCacheForTest();
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-wt-helper-'));
   brainDir = path.join(tmpRoot, 'brain');
   fs.mkdirSync(brainDir, { recursive: true });
@@ -120,6 +121,233 @@ describe('writePageThrough', () => {
     expect(res).toEqual({ written: false, skipped: 'page_not_found_after_write' });
   });
 
+  test('[REGRESSION twin] honors the recorded source_path instead of minting a slug-named twin', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    // A human-authored vault file whose on-disk name is NOT its slug — the
+    // normal case for Obsidian (Title Case, spaces) once slugified.
+    const slug = 'library/people/steve-jobs';
+    const authored = 'Library/People/Steve Jobs.md';
+    await importFromContent(engine, slug, `---\ntitle: Steve Jobs\ntype: person\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+      sourcePath: authored,
+    });
+    fs.mkdirSync(path.join(brainDir, 'Library', 'People'), { recursive: true });
+    fs.writeFileSync(path.join(brainDir, authored), 'stale\n');
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(path.join(brainDir, authored));
+    // The authored file was UPDATED in place...
+    expect(fs.readFileSync(path.join(brainDir, authored), 'utf8')).not.toBe('stale\n');
+    // ...and no slug-derived twin appeared anywhere in the tree.
+    const twin = resolvePageFilePath(brainDir, slug, 'default');
+    expect(fs.existsSync(twin)).toBe(false);
+    expect(walkFiles(brainDir).sort()).toEqual([path.join(brainDir, authored)]);
+  });
+
+  test('[REGRESSION twin] null source_path still falls back to the slug-derived path', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'inbox/2026-01-01-abc123';
+    // Born via put/capture: no file of record, so source_path stays NULL.
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+    });
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(resolvePageFilePath(brainDir, slug, 'default'));
+  });
+
+  test('[REGRESSION twin] falls back to a contained file:// source_uri when source_path is null (capture --file of a vault file)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'library/companies/postiz';
+    const authored = 'Library/Companies/Postiz.md';
+    // `capture --file` records the absolute path as source_uri and leaves
+    // source_path NULL — the exact shape that used to mint a twin.
+    await importFromContent(engine, slug, `---\ntitle: Postiz\ntype: company\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+    });
+    await engine.executeRaw(`UPDATE pages SET source_uri = $1 WHERE slug = $2`, [
+      `file://${path.join(brainDir, authored)}`,
+      slug,
+    ]);
+    fs.mkdirSync(path.join(brainDir, 'Library', 'Companies'), { recursive: true });
+    fs.writeFileSync(path.join(brainDir, authored), 'stale\n');
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(path.join(brainDir, authored));
+    // NB: no `existsSync(slug path)` assertion here — this slug differs from the
+    // authored name only by CASE, so a case-insensitive FS (macOS/Windows) folds
+    // the two and existsSync would report a twin that isn't there. walkFiles
+    // enumerates real directory entries, so it is case-truthful on every FS.
+    expect(walkFiles(brainDir).sort()).toEqual([path.join(brainDir, authored)]);
+  });
+
+  test('[REGRESSION twin] a file:// source_uri OUTSIDE the repo is ignored', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'inbox/from-elsewhere';
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+    });
+    // A file captured from outside the brain repo has no file of record inside it.
+    await engine.executeRaw(`UPDATE pages SET source_uri = $1 WHERE slug = $2`, [
+      `file://${path.join(tmpRoot, 'outside', 'Notes.md')}`,
+      slug,
+    ]);
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(resolvePageFilePath(brainDir, slug, 'default'));
+    expect(fs.existsSync(path.join(tmpRoot, 'outside', 'Notes.md'))).toBe(false);
+  });
+
+  test('[REGRESSION twin] a traversing source_path is ignored, not joined', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'wiki/ideas/hostile-1';
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'default',
+      sourcePath: `${slug}.md`,
+    });
+    // Simulate a hostile / corrupted row after the fact.
+    await engine.executeRaw(`UPDATE pages SET source_path = $1 WHERE slug = $2`, [
+      '../../escaped.md',
+      slug,
+    ]);
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    // Falls back to the slug path rather than escaping the write root.
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(resolvePageFilePath(brainDir, slug, 'default'));
+    expect(fs.existsSync(path.join(tmpRoot, '..', 'escaped.md'))).toBe(false);
+  });
+
+  test('sync.write_through=false → skipped disabled_by_config, nothing touches disk', async () => {
+    // Everything else is configured for a successful write — the flag alone
+    // must stop it, proving the gate runs before any FS work.
+    await engine.setConfig('sync.repo_path', brainDir);
+    await engine.setConfig('sync.write_through', 'false');
+    const slug = 'wiki/ideas/db-only-note';
+    await seedPage(slug);
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res).toEqual({ written: false, skipped: 'disabled_by_config' });
+    expect(walkFiles(brainDir).some((f) => f.endsWith('.md'))).toBe(false);
+    // The DB row stays the durable sink.
+    expect(await engine.getPage(slug, { sourceId: 'default' })).not.toBeNull();
+  });
+
+  test('sync.write_through=false also gates the per-source local_path branch', async () => {
+    const alphaDir = path.join(tmpRoot, 'alpha-flag-repo');
+    fs.mkdirSync(alphaDir, { recursive: true });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config) VALUES ('alpha', 'Alpha', $1, '{}'::jsonb)`,
+      [alphaDir],
+    );
+    await engine.setConfig('sync.write_through', 'false');
+
+    const slug = 'notes/alpha-db-only';
+    await importFromContent(engine, slug, `---\ntitle: T\ntype: note\n---\n\n# Body\n`, {
+      noEmbed: true,
+      sourceId: 'alpha',
+      sourcePath: `${slug}.md`,
+    });
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'alpha' });
+
+    expect(res).toEqual({ written: false, skipped: 'disabled_by_config' });
+    expect(walkFiles(alphaDir).some((f) => f.endsWith('.md'))).toBe(false);
+  });
+
+  test('sync.write_through unset or any non-"false" value keeps the default write-through behavior', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    // Explicit 'true' — same as unset (the flag is an opt-out).
+    await engine.setConfig('sync.write_through', 'true');
+    const slug = 'wiki/ideas/still-written';
+    await seedPage(slug);
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+
+    expect(res.written).toBe(true);
+    expect(fs.existsSync(res.path!)).toBe(true);
+  });
+
+  test('off values parse case-insensitively: FALSE / 0 / Off / no / " false " all disable', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'wiki/ideas/off-value-parsing';
+    await seedPage(slug);
+
+    for (const value of ['FALSE', '0', 'Off', 'no', ' false ']) {
+      await engine.setConfig('sync.write_through', value);
+      _resetWriteThroughCacheForTest();
+      const res = await writePageThrough(engine, slug, { sourceId: 'default' });
+      expect(res).toEqual({ written: false, skipped: 'disabled_by_config' });
+    }
+
+    // Non-off values (including garbage) keep the default-on behavior.
+    for (const value of ['1', 'yes', 'banana', '']) {
+      await engine.setConfig('sync.write_through', value);
+      _resetWriteThroughCacheForTest();
+      expect(await isWriteThroughDisabled(engine)).toBe(false);
+      _resetWriteThroughCacheForTest();
+    }
+  });
+
+  test('the flag read is memoized per engine — bulk loops pay one config SELECT, not one per page', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    let flagReads = 0;
+    const counting = Object.create(engine) as typeof engine;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (counting as any).getConfig = async (key: string) => {
+      if (key === 'sync.write_through') flagReads += 1;
+      return engine.getConfig(key);
+    };
+
+    const slugA = 'wiki/ideas/memo-a';
+    const slugB = 'wiki/ideas/memo-b';
+    await seedPage(slugA);
+    await seedPage(slugB);
+
+    expect((await writePageThrough(counting, slugA, { sourceId: 'default' })).written).toBe(true);
+    expect((await writePageThrough(counting, slugB, { sourceId: 'default' })).written).toBe(true);
+    expect(flagReads).toBe(1);
+
+    // A config flip inside the TTL window keeps serving the cached value...
+    await engine.setConfig('sync.write_through', 'false');
+    expect((await writePageThrough(counting, slugA, { sourceId: 'default' })).written).toBe(true);
+    // ...and becomes visible once the cache is dropped.
+    _resetWriteThroughCacheForTest();
+    const res = await writePageThrough(counting, slugA, { sourceId: 'default' });
+    expect(res).toEqual({ written: false, skipped: 'disabled_by_config' });
+  });
+
+  test('a failing flag read fails open to enabled (the write still lands)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const failing = Object.create(engine) as typeof engine;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (failing as any).getConfig = async (key: string) => {
+      if (key === 'sync.write_through') throw new Error('simulated config outage');
+      return engine.getConfig(key);
+    };
+
+    const slug = 'wiki/ideas/fail-open';
+    await seedPage(slug);
+    const res = await writePageThrough(failing, slug, { sourceId: 'default' });
+    expect(res.written).toBe(true);
+    expect(fs.existsSync(res.path!)).toBe(true);
+  });
+
   test('[REGRESSION #2018] default page (null local_path) in a multi-source brain → skipped, no leak into a sibling source repo', async () => {
     // A sibling federated source with its OWN working tree.
     const siblingDir = path.join(tmpRoot, 'housefax');
@@ -170,6 +398,33 @@ describe('writePageThrough', () => {
     expect(fs.existsSync(path.join(alphaDir, `${slug}.md`))).toBe(true);
     // The global repo path is untouched.
     expect(walkFiles(globalDir).some((f) => f.endsWith('.md'))).toBe(false);
+  });
+
+  test('Git-root source_path updates the file inside a subdirectory local_path', async () => {
+    const gitRoot = path.join(tmpRoot, 'monorepo');
+    fs.mkdirSync(path.join(gitRoot, '.git'), { recursive: true });
+    const sourceRoot = path.join(gitRoot, 'public', 'changelog');
+    fs.mkdirSync(path.join(sourceRoot, 'posts'), { recursive: true });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config) VALUES ('changelog', 'Changelog', $1, '{}'::jsonb)`,
+      [sourceRoot],
+    );
+    const slug = 'public/changelog/posts/2026-08-18';
+    const sourcePath = `${slug}.md`;
+    const filePath = path.join(sourceRoot, 'posts', '2026-08-18.md');
+    await importFromContent(engine, slug, `---\ntitle: Release\ntype: note\n---\n\n# Current body\n`, {
+      noEmbed: true,
+      sourceId: 'changelog',
+      sourcePath,
+    });
+    fs.writeFileSync(filePath, 'stale\n');
+
+    const res = await writePageThrough(engine, slug, { sourceId: 'changelog' });
+
+    expect(res.written).toBe(true);
+    expect(res.path).toBe(filePath);
+    expect(fs.readFileSync(filePath, 'utf8')).not.toBe('stale\n');
+    expect(fs.existsSync(path.join(sourceRoot, sourcePath))).toBe(false);
   });
 
   test('[REGRESSION #2831] differently-cased entry occupying the target → skipped case_insensitive_collision, existing file untouched', async () => {

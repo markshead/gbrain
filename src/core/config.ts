@@ -1,7 +1,8 @@
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSync } from 'fs';
 import { isAbsolute, join } from 'path';
 import { homedir } from 'os';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
+import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -27,6 +28,10 @@ function getConfigPath() { return configPath(); }
 
 export interface GBrainConfig {
   engine: 'postgres' | 'pglite';
+  /** File-plane hook-lane keys (read by engine-free hook/push children).
+   * `gbrain config set` routes these two dotted keys here, not to the DB. */
+  push?: { allow_unverified_remote?: boolean };
+  hooks?: { stop_push_debounce_min?: number | string };
   database_url?: string;
   database_path?: string;
   openai_api_key?: string;
@@ -56,13 +61,42 @@ export interface GBrainConfig {
    * launchd/daemon/MCP contexts without a process-env export silently
    * failed multimodal embeds despite config.json looking complete.
    *
-   * NOTE (scoped to what this fix covers): `gbrain config set
-   * voyage_api_key X` writes the DB plane, which `loadConfigWithEngine()`
-   * does NOT merge for any `*_api_key` field (zeroentropy_api_key /
-   * openrouter_api_key have the same pre-existing gap) — only the
-   * config.json file-plane route is wired through today.
+   * NOTE: `gbrain config set voyage_api_key X` routes to the FILE plane
+   * (FILE_PLANE_API_KEYS in src/commands/config.ts); a value that landed in
+   * the DB plane anyway is still honored via the #2119 read-side merge
+   * (DB_MERGED_PROVIDER_KEY_FIELDS, env > file > DB).
    */
   voyage_api_key?: string;
+  /**
+   * Alibaba DashScope API key (#3500). File-plane slot so config.json's
+   * `dashscope_api_key` reaches the dashscope / dashscope-rerank recipes:
+   * file plane → buildGatewayConfig env dict → recipe reads
+   * DASHSCOPE_API_KEY. Same fold pattern (and same DB-plane caveat) as
+   * voyage_api_key above.
+   */
+  dashscope_api_key?: string;
+  /**
+   * Google Gemini API key (#3500). File-plane slot folded into the gateway
+   * env as GOOGLE_GENERATIVE_AI_API_KEY (the name the google recipe reads).
+   * buildGatewayConfig also accepts process-env GEMINI_API_KEY — the name
+   * Google's own docs/SDKs use — as an alias for
+   * GOOGLE_GENERATIVE_AI_API_KEY. Same fold pattern (and same DB-plane
+   * caveat) as voyage_api_key above.
+   */
+  google_api_key?: string;
+  /**
+   * Azure OpenAI API key (#4031). File-plane slot folded into the gateway env
+   * as AZURE_OPENAI_API_KEY (the name the azure-openai recipe reads). Same
+   * fold pattern (and same DB-plane caveat) as voyage_api_key above. Key-based
+   * auth alternative to the Entra flow below.
+   */
+  azure_openai_api_key?: string;
+  /** Azure OpenAI (keyless/Entra). Non-secret endpoint + deployment + Entra opt-in,
+   * folded into the gateway env so the azure-openai recipe works in any shell.
+   * The bearer token is minted at request time via `az` — no secret stored here. */
+  azure_openai_endpoint?: string;
+  azure_openai_deployment?: string;
+  azure_openai_use_entra?: string;
   /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
@@ -91,6 +125,21 @@ export interface GBrainConfig {
   provider_base_urls?: Record<string, string>;
   /** Optional chat request providerOptions overrides keyed by recipe id or "recipe:modelId". */
   provider_chat_options?: Record<string, Record<string, unknown>>;
+  /**
+   * MEMORY_VERBS v1 (Cathedral 1): default MCP tool surface for `gbrain serve`.
+   * 'verbs' = exactly the 7 protocol verbs (the quickstart surface);
+   * 'starter' (WP4) = the ~20-op daily-driver set (STARTER_OPS in
+   * src/mcp/surface.ts); 'full' (default) = every operation. The `--surface`
+   * flag overrides per-run. On the OAuth HTTP transport this resolves the
+   * server CEILING (D2): per-client row surfaces can narrow below it but
+   * never widen past it.
+   */
+  mcp_surface?: 'verbs' | 'starter' | 'full';
+  /**
+   * MEMORY_VERBS v1 [D6C]: ISO timestamp stamped by `gbrain init` so
+   * `gbrain protocol stats` can derive real TTHW (install → first verb call).
+   */
+  protocol_installed_at?: string;
   /**
    * Optional storage backend config (S3/Supabase/local). Shape matches
    * `StorageConfig` in `./storage.ts`. Typed as `unknown` here to avoid
@@ -223,6 +272,15 @@ export interface GBrainConfig {
    * reflex knobs.
    */
   retrieval_reflex_window_turns?: number;
+  /**
+   * v0.46.15 (identity wave) — kill switch for the reflex's lexical recall
+   * arms (lowercase weak-candidate alias arm + surname arm). Default ON
+   * (absent = enabled); `false` reproduces pre-wave resolution exactly.
+   * File-plane / env (GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS) only — same
+   * plane as the other reflex knobs; a false-fire regression in production
+   * reverts on the next turn with a config edit, no redeploy.
+   */
+  retrieval_reflex_lexical_arms?: boolean;
   embedding_image_ocr?: boolean;
   embedding_image_ocr_model?: string;
 
@@ -318,6 +376,16 @@ export interface GBrainConfig {
   };
 
   /**
+   * #2119-class read-side (also #2137/#4297) — flat map of DB-plane `cycle.*`
+   * knobs, keyed by the path UNDER the `cycle.` prefix (e.g.
+   * `cycle.extract_atoms.budget_usd` → `cycle['extract_atoms.budget_usd']`),
+   * values raw strings (each consumer owns its parse, as with
+   * `engine.getConfig()`). Populated by `loadConfigWithEngine()`; per-leaf
+   * precedence file > DB (no env layer). See src/core/config-db-merge.ts.
+   */
+  cycle?: Record<string, string>;
+
+  /**
    * Thin-client mode (multi-topology v1). When set, this install does NOT
    * have a local DB; it talks to a remote `gbrain serve --http` over MCP.
    * The CLI dispatch guard in `src/cli.ts` checks for this field BEFORE
@@ -389,6 +457,30 @@ export interface GBrainConfig {
      * tier so a hosted gbrain never serves its own bundled dev skills).
      */
     skills_dir?: string;
+    /**
+     * WP3 — unknown tool-call argument posture for MCP dispatch.
+     *   'warn' (default / absent): unknown params are accepted; each call
+     *     collects `_meta.warnings` + a model-visible notice block, and the
+     *     request logs as 'success_with_warnings'.
+     *   'reject': unknown params return `invalid_params` (with a
+     *     did-you-mean suggestion), and tool schemas are emitted with
+     *     `additionalProperties: false`.
+     * Dual-plane: DB plane (`gbrain config set mcp.strict_params ...`) wins
+     * over this file slot. See src/mcp/validate-params.ts.
+     */
+    strict_params?: 'warn' | 'reject';
+    /**
+     * WP4 (D2 / plan OQ1) — default surface for OAuth clients whose
+     * `oauth_clients.surface` row value is NULL. oauth_clients carries no
+     * DCR-origin marker, so this applies to ALL null-surface clients (not
+     * just dynamically-registered ones); operators pre-seed important
+     * clients with `gbrain auth rescope-client <id> --surface full`.
+     * Unset (default) = null-surface clients get the server ceiling —
+     * pre-WP4 behavior, existing clients untouched. Dual-plane: the DB
+     * plane (`gbrain config set mcp.default_surface_dcr starter`) wins
+     * over this file slot. Always bounded by the server ceiling (D2).
+     */
+    default_surface_dcr?: 'verbs' | 'starter' | 'full';
   };
 }
 
@@ -601,6 +693,15 @@ export function loadConfig(): GBrainConfig | null {
       Number.isFinite(Number(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS))
       ? { retrieval_reflex_window_turns: Number(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS) }
       : {}),
+    ...(process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS
+      ? {
+          // Case-insensitive + common negatives — incident escape hatch;
+          // mirrors reflex.ts:lexicalArmsEnabled (adversarial F11).
+          retrieval_reflex_lexical_arms: !/^(false|0|off|no)$/i.test(
+            process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS.trim(),
+          ),
+        }
+      : {}),
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
       ? { remote_mcp: { ...fileConfig.remote_mcp, oauth_client_secret: process.env.GBRAIN_REMOTE_CLIENT_SECRET } }
       : {}),
@@ -643,6 +744,9 @@ export function loadConfig(): GBrainConfig | null {
   return merged as GBrainConfig;
 }
 
+// #2119 read-side merge list re-exported so callers keep one config surface.
+export { DB_MERGED_PROVIDER_KEY_FIELDS } from './config-db-merge.ts';
+
 /**
  * v0.27.1 — async config loader that overlays DB-plane config on top of the
  * file/env config. Used by `gbrain` CLI's connectEngine() AFTER engine.connect()
@@ -652,15 +756,16 @@ export function loadConfig(): GBrainConfig | null {
  * Precedence: env > file > DB > defaults. Env stays the operator escape hatch;
  * file is the durable per-machine config; DB is the user-mutable runtime knob.
  *
- * Today only the v0.27.1 multimodal flags participate in DB-merge. Existing
- * fields (embedding_model, etc.) keep their file/env-only loading because they
- * size the schema and must be stable across engine connect.
+ * Participating DB-plane keys: multimodal/OCR flags, provider_base_urls.*,
+ * the embedding-column registry, content_sanity.*, dream.*, eval.*, and the
+ * #2119-class read-side set (provider credentials, chat/expansion pins,
+ * chat_fallback_chain, flat cycle.* — see src/core/config-db-merge.ts, which
+ * also documents why embedding_model/dims must NEVER join any list, #4287).
  */
 export async function loadConfigWithEngine(
-  engine: {
-    getConfig(key: string): Promise<string | null | undefined>;
-    listConfigKeys?(prefix: string): Promise<string[]>;
-  },
+  // DbPlaneEngineReader: { getConfig; listConfigKeys?; executeRaw? } — the
+  // optional executeRaw lets the #2119 merge batch its reads in one query.
+  engine: DbPlaneEngineReader,
   base?: GBrainConfig | null,
 ): Promise<GBrainConfig | null> {
   // Codex /ship finding #3: when there's no file config AND no env DB URL,
@@ -885,6 +990,66 @@ export async function loadConfigWithEngine(
     merged.dream = mergedDream;
   }
 
+  // #1475 — eval.* DB-plane merge. Both keys are in KNOWN_CONFIG_KEYS, so
+  // `gbrain config set eval.capture true` is accepted and stored, and
+  // `gbrain config get` reads it back (it queries engine.getConfig directly
+  // and prints `source: db plane`). But the runtime gates read the MERGED
+  // config — isEvalCaptureEnabled/isEvalScrubEnabled take `ctx.config` — so
+  // without a merge branch here the write was accepted, echoed back, and had
+  // no effect: capture stayed off unless GBRAIN_CONTRIBUTOR_MODE=1 was also
+  // exported, which is what the config was supposed to make unnecessary.
+  //
+  // Both directions matter. `false` is not "unset": eval.capture=false is the
+  // documented opt-out for a brain that has CONTRIBUTOR_MODE exported, and
+  // eval.scrub_pii=false is an explicit privacy decision. dbBool already
+  // distinguishes them ('' / null / undefined → undefined).
+  // Strict, not `dbBool`. `dbBool` maps every non-empty value other than the
+  // exact string 'true' to FALSE, and `config set` stores whatever it is given
+  // — so `gbrain config set eval.scrub_pii TRUE` (or `1`, or a typo like
+  // `tru`) would arrive here as `false` and silently DISABLE PII scrubbing.
+  // Measured: 'true'→true, 'false'→false, and 'tru' / 'TRUE' / '1' / 'yes' all
+  // →false under dbBool. Before this merge existed those values were inert, so
+  // adopting dbBool here would newly activate that footgun on a privacy knob.
+  // An unrecognised value is treated as unset, which falls back to the
+  // documented default (scrub on, capture per CONTRIBUTOR_MODE) — fail-safe.
+  //
+  // Deliberately scoped to the two keys this change introduces. The same
+  // looseness applies to the other dbBool keys, but tightening those is a
+  // behavior change for existing brains and belongs in its own PR.
+  async function dbBoolStrict(key: string): Promise<boolean | undefined> {
+    try {
+      const v = await engine.getConfig(key);
+      if (v === 'true') return true;
+      if (v === 'false') return false;
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  const dbEvalCapture = await dbBoolStrict('eval.capture');
+  const dbEvalScrubPii = await dbBoolStrict('eval.scrub_pii');
+
+  const mergedEval: NonNullable<GBrainConfig['eval']> = { ...(merged.eval ?? {}) };
+  if (mergedEval.capture === undefined && dbEvalCapture !== undefined) {
+    mergedEval.capture = dbEvalCapture;
+  }
+  if (mergedEval.scrub_pii === undefined && dbEvalScrubPii !== undefined) {
+    mergedEval.scrub_pii = dbEvalScrubPii;
+  }
+  // Same container discipline as dream/content_sanity: a brain that sets
+  // neither key keeps `cfg.eval` undefined, so `config show` does not sprout
+  // an empty object and downstream `config?.eval?.x === undefined` reads are
+  // unchanged.
+  if (Object.keys(mergedEval).length > 0) {
+    merged.eval = mergedEval;
+  }
+
+  // #2119-class read-side merge (also #2137/#4297): provider credentials,
+  // chat/expansion pins, chat_fallback_chain, flat cycle.* (env > file > DB).
+  // One batched, ~30s-memoized read per engine handle (D2 remediation).
+  await applyDbPlaneReadSideMerge(merged, engine);
+
   return merged;
 }
 
@@ -913,6 +1078,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'zeroentropy_api_key',
   'openrouter_api_key',
   'voyage_api_key',
+  'dashscope_api_key',
+  'google_api_key',
+  'azure_openai_api_key',
+  'azure_openai_endpoint',
+  'azure_openai_deployment',
+  'azure_openai_use_entra',
   'embedding_model',
   'embedding_dimensions',
   'embedding_disabled',
@@ -920,6 +1091,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'chat_model',
   'chat_fallback_chain',
   'provider_base_urls',
+  // MEMORY_VERBS v1 (Cathedral 1)
+  'mcp_surface',
+  'protocol_installed_at',
   'provider_chat_options',
   'storage',
   'eval',
@@ -934,7 +1108,12 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'remote_mcp',
   'sync',
   'sync.repo_path',
+  'import.require_configured_root',
   'sync.last_commit',
+  // Opt-out for the put_page/capture disk write-through (write-through.ts):
+  // 'false' makes every page write DB-only. For brains whose host repo is a
+  // shared working tree where stray root-level .md artifacts are unwanted.
+  'sync.write_through',
   // Gateway-native subagent loop toggle (routes subagent jobs through the
   // provider-agnostic gateway.toolLoop for non-Anthropic providers). The
   // subagent handler's error message tells users to `config set` this, so it
@@ -942,6 +1121,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'agent.use_gateway_loop',
   // #2778: per-turn output-token cap for the subagent loop (default 8192).
   'agent.max_output_tokens',
+  // File-plane bootstrap hook-lane keys (routed to ~/.gbrain/config.json by
+  // `config set` — engine-free hook/push children read loadConfigFileOnly).
+  'push.allow_unverified_remote',
+  'hooks.stop_push_debounce_min',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
   'search.cache.enabled',
@@ -970,17 +1153,32 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'cycle.extract_atoms.budget_usd',
   'models.dream.patterns',
   'models.dream.synthesize_verdict',
+  // #4152: preferred triage-model key (explicit pre-read in loadSynthConfig;
+  // wins over models.dream.synthesize_verdict + dream.synthesize.verdict_model).
+  'models.dream.triage',
   'models.drift',
   'models.auto_think',
   'models.think',
   'models.subagent',
   'models.expansion',
+  'models.contextual_synopsis',
   'models.chat',
   'models.brainstorm.judge',
   'models.eval.longmemeval',
   'facts.extraction_model',
+  // Brain-wide kill switch for fact extraction, read by
+  // src/core/facts/extract.ts:isFactsExtractionEnabled and honored by
+  // sweep.ts, operations.ts and transcripts/ingest-facts.ts. That function's
+  // own docstring tells operators to flip it with
+  // `gbrain config set facts.extraction_enabled false` — which was rejected
+  // as an unknown key until this registration.
+  'facts.extraction_enabled',
   // #2113: output-token cap for the per-turn facts extractor (default 4000).
   'facts.extraction_max_tokens',
+  // [ENG-8] Brain-level default visibility for facts writes when the caller
+  // didn't specify one: 'private' (default) | 'world'. Resolved by
+  // src/core/facts/visibility.ts; explicit caller values always win.
+  'facts.default_visibility',
   // Conversation parser LLM fallback. Deliberately register the exact key,
   // not a conversation_parser.* prefix: fallback is the only live opt-in
   // consumer, while the polish scaffold remains unwired.
@@ -996,6 +1194,25 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.synthesize.output_root',
   'dream.synthesize.subagent_timeout_ms',
   'dream.synthesize.subagent_wait_timeout_ms',
+  // #4152 two-stage cascade: subagent turn budget (default 16) + opt-in
+  // per-source daily submission cap (default 0 = disabled; 200 recommended
+  // for busy deployments).
+  'dream.synthesize.max_turns',
+  'dream.synthesize.max_submissions_per_source_per_day',
+  // #4216/#4194 dream-wave knobs: synthesis execution mode ('oneshot'
+  // default | 'agentic'), pre-retrieval link-candidate manifest (default on),
+  // and inline-drain concurrency (default 1; clamped [1,8]; PGLite forced 1).
+  'dream.synthesize.mode',
+  'dream.synthesize.link_manifest',
+  'dream.synthesize.inline_concurrency',
+  // #4152 triage knobs. The triage model's preferred key is
+  // `models.dream.triage` (models.* prefix, registered via the models.dream.*
+  // family); these tune the gate + sampling + pass budget.
+  'dream.triage.threshold',
+  'dream.triage.max_chars',
+  'dream.triage.max_tokens',
+  'dream.triage.max_ms',
+  'dream.triage.concurrency',
   'dream.patterns.lookback_days',
   'dream.patterns.min_evidence',
   // #2782-family: patterns-phase subagent timeouts (mirror of the
@@ -1024,6 +1241,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // the advisor exposes operational diagnostics (version/jobs/key presence),
   // not prose skills. Default OFF; read-only over MCP.
   'mcp.publish_advisor',
+  // WP3 — unknown tool-call argument posture ('warn' default | 'reject').
+  // Read dual-plane by src/mcp/validate-params.ts (DB > file > 'warn').
+  'mcp.strict_params',
   // Skill-nag suppression (#2180): brain-resident pack install nag off-switch.
   'skillpack.nag_disabled',
   // Self-upgrade (v0.42; file plane, read on the hot path)
@@ -1050,6 +1270,17 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // operator had to discover --force by reading source. Same class as the
   // spend-controls registration above.
   'auto_chronicle',
+  // Auto-link toggle read by the put_page post-hook (link-extraction.ts),
+  // reconcile-links, and sweep. The documented off-switch is `gbrain config
+  // set auto_link false` — same unregistered-key class as auto_chronicle.
+  'auto_link',
+  // v0.46.3: the provider_sunset doctor check's own suppression escape hatch
+  // (doctor.ts) and docs/guides/embedding-migration.md both document
+  // `gbrain config set doctor.suppress_provider_sunset true`, but the key was
+  // never registered — the documented command exited 1 with "Unknown config
+  // key". Same class as auto_chronicle above. Deliberately an exact key, not
+  // a blanket 'doctor.' prefix (unbounded namespaces defeat the typo gate).
+  'doctor.suppress_provider_sunset',
   // #2606: chronicle judge output-token cap (default 4000). Event-dense
   // pages overflowed the old hardcoded 1500 and were misrecorded as
   // no_events; the cap is now configurable and truncation is surfaced.
@@ -1058,11 +1289,30 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // consent reads this key, and enabling it is the documented path to
   // `gbrain takes extract --from-pages` — same unregistered-key class.
   'takes.bootstrap_enabled',
+  // Orphan reporting scope. These are consumed by core/orphan-policy.ts and
+  // documented there as the per-brain override path.
+  'orphans.exclude_prefixes',
+  'orphans.exclude_slugs',
   'sync.cost_gate_min_usd',
   'sync.federated_v2',
+  // #2179: clamp window for DCR-requested per-client token TTLs. Read by
+  // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
+  // defaults fail-closed to max(--token-ttl, min).
+  'oauth.dcr_ttl_min_seconds',
+  'oauth.dcr_ttl_max_seconds',
   'embed.backfill_cooldown_min',
   'embed.backfill_max_usd_per_source_24h',
   'embed.backfill_max_usd',
+  // Brain-level default source. Read by source-resolver.ts tier 5
+  // (`engine.getConfig('sources.default')`) and written by
+  // `gbrain sources default <id>`. Listed here so `gbrain config set`
+  // stops claiming "Nothing in gbrain reads this" for a key the resolver
+  // reads on every unqualified call.
+  'sources.default',
+  // Alias/undeclared explicit-type warnings at sync/import (default on).
+  // Read by performSync + runImport summary aggregation; 'false'/'0'/'off'
+  // silences both surfaces (schema lint rules stay active).
+  'schema.type_warnings',
 ];
 
 /**
@@ -1083,11 +1333,45 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
+  // Queue admission control (per-name sub-keys):
+  //   minions.coalesce_params.<name>, minions.ttl_waiting_hours.<name>,
+  //   minions.quota_max_waiting.<name>, plus the one-time
+  //   minions.ttl_notice_shown flag. Booleans via the canonical truthiness
+  //   parser; numeric 0 disables.
+  'minions.',
+  'pace.',              // pace.mode + PACE_MODE_CONFIG_KEYS (src/core/pace-mode.ts)
 ];
+
+/**
+ * Canonical truthiness for DB-plane boolean config values (#2753).
+ *
+ * Config values arrive as opaque strings from `gbrain config set`, so every
+ * reader has to decide what counts as "on". Left to each call site those sets
+ * drift, and the drift is silent in the worst possible way: the doctor accepted
+ * `yes`/`on` while the subagent worker accepted only `true`/`1`, so
+ * `gbrain config set agent.use_gateway_loop yes` produced a healthy doctor
+ * report AND a runtime refusal of the very job the setting was supposed to
+ * enable. One parser, used by every reader, is what keeps a green health check
+ * honest.
+ *
+ * Accepts `true` / `1` / `yes` / `on` (case-insensitive, surrounding whitespace
+ * trimmed). Everything else — including `null`, non-strings, and the empty
+ * string — is false, so an unset or garbled value fails closed.
+ */
+export function isConfigTruthy(raw: unknown): boolean {
+  return typeof raw === 'string'
+    && ['true', '1', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
 
 export function saveConfig(config: GBrainConfig): void {
   mkdirSync(getConfigDir(), { recursive: true });
-  writeFileSync(getConfigPath(), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // Atomic write (tmp + rename): long-lived workers re-read this file per job
+  // (gateway env refresh, keyed/keyless classification) — a truncate-then-write
+  // here could be read torn, making a keyed install classify as keyless and
+  // calmly consume work it should retry.
+  const tmp = `${getConfigPath()}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, getConfigPath());
   try {
     chmodSync(getConfigPath(), 0o600);
   } catch {

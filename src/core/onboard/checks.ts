@@ -102,6 +102,43 @@ export async function checkEmbedStaleness(
 }
 
 /**
+ * Can `extract-ner` actually do anything on this brain?
+ *
+ * Three-state on purpose. The recommender must be able to tell "the pack
+ * declares no NER rules" (a real, explainable no-auto-fix) from "the pack
+ * could not be resolved at all" (an operator problem). Collapsing both into
+ * a bare `false` is what turns a phantom recommendation into a phantom
+ * SILENCE: the nag disappears and nothing says why.
+ *
+ * Resolution goes through `loadActivePackForLocalEngine`, which is also what
+ * the `extract-ner` handler uses — so recommender and handler cannot resolve
+ * different packs and then disagree about the same brain. That helper pins
+ * `remote: false` (an onboard check is a LOCAL surface; the generic
+ * `loadActivePackBestEffort` defaults `remote: ctx.remote ?? true`, and a
+ * tier-1 trust rejection would arrive here masquerading as "pack has no NER
+ * rules") and pairs file-only config with the engine's DB-side `schema_pack`,
+ * matching `checkPackUpgradeAvailable` / `checkTypeProliferation` below.
+ *
+ * Those two siblings still open-code the same resolution rather than calling
+ * the shared helper: their outer `catch` returns a distinguishable
+ * `Check skipped: <message>`, which a null-swallowing helper would flatten
+ * into "No active pack".
+ */
+async function resolveNerInferenceCapability(
+  engine: BrainEngine,
+): Promise<'supported' | 'no_rules' | 'unresolved'> {
+  try {
+    const { loadActivePackForLocalEngine, packSupportsNerInference } =
+      await import('../schema-pack/best-effort.ts');
+    const pack = await loadActivePackForLocalEngine(engine);
+    if (!pack) return 'unresolved';
+    return packSupportsNerInference(pack) ? 'supported' : 'no_rules';
+  } catch {
+    return 'unresolved';
+  }
+}
+
+/**
  * entity_link_coverage: fraction of entity pages with at least one inbound link.
  *
  * Per A21 + codex finding #15: TABLESAMPLE BERNOULLI on Postgres when
@@ -170,32 +207,36 @@ export async function checkEntityLinkCoverage(
   // surfaces the same fix via the onboard plan either way.
   if (coverage >= 0.7) {
     message = `Coverage ${pct}% ± ${ciPct}%${sampleNote}`;
-  } else if (coverage >= 0.4) {
-    status = 'warn';
-    message = `Coverage ${pct}% ± ${ciPct}% (target 70%)${sampleNote}`;
-    remediations.push(makeRemediationStep({
-      id: 'onboard.extract_ner_links',
-      job: 'extract-ner',
-      params: {},
-      severity: 'medium',
-      est_seconds: 300,
-      est_usd_cost: 0,
-      rationale: `Entity link coverage at ${pct}%; NER extraction lifts typed-link density`,
-      status: 'remediable',
-    }));
   } else {
     status = 'warn';
     message = `Coverage ${pct}% ± ${ciPct}% (target 70%)${sampleNote}`;
-    remediations.push(makeRemediationStep({
-      id: 'onboard.extract_ner_links',
-      job: 'extract-ner',
-      params: {},
-      severity: 'high',
-      est_seconds: 600,
-      est_usd_cost: 0,
-      rationale: `Entity link coverage at ${pct}%; NER extraction lifts typed-link density`,
-      status: 'remediable',
-    }));
+    // Only recommend NER extraction if the active pack actually declares
+    // inference.regex rules — otherwise `extract-ner` is a structural no-op
+    // (pack_unavailable, 0 links) and the recommendation could never clear.
+    //
+    // Recommender and handler now share BOTH halves of the question: the same
+    // resolver (`loadActivePackForLocalEngine`) picks the pack, and the same
+    // predicate (`packSupportsNerInference`) judges its capability. Sharing
+    // only the predicate would still have let the two resolve different packs.
+    const nerCapability = await resolveNerInferenceCapability(engine);
+    if (nerCapability === 'supported') {
+      remediations.push(makeRemediationStep({
+        id: 'onboard.extract_ner_links',
+        job: 'extract-ner',
+        params: {},
+        severity: coverage >= 0.4 ? 'medium' : 'high',
+        est_seconds: coverage >= 0.4 ? 300 : 600,
+        est_usd_cost: 0,
+        rationale: `Entity link coverage at ${pct}%; NER extraction lifts typed-link density`,
+        status: 'remediable',
+      }));
+    } else if (nerCapability === 'no_rules') {
+      message += ' — no auto-fix: the active schema pack declares no NER inference rules'
+        + ' (add link_types[].inference.regex, or upgrade the pack)';
+    } else {
+      message += ' — no auto-fix: could not resolve the active schema pack, so NER'
+        + ' capability is unknown (see `gbrain doctor` schema_pack checks)';
+    }
   }
   return {
     check: { name: 'entity_link_coverage', status, message },
@@ -259,32 +300,31 @@ export async function checkTimelineCoverage(
   // code doesn't flip on a fresh brain.
   if (coverage >= 0.9) {
     message = `Coverage ${pct}% ± ${ciPct}%${sampleNote}`;
-  } else if (coverage >= 0.7) {
-    status = 'warn';
-    message = `Coverage ${pct}% ± ${ciPct}% (target 90%)${sampleNote}`;
-    remediations.push(makeRemediationStep({
-      id: 'onboard.extract_timeline_from_meetings',
-      job: 'extract-timeline-from-meetings',
-      params: {},
-      severity: 'medium',
-      est_seconds: 240,
-      est_usd_cost: 0,
-      rationale: `Timeline coverage at ${pct}%; meeting-derived entries lift it`,
-      status: 'remediable',
-    }));
   } else {
     status = 'warn';
     message = `Coverage ${pct}% ± ${ciPct}% (target 90%)${sampleNote}`;
-    remediations.push(makeRemediationStep({
-      id: 'onboard.extract_timeline_from_meetings',
-      job: 'extract-timeline-from-meetings',
-      params: {},
-      severity: 'high',
-      est_seconds: 480,
-      est_usd_cost: 0,
-      rationale: `Timeline coverage at ${pct}%; meeting-derived entries lift it`,
-      status: 'remediable',
-    }));
+    // Only recommend meeting-derived timeline extraction if there are dated
+    // meeting pages to extract FROM — otherwise the job creates 0 entries
+    // (it skips meetings without effective_date) and the rec never clears.
+    const datableMeetings = await safeCount(
+      engine,
+      `SELECT COUNT(*) AS count FROM pages
+         WHERE type = 'meeting' AND effective_date IS NOT NULL AND deleted_at IS NULL`,
+    );
+    if (datableMeetings > 0) {
+      remediations.push(makeRemediationStep({
+        id: 'onboard.extract_timeline_from_meetings',
+        job: 'extract-timeline-from-meetings',
+        params: {},
+        severity: coverage >= 0.7 ? 'medium' : 'high',
+        est_seconds: coverage >= 0.7 ? 240 : 480,
+        est_usd_cost: 0,
+        rationale: `Timeline coverage at ${pct}%; meeting-derived entries lift it`,
+        status: 'remediable',
+      }));
+    } else {
+      message += ' — no auto-fix: no dated meeting pages to extract timeline entries from';
+    }
   }
   return {
     check: { name: 'timeline_coverage', status, message },
@@ -386,14 +426,15 @@ export async function checkPackUpgradeAvailable(
 ): Promise<OnboardCheckResult> {
   try {
     const { loadActivePack, findPackSuccessors } = await import('../schema-pack/load-active.ts');
+    const { loadConfigFileOnly } = await import('../config.ts');
     // Read the engine's DB-side schema_pack so a post-unify flip is visible
-    // here even before the file-plane config catches up. Falls through to
-    // file-plane/env/default resolution when unset.
+    // here even before the file-plane config catches up. File-only config
+    // preserves tier-6 schema_pack without merging transient env/database state.
     let dbConfig: string | undefined;
     try {
       dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
     } catch { /* engine.config may not exist on very old brains */ }
-    const active = await loadActivePack({ cfg: null, remote: false, dbConfig })
+    const active = await loadActivePack({ cfg: loadConfigFileOnly(), remote: false, dbConfig })
       .catch(() => null);
     if (!active) {
       return {
@@ -425,7 +466,9 @@ export async function checkPackUpgradeAvailable(
         makeRemediationStep({
           id: 'onboard.pack_upgrade_' + successor.manifest.name,
           job: 'unify-types',
-          params: { target_pack: successor.manifest.name },
+          // #1575: the worker defaults `apply` to false (dry-run); a
+          // remediation step is a consented apply, so carry it explicitly.
+          params: { target_pack: successor.manifest.name, apply: true },
           severity: 'medium',
           est_seconds: 600,  // ~10min on 186K-page brain (production proxy)
           est_usd_cost: 0,   // pure SQL; no LLM spend
@@ -463,11 +506,12 @@ export async function checkTypeProliferation(
   let declared = 15;  // fallback to gbrain-base-v2 default if pack unavailable
   try {
     const { loadActivePack } = await import('../schema-pack/load-active.ts');
+    const { loadConfigFileOnly } = await import('../config.ts');
     let dbConfig: string | undefined;
     try {
       dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
     } catch { /* tolerate pre-config brains */ }
-    const active = await loadActivePack({ cfg: null, remote: false, dbConfig })
+    const active = await loadActivePack({ cfg: loadConfigFileOnly(), remote: false, dbConfig })
       .catch(() => null);
     if (active) declared = active.manifest.page_types.length;
   } catch {

@@ -208,6 +208,9 @@ describe('thin-client scratch-DB guard — jobs partial dispatch + config refusa
     expect(existsSync(join(tmp, '.gbrain', 'brain.pglite'))).toBe(false);
     expect(r.stdout + r.stderr).not.toContain('Schema version');
     expect(r.stdout + r.stderr).not.toContain('migration(s) pending');
+    // A scratch store is a FRESH install, so a re-regression would print the
+    // quiet-replay summary line, not the verbose header — pin both shapes.
+    expect(r.stdout + r.stderr).not.toContain('Setting up brain schema');
   });
 
   test('`gbrain jobs list` never fabricates a scratch local engine', async () => {
@@ -216,5 +219,29 @@ describe('thin-client scratch-DB guard — jobs partial dispatch + config refusa
     const { existsSync } = await import('fs');
     expect(existsSync(join(tmp, '.gbrain', 'brain.pglite'))).toBe(false);
     expect(r.stdout + r.stderr).not.toContain('Schema version');
+    expect(r.stdout + r.stderr).not.toContain('Setting up brain schema');
+  });
+
+  test('`gbrain think` never fabricates a scratch local engine', async () => {
+    // Same class as jobs get: pglite-keyed thin client must not open a
+    // scratch store / replay migrations before the remote think call.
+    seedThinClientConfig({ engine: 'pglite' });
+    const r = await run(['think', 'What do we know?']);
+    const { existsSync } = await import('fs');
+    expect(existsSync(join(tmp, '.gbrain', 'brain.pglite'))).toBe(false);
+    expect(r.stdout + r.stderr).not.toContain('Schema version');
+    expect(r.stdout + r.stderr).not.toContain('Setting up brain schema');
+    expect(r.stdout + r.stderr).not.toContain('database_url is missing');
+  });
+
+  test('`gbrain think` on postgres-keyed thin client never demands database_url', async () => {
+    // Topology 2 as shipped: engine postgres, remote_mcp set, no database_url.
+    // Today's connectEngine() throws `database_url is missing` before
+    // runThinkCli's isThinClient branch. Remote call to brain-host.example
+    // will fail (unreachable) — irrelevant. Pin that connectEngine did not run.
+    seedThinClientConfig({ engine: 'postgres' });
+    const r = await run(['think', 'What do we know?']);
+    expect(r.stdout + r.stderr).not.toContain('database_url is missing');
+    expect(r.stdout + r.stderr).not.toContain('No brain configured');
   });
 });

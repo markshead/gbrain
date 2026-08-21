@@ -52,7 +52,7 @@ describe('checkZeEmbeddingHealth', () => {
     expect(check.message).toContain('not ZeroEntropy');
   });
 
-  test('on ZE + no key: warns with setup hint', async () => {
+  test('on ZE + no key: warns migration-first (no signup funnel)', async () => {
     configureGateway({
       embedding_model: 'zeroentropyai:zembed-1',
       embedding_dimensions: 1280,
@@ -65,7 +65,10 @@ describe('checkZeEmbeddingHealth', () => {
       const check = await checkZeEmbeddingHealth(engine);
       expect(check.status).toBe('warn');
       expect(check.message).toContain('ZEROENTROPY_API_KEY');
-      expect(check.message).toContain('zeroentropy.dev');
+      // Migration-first: the fix for a missing key on a sunsetting provider
+      // is the off-ramp, never a signup link.
+      expect(check.message).toContain('migrate embeddings');
+      expect(check.message).not.toContain('dashboard.zeroentropy.dev');
     });
   });
 
@@ -143,9 +146,10 @@ describe('checkEmbeddingWidthConsistency', () => {
   });
 
   test('gateway unconfigured: skips with ok', async () => {
-    // Reset gateway so requireConfig() throws.
-    const { resetGateway } = await import('../src/core/ai/gateway.ts');
-    resetGateway();
+    // Hard-unconfigure so requireConfig() throws — resetGateway() would
+    // restore the preload's test baseline (#3554).
+    const { __unconfigureGatewayForTests } = await import('../src/core/ai/gateway.ts');
+    __unconfigureGatewayForTests();
     const check = await checkEmbeddingWidthConsistency(engine);
     expect(check.status).toBe('ok');
     expect(check.message).toContain('gateway not configured');

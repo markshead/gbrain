@@ -10,6 +10,8 @@
 
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'fs';
+import type { BrainEngine } from '../src/core/engine.ts';
+import { __testing } from '../src/core/cycle/patterns.ts';
 
 const patternsSrc = readFileSync(
   new URL('../src/core/cycle/patterns.ts', import.meta.url),
@@ -74,12 +76,36 @@ describe('patterns phase wiring', () => {
 });
 
 describe('patterns scope filter', () => {
-  test('filters reflections by slug LIKE <output_root>/personal/reflections/%', () => {
-    // #2415: the namespace root is configurable (dream.synthesize.output_root,
-    // default 'wiki') and bound as a parameter — the scope filter itself and
-    // the reflections sub-path stay pinned.
+  test('reflection excerpts never split a UTF-16 surrogate pair', async () => {
+    const rocket = '\uD83D\uDE80';
+    const compiledTruth = `${'a'.repeat(599)}${rocket}tail`;
+    const engine = {
+      executeRaw: async () => [{
+        slug: 'wiki/personal/reflections/example',
+        title: 'Example',
+        compiled_truth: compiledTruth,
+      }],
+    } as unknown as BrainEngine;
+
+    const [reflection] = await __testing.gatherReflections(engine, 30);
+
+    expect(reflection.excerpt.isWellFormed()).toBe(true);
+    expect(reflection.excerpt.endsWith(rocket)).toBe(false);
+    expect(reflection.excerpt.length).toBe(599);
+  });
+
+  test('filters reflections by slug LIKE <source_slug_prefix>/%', () => {
+    // #2415 made the top-level namespace root configurable
+    // (dream.synthesize.output_root, default 'wiki'). A later patch made the
+    // full `personal/reflections` sub-path configurable too
+    // (dream.patterns.source_slug_prefix, defaults to
+    // `<output_root>/personal/reflections` so existing behavior is
+    // unchanged) — schemas with no `personal/` nesting (e.g. a flat
+    // `meetings/` tree) can point the phase at their own compiled_truth
+    // source instead.
     expect(patternsSrc).toContain('slug LIKE $2');
-    expect(patternsSrc).toContain('/personal/reflections/%');
+    expect(patternsSrc).toContain('${sourceSlugPrefix}/%');
+    expect(patternsSrc).toContain('dream.patterns.source_slug_prefix');
   });
 
   test('orders by updated_at DESC for recency-bias', () => {
@@ -88,5 +114,23 @@ describe('patterns scope filter', () => {
 
   test('caps gather to 100 reflections (cost control)', () => {
     expect(patternsSrc).toContain('LIMIT 100');
+  });
+
+  test('output slug prefix is config-driven, defaulting to <output_root>/personal/patterns', () => {
+    expect(patternsSrc).toContain('dream.patterns.output_slug_prefix');
+    expect(patternsSrc).toContain('${outputRoot}/personal/patterns');
+  });
+
+  test('source slug prefix defaults to <output_root>/personal/reflections', () => {
+    expect(patternsSrc).toContain('${outputRoot}/personal/reflections');
+  });
+
+  test('adds a configured output_slug_prefix to the subagent write allow-list', () => {
+    // A custom dream.patterns.output_slug_prefix (e.g. a flat schema with no
+    // personal/ nesting) is not covered by the filing-rules globs, which only
+    // remap the `wiki/personal/patterns/*` literal by output_root. The phase
+    // must add it explicitly so put_page actually grants write access there.
+    expect(patternsSrc).toContain('outputGlob');
+    expect(patternsSrc).toContain('allowedSlugPrefixes.push(outputGlob)');
   });
 });

@@ -27,6 +27,8 @@
  */
 
 import type { BrainEngine } from './engine.ts';
+import { isUndefinedTableError } from './utils.ts';
+import { CJK_SLUG_CHARS } from './cjk.ts';
 import { stripCodeBlocks } from './link-extraction.ts';
 
 /** D2: hardcoded entity types for v1. Pack-aware extension is TODO-1. */
@@ -39,7 +41,10 @@ export const LINKABLE_ENTITY_TYPES = ['person', 'company', 'organization', 'enti
  * pack-aware follow-up (TODO-1) can let users opt specific 3-char entity
  * types in.
  */
+let aliasGazetteerWarned = false;
+
 const MIN_NAME_LENGTH = 4;
+const MIN_CJK_NAME_LENGTH = 2;
 
 /**
  * Built-in ignore list — common ambiguous tokens whose body-text mentions
@@ -104,18 +109,101 @@ export interface FindMentionsOpts {
 // ============================================================
 
 /**
- * Token-only tokenizer. Returns `[token, offset]` pairs for every
- * `[a-zA-Z0-9]+` run, lowercased. Non-ASCII (CJK, accented) is
- * deliberately not tokenized in v1 — entity gazetteer is English-dominant
- * in production today. Widening to `\p{L}+` is a future option once a
- * real CJK entity catalog appears (filed under TODO-1 + a TODO for
- * Unicode-aware tokenization).
+ * The CJK character set this module treats as char-level, declared ONCE.
  *
- * Possessive "Acme's" tokenizes as ['acme', 's'] (single-quote breaks the
- * run) — single-word "Acme" lookup succeeds at offset 0; the trailing 's'
- * is harmless noise.
+ * `CJK_SLUG_CHARS` (src/core/cjk.ts) is the repo-wide single source of truth
+ * — Han U+4E00–9FFF, Hiragana, Katakana, Hangul syllables — and this module
+ * now uses it verbatim.
+ *
+ * Note the deliberate behaviour change: the walkers here used to carry their
+ * own copy of the ranges that also covered Han Extension A (U+3400–4DBF),
+ * which cjk.ts scopes out repo-wide (see its header). Aligning on the shared
+ * constant means Ext-A characters are no longer treated as CJK by
+ * by-mention: they tokenize as word runs and, being a single sub-4-character
+ * token, an Ext-A-only entity title now falls below MIN_NAME_LENGTH instead
+ * of qualifying under MIN_CJK_NAME_LENGTH. Search, chunking and slug grammar
+ * already ignore Ext-A, so this makes by-mention consistent with them rather
+ * than being the one subsystem that disagrees.
+ *
+ * Everything below — TOKEN_RE, hasCJK(), cjkCharCount() and the two
+ * per-character walkers — derives from this one import. There are no copies
+ * of the ranges in this file.
  */
-const TOKEN_RE = /[a-zA-Z0-9]+/g;
+const CJK_CHAR_RE = new RegExp(`^[${CJK_SLUG_CHARS}]$`, 'u');
+
+/**
+ * Conservative code-point bounds for CJK_SLUG_CHARS, derived from the range
+ * string itself (strip the `-` separators and the remaining characters are
+ * exactly the range endpoints) so they can never drift from it. Used only
+ * as a cheap pre-filter — Latin/Vietnamese text short-circuits before the
+ * regex in the per-character walkers, which run over every body byte.
+ */
+const CJK_BOUNDS = ((): { min: number; max: number } => {
+  let min = 0x10ffff;
+  let max = 0;
+  for (const ch of CJK_SLUG_CHARS.replace(/-/g, '')) {
+    const cp = ch.codePointAt(0)!;
+    if (cp < min) min = cp;
+    if (cp > max) max = cp;
+  }
+  return { min, max };
+})();
+
+function isCJKChar(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  if (cp < CJK_BOUNDS.min || cp > CJK_BOUNDS.max) return false;
+  return CJK_CHAR_RE.test(ch);
+}
+
+/**
+ * Word-run tokenizer: a letter or ASCII digit, followed by any run of
+ * letters, ASCII digits and combining marks — CJK excluded throughout, so
+ * CJK keeps flowing through the per-character path in the walkers below.
+ *
+ * Latin scripts with diacritics tokenize as whole words instead of
+ * fragmenting on every accented character — "Nguyễn" is one token, not
+ * ["nguy","n"], and "Đà Nẵng" is ["đà","nẵng"], not ["n","ng"].
+ *
+ * Four deliberate boundaries, each of which was a real regression:
+ *
+ *  - The LEAD must be a letter or digit, so a token can never consist of
+ *    combining marks alone. U+FE0F (VARIATION SELECTOR-16, category Mn)
+ *    rides on most emoji, so a mark-only token would hijack the gazetteer
+ *    key of every emoji-prefixed entity title ("❤️ Health Notes" keying on
+ *    U+FE0F instead of "health") and collapse all of them into one shared,
+ *    mutually-confusable bucket.
+ *  - Combining marks ARE allowed after the lead. NFD Vietnamese is base
+ *    letter + mark, so excluding \p{M} would re-fragment the exact names
+ *    this tokenizer exists to keep whole.
+ *  - Digits are ASCII-only, exactly as the previous /[a-zA-Z0-9]+/ was.
+ *    \p{N} would additionally mint tokens for ¹ ½ １ (Nl/No/non-ASCII Nd),
+ *    and findMentionedEntities requires gazetteer tokens to be STRICTLY
+ *    ADJACENT in the body — so a superscript between the words of
+ *    "Acme Corp" would silently break a match that used to work.
+ *  - Plain `u` flag, not `v`: the CJK exclusion is a negative lookahead
+ *    over CJK_SLUG_CHARS, the same construction src/core/think/gather.ts
+ *    already uses. No es2024 target requirement, no set-subtraction syntax.
+ */
+const TOKEN_RE = new RegExp(
+  `(?![${CJK_SLUG_CHARS}])[\\p{L}0-9]` +
+  `(?:(?![${CJK_SLUG_CHARS}])[\\p{L}\\p{M}0-9])*`,
+  'gu',
+);
+
+/**
+ * Canonical form for a single token. NFC only — canonical composition, no
+ * compatibility folding — so an NFD body and an NFC gazetteer title produce
+ * the same token, while diacritics stay significant ("Hồng" still must not
+ * match "Hong").
+ *
+ * Applied PER TOKEN, never to the whole text: `Mention.offset` is contracted
+ * to index into the ORIGINAL body (extract-ner.ts slices a context window
+ * from it to infer the link verb), and normalizing the text up front would
+ * silently shift every offset.
+ */
+function normalizeToken(s: string): string {
+  return s.normalize('NFC').toLowerCase();
+}
 
 interface ScannedToken {
   text: string;       // lowercase
@@ -123,22 +211,149 @@ interface ScannedToken {
   length: number;     // original length (for span tracking)
 }
 
-function tokenizeForScan(text: string): ScannedToken[] {
+/**
+ * Body-text tokenizer. Returns `[token, offset]` pairs.
+ *
+ * Word runs: each TOKEN_RE match is one token, NFC-normalized and
+ *   lowercased. Covers ASCII and diacritic Latin scripts like Vietnamese
+ *   ("Nguyễn" → one token, not ["nguy","n"]).
+ * CJK: each CJK character (Chinese/Japanese/Korean) is an individual
+ *   token. This allows the normal maximal-munch scan path to reach CJK
+ *   gazetteer entries without a separate substring pass.
+ *
+ * `offset` and `length` index into the ORIGINAL string — callers slice
+ * context windows out of the untouched body with them.
+ *
+ * Possessive "Acme's" tokenizes as ['acme', 's'] (single-quote breaks the
+ * run) — single-word "Acme" lookup succeeds at offset 0; the trailing 's'
+ * is harmless noise.
+ *
+ * Exported so tests can assert on TOKENIZATION rather than only on the
+ * resolved mention (see tokenizeTitle).
+ */
+export function tokenizeForScan(text: string): ScannedToken[] {
   const out: ScannedToken[] = [];
   TOKEN_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
+
+  // Collect word-run token spans first.
+  const wordSpans: Array<{ start: number; end: number }> = [];
   while ((m = TOKEN_RE.exec(text)) !== null) {
-    out.push({ text: m[0].toLowerCase(), offset: m.index, length: m[0].length });
+    wordSpans.push({ start: m.index, end: m.index + m[0].length });
+  }
+
+  // Walk character-by-character: emit word-run tokens at their start
+  // positions, then emit individual CJK characters for positions that fall
+  // outside every word-run span.
+  let spanIdx = 0;
+  for (let i = 0; i < text.length;) {
+    // Advance spanIdx past any spans that end before or at i.
+    while (spanIdx < wordSpans.length && wordSpans[spanIdx]!.end <= i) {
+      spanIdx++;
+    }
+
+    // If position i is inside a word-run span, emit the full token and jump
+    // past it.
+    if (spanIdx < wordSpans.length && i >= wordSpans[spanIdx]!.start && i < wordSpans[spanIdx]!.end) {
+      const span = wordSpans[spanIdx]!;
+      const token = text.slice(span.start, span.end);
+      out.push({ text: normalizeToken(token), offset: span.start, length: token.length });
+      i = span.end;
+      spanIdx++;
+      continue;
+    }
+
+    // CJK: emit as individual character token.
+    const cp = text.codePointAt(i) ?? 0;
+    const charLen = cp > 0xffff ? 2 : 1; // surrogate pair
+    const charStr = text.slice(i, i + charLen);
+    if (isCJKChar(charStr)) {
+      out.push({ text: normalizeToken(charStr), offset: i, length: charLen });
+      i += charLen;
+    } else {
+      i++;
+    }
   }
   return out;
 }
 
-function tokenizeTitle(title: string): string[] {
+function hasCJK(s: string): boolean {
+  for (const ch of s) {
+    if (isCJKChar(ch)) return true;
+  }
+  return false;
+}
+
+function cjkCharCount(s: string): number {
+  let count = 0;
+  for (const ch of s) {
+    if (isCJKChar(ch)) count++;
+  }
+  return count;
+}
+
+/**
+ * Tokenize a page title for gazetteer insertion.
+ *
+ * Word-run titles: TOKEN_RE tokenization, NFC-normalized and lowercased —
+ *   ASCII plus diacritic Latin scripts (Vietnamese, etc.).
+ * CJK titles (no word-run content): split into individual characters —
+ *   e.g. "纳瓦尔" → ["纳","瓦","尔"]. This allows normal multi-token
+ *   maximal-munch matching to work with character-level CJK tokens
+ *   produced by `tokenizeForScan`.
+ * Mixed CJK+word-run titles: word-run parts tokenized normally, CJK parts
+ *   split into individual characters.
+ *
+ * Exported so tests can assert on TOKENIZATION rather than only on the
+ * resolved mention — a mention-only assertion passes even with a tokenizer
+ * that fragments the title and the body symmetrically.
+ */
+export function tokenizeTitle(title: string): string[] {
   const tokens: string[] = [];
   TOKEN_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = TOKEN_RE.exec(title)) !== null) tokens.push(m[0].toLowerCase());
-  return tokens;
+  const hasWordRun = TOKEN_RE.test(title);
+  if (hasWordRun) {
+    // Mixed word-run+CJK or pure word-run: tokenize word runs normally,
+    // then append individual CJK characters in order.
+    TOKEN_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    const wordSpans: Array<{ start: number; end: number; text: string }> = [];
+    while ((m = TOKEN_RE.exec(title)) !== null) {
+      wordSpans.push({ start: m.index, end: m.index + m[0].length, text: normalizeToken(m[0]) });
+    }
+    let spanIdx = 0;
+    for (let i = 0; i < title.length;) {
+      while (spanIdx < wordSpans.length && wordSpans[spanIdx]!.end <= i) spanIdx++;
+      if (spanIdx < wordSpans.length && i >= wordSpans[spanIdx]!.start && i < wordSpans[spanIdx]!.end) {
+        tokens.push(wordSpans[spanIdx]!.text);
+        i = wordSpans[spanIdx]!.end;
+        spanIdx++;
+        continue;
+      }
+      const cp = title.codePointAt(i) ?? 0;
+      const charLen = cp > 0xffff ? 2 : 1;
+      const charStr = title.slice(i, i + charLen);
+      if (isCJKChar(charStr)) {
+        tokens.push(normalizeToken(charStr));
+        i += charLen;
+      } else {
+        i++;
+      }
+    }
+    return tokens;
+  }
+  // Pure CJK (no word-run content): split into individual characters.
+  if (hasCJK(title)) {
+    for (let i = 0; i < title.length;) {
+      const cp = title.codePointAt(i) ?? 0;
+      const charLen = cp > 0xffff ? 2 : 1;
+      tokens.push(normalizeToken(title.slice(i, i + charLen)));
+      i += charLen;
+    }
+    return tokens;
+  }
+  // Non-ASCII, non-CJK title (emoji, symbols, etc.) — empty set.
+  return [];
 }
 
 /**
@@ -175,7 +390,15 @@ export async function buildGazetteer(
 
   const gazetteer: Gazetteer = new Map();
   for (const row of rows) {
-    if (!row.title || row.title.length < MIN_NAME_LENGTH) continue;
+    if (!row.title) continue;
+    if (!hasCJK(row.title) && row.title.length < MIN_NAME_LENGTH) continue;
+    if (hasCJK(row.title) && cjkCharCount(row.title) < MIN_CJK_NAME_LENGTH) continue;
+    // NOTE (v0.46.15, deliberately preserved): for TITLES this condition is
+    // intentionally vacuous — every row here IS a real page, so an
+    // ignore-listed name the user explicitly created a page for is always
+    // allowed (documented CK12 policy). The ignore list bites only via
+    // opts.extraIgnore names that have no page, and — with real teeth — on
+    // the ALIAS entries below, which are not user-created pages.
     if (ignoreSet.has(row.title) && !existingTitles.has(row.title)) continue;
 
     const tokens = tokenizeTitle(row.title);
@@ -192,6 +415,78 @@ export async function buildGazetteer(
     const bucket = gazetteer.get(key);
     if (bucket) bucket.push(entry);
     else gazetteer.set(key, [entry]);
+  }
+
+  // ── Alias entries (v0.46.15 identity wave, #3801) ────────────────────────
+  // page_aliases rows joined to LIVE entity-typed pages become additional
+  // gazetteer entries, so a body mention of "saoirse" links to
+  // people/saoirse-x. Guards (stricter than titles — aliases are not
+  // user-created pages):
+  //   - ignore-list applies CASE-INSENSITIVELY with NO existing-page escape
+  //     (aliases store normalized lowercase; DEFAULT_IGNORE_LIST is cased)
+  //   - aliases mapping to >1 slug within a source are skipped (ambiguous)
+  //   - aliases colliding with any existing page TITLE in the SAME source
+  //     are skipped (the title entry wins; per-source scoping per R2-9)
+  //   - MIN_NAME_LENGTH applies to the alias string
+  try {
+    const aliasRows = await engine.executeRaw<{
+      alias_norm: string;
+      slug: string;
+      source_id: string | null;
+      title: string | null;
+    }>(
+      `SELECT pa.alias_norm, pa.slug, pa.source_id, p.title
+       FROM page_aliases pa
+       JOIN pages p ON p.slug = pa.slug AND p.source_id = pa.source_id
+       WHERE p.type IN (${typeList})
+         AND p.deleted_at IS NULL`,
+      [],
+    );
+    const ignoreLc = new Set(Array.from(ignoreSet, (s) => s.toLowerCase()));
+    // Per-source title index for alias-vs-title collision checks.
+    const titleBySource = new Set<string>();
+    for (const r of rows) {
+      if (r.title) titleBySource.add(`${r.source_id ?? 'default'} ${r.title.toLowerCase()}`);
+    }
+    // Ambiguity: same (source, alias) → multiple slugs.
+    const bySourceAlias = new Map<string, Set<string>>();
+    for (const a of aliasRows) {
+      const k = `${a.source_id ?? 'default'} ${a.alias_norm}`;
+      const set = bySourceAlias.get(k) ?? new Set<string>();
+      set.add(a.slug);
+      bySourceAlias.set(k, set);
+    }
+    const seenAliasEntry = new Set<string>();
+    for (const a of aliasRows) {
+      const alias = a.alias_norm?.trim();
+      if (!alias || !a.title) continue;
+      const src = a.source_id ?? 'default';
+      if (alias.length < MIN_NAME_LENGTH && !hasCJK(alias)) continue;
+      if (hasCJK(alias) && cjkCharCount(alias) < MIN_CJK_NAME_LENGTH) continue;
+      if (ignoreLc.has(alias.toLowerCase())) continue;
+      if ((bySourceAlias.get(`${src} ${alias}`)?.size ?? 0) > 1) continue;
+      if (titleBySource.has(`${src} ${alias.toLowerCase()}`)) continue;
+      const dedupeKey = `${src} ${alias} ${a.slug}`;
+      if (seenAliasEntry.has(dedupeKey)) continue;
+      seenAliasEntry.add(dedupeKey);
+      const tokens = tokenizeTitle(alias);
+      if (tokens.length === 0) continue;
+      if (tokens[0]!.length < MIN_NAME_LENGTH && tokens.length === 1) continue;
+      const entry: GazetteerEntry = { slug: a.slug, source_id: src, title: a.title, tokens };
+      const key = tokens[0]!;
+      const bucket = gazetteer.get(key);
+      if (bucket) bucket.push(entry);
+      else gazetteer.set(key, [entry]);
+    }
+  } catch (err) {
+    // pre-v110 brains: no page_aliases table — titles-only gazetteer.
+    // Any OTHER failure (connection blip, permission) warns once per process
+    // (adversarial F12): a silently titles-only gazetteer under-links every
+    // page processed until restart, and nobody would know why.
+    if (!isUndefinedTableError(err) && !aliasGazetteerWarned) {
+      aliasGazetteerWarned = true;
+      console.error(`[gbrain] gazetteer alias load degraded (titles-only): ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // Sort each bucket by token-count DESC so maximal-munch walks longest-first.

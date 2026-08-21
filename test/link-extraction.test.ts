@@ -7,9 +7,13 @@ import {
   inferLinkType,
   makeResolver,
   parseTimelineEntries,
+  deriveTimelineAnchor,
   isAutoLinkEnabled,
   FRONTMATTER_LINK_MAP,
   unwrapWikilink,
+  buildBasenameIndex,
+  queryBasenameIndex,
+  normalizeBasename,
   type SlugResolver,
 } from '../src/core/link-extraction.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -57,7 +61,7 @@ describe('extractEntityRefs', () => {
   test('extracts filesystem-relative refs ([Name](../people/slug.md))', () => {
     const refs = extractEntityRefs('Met with [Alice Chen](../people/alice-chen.md) at the office.');
     expect(refs.length).toBe(1);
-    expect(refs[0]).toEqual({ name: 'Alice Chen', slug: 'people/alice-chen', dir: 'people' });
+    expect(refs[0]).toEqual({ name: 'Alice Chen', slug: 'people/alice-chen', dir: 'people', upLevels: 1 });
   });
 
   test('extracts engine-style slug refs ([Name](people/slug))', () => {
@@ -99,16 +103,37 @@ describe('extractEntityRefs', () => {
     expect(extractEntityRefs('[Alice(people/alice)')).toEqual([]);
   });
 
-  test('skips non-entity dirs (notes/, ideas/ stay if added later but are accepted now)', () => {
-    // Current regex targets entity dirs explicitly. Notes/ shouldn't match.
+  test('#2576: non-whitelisted dirs (notes/, ops/) ARE extracted as candidates', () => {
+    // Pre-#2576 the DIR_PATTERN whitelist silently dropped these. Now any
+    // dir-shaped path is a candidate; page-existence checks downstream
+    // (resolveCandidateSources / put_page allSlugs / addLinksBatch JOIN)
+    // decide whether an edge is persisted.
     const refs = extractEntityRefs('See [random](notes/random).');
-    expect(refs).toEqual([]);
+    expect(refs.map(r => r.slug)).toEqual(['notes/random']);
+    expect(refs[0].dir).toBe('notes');
   });
 
   test('extracts meeting refs', () => {
     const refs = extractEntityRefs('See [Standup](meetings/2026-01-15-standup).');
     expect(refs.length).toBe(1);
     expect(refs[0].dir).toBe('meetings');
+  });
+
+  test('percent-decodes a markdown-link target before resolution', () => {
+    // ANY_DIR_SEGMENT requires a lowercase leading directory segment, so
+    // this producer's realistic percent-encoded input keeps the dir
+    // lowercase and encodes a character in the basename — here `%2D` for
+    // `-`, decoding to the exact page slug `people/alice-chen`.
+    const refs = extractEntityRefs('Met with [Alice Chen](people/alice%2Dchen) at the office.');
+    expect(refs.length).toBe(1);
+    expect(refs[0].slug).toBe('people/alice-chen');
+  });
+
+  test('keeps a malformed percent-escape raw instead of throwing', () => {
+    expect(() => extractEntityRefs('[Alice](people/alice%zzchen)')).not.toThrow();
+    const refs = extractEntityRefs('[Alice](people/alice%zzchen)');
+    expect(refs.length).toBe(1);
+    expect(refs[0].slug).toBe('people/alice%zzchen');
   });
 
   // ─── issue #972: generic `[[bare-name]]` wikilinks (pass 2c) ─────────────
@@ -483,8 +508,10 @@ describe('extractPageLinks', () => {
     expect(seen).toContain('struktura');
     expect(seen).not.toContain('notes/struktura');
     expect(candidates.map(c => c.targetSlug)).toEqual(['notes/struktura']);
-    expect(candidates[0].linkType).toBe('wikilink_basename');
-    expect(candidates[0].linkSource).toBe('wikilink-resolved');
+    // #2576: the literal path now yields the direct verb-typed candidate
+    // (parity with whitelisted dirs), not a wikilink_basename demotion.
+    expect(candidates[0].linkType).toBe('mentions');
+    expect(candidates[0].linkSource).toBe('markdown');
   });
 
   test('path-qualified wikilink keeps only matches ending with the written path', async () => {
@@ -515,7 +542,13 @@ describe('extractPageLinks', () => {
       'concepts/x', 'See [[notes/struktura]].',
       {}, 'concept', resolver, { globalBasename: true },
     );
-    expect(candidates.map(c => c.targetSlug)).toEqual(['vault/notes/struktura']);
+    // #2576: the literal path is ALSO emitted as a direct candidate (typed,
+    // linkSource 'markdown') — downstream existence checks drop it when no
+    // `notes/struktura` page exists, so only the suffix match persists.
+    expect(candidates.map(c => c.targetSlug)).toEqual(['notes/struktura', 'vault/notes/struktura']);
+    const suffixMatch = candidates.find(c => c.targetSlug === 'vault/notes/struktura')!;
+    expect(suffixMatch.linkType).toBe('wikilink_basename');
+    expect(suffixMatch.linkSource).toBe('wikilink-resolved');
   });
 
   test('path-qualified self-link is dropped like the bare form', async () => {
@@ -552,6 +585,77 @@ describe('extractPageLinks', () => {
     expect(alice!.linkType).not.toBe('wikilink_basename'); // verb-inferred
     expect(strk).toBeDefined();
     expect(strk!.linkType).toBe('wikilink_basename');
+  });
+
+  // ─── issue #1964: dir-qualified wikilinks with raw Obsidian paths ────────
+
+  test('#1964: dir-qualified wikilink resolves via sync-consistent slugification (flag OFF)', async () => {
+    // `[[llm-wiki/entities/AI 3.0]]` is a raw Obsidian path; the page slug
+    // is the sync-slugified `llm-wiki/entities/ai-3.0`. Must resolve WITHOUT
+    // global_basename (it's dir-qualified) and must NOT leak to a same-tail
+    // page in a different directory.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'ai-3.0' ? ['other/ai-3.0', 'llm-wiki/entities/ai-3.0'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'llm-wiki/notes/roadmap',
+      'See [[llm-wiki/entities/AI 3.0]] for the model.',
+      {}, 'concept', resolver,
+      // opts.globalBasename omitted (= false) — path is dir-qualified
+    );
+    // #2576/#3560 also emits raw-literal + bare-path candidates alongside;
+    // downstream existence checks drop them (no such pages). The resolved
+    // wikilink edge is what this test pins.
+    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
+    expect(resolved.map(c => c.targetSlug)).toEqual(['llm-wiki/entities/ai-3.0']);
+    expect(resolved[0].linkType).toBe('wikilink_basename');
+  });
+
+  test('#1964: path-suffix match resolves wiki-root-relative paths against a real index', async () => {
+    // Author writes `[[llm-wiki/entities/AI 3.0]]` but the brain nests the
+    // wiki under a vault dir. Suffix match rescues it; queried through the
+    // REAL basename index so the tail-key lookup is exercised end to end.
+    const idx = buildBasenameIndex(['vault/llm-wiki/entities/ai-3.0', 'people/ai-3.0']);
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) => queryBasenameIndex(idx, name),
+    };
+    const { candidates } = await extractPageLinks(
+      'vault/llm-wiki/notes/roadmap',
+      'See [[llm-wiki/entities/AI 3.0]].',
+      {}, 'concept', resolver,
+    );
+    // Filter to the resolved wikilink edge — #2576/#3560's raw-literal and
+    // bare-path candidates are emitted alongside and dropped downstream.
+    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
+    expect(resolved.map(c => c.targetSlug)).toEqual(['vault/llm-wiki/entities/ai-3.0']);
+  });
+
+  test('wikilink interiors are masked from the bare-path pass (no parent-page edge)', async () => {
+    // Codex wave-i finding: `[[llm-wiki/entities/AI 3.0]]` leaves its
+    // lowercase prefix `llm-wiki/entities` as a bare-path match if the
+    // scanner sees wikilink interiors — a spurious 'markdown' edge to the
+    // PARENT page whenever it exists. The mask blanks `[[...]]` spans before
+    // pass 2; the wikilink pass owns those interiors.
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) =>
+        name === 'ai-3.0' ? ['llm-wiki/entities/ai-3.0'] : [],
+    };
+    const { candidates } = await extractPageLinks(
+      'llm-wiki/notes/roadmap',
+      'See [[llm-wiki/entities/AI 3.0]] for the model. Also see ops/runbook.',
+      {}, 'concept', resolver,
+    );
+    // The parent-prefix must NOT appear from the wikilink interior...
+    expect(candidates.map(c => c.targetSlug)).not.toContain('llm-wiki/entities');
+    // ...while a genuine bare path in prose still produces its candidate,
+    expect(candidates.map(c => c.targetSlug)).toContain('ops/runbook');
+    // and the wikilink itself still resolves through its own pass.
+    expect(candidates.filter(c => c.linkSource === 'wikilink-resolved')
+      .map(c => c.targetSlug)).toEqual(['llm-wiki/entities/ai-3.0']);
   });
 
   test('opts.skipFrontmatter suppresses the frontmatter pass', async () => {
@@ -849,6 +953,55 @@ More prose here.
 - **2026-02-20** | Another event`;
     const entries = parseTimelineEntries(content);
     expect(entries.length).toBe(2);
+  });
+});
+
+// ─── deriveTimelineAnchor ──────────────────────────────────────
+
+describe('deriveTimelineAnchor', () => {
+  test('anchors at a frontmatter effective_date with the page title as summary', () => {
+    const a = deriveTimelineAnchor({
+      slug: 'meetings/2026-04-24-handover',
+      title: 'Ops handover',
+      effectiveDate: new Date('2026-04-24T09:00:00Z'),
+      effectiveDateSource: 'event_date',
+    });
+    expect(a).toEqual({ date: '2026-04-24', summary: 'Ops handover', detail: '' });
+  });
+
+  test('accepts a filename-sourced date and an ISO-string effectiveDate', () => {
+    const a = deriveTimelineAnchor({
+      slug: 'daily/2022-04-20-standup',
+      title: '',
+      effectiveDate: '2022-04-20',
+      effectiveDateSource: 'filename',
+    });
+    expect(a).toEqual({ date: '2022-04-20', summary: '2022-04-20-standup', detail: '' });
+  });
+
+  test('returns null for the fallback (updated_at) source — not a real content date', () => {
+    expect(deriveTimelineAnchor({
+      slug: 'notes/x', title: 'X',
+      effectiveDate: new Date('2026-01-01T00:00:00Z'),
+      effectiveDateSource: 'fallback',
+    })).toBeNull();
+  });
+
+  test('returns null when no date or no source', () => {
+    expect(deriveTimelineAnchor({ slug: 'a', effectiveDate: null, effectiveDateSource: 'date' })).toBeNull();
+    expect(deriveTimelineAnchor({ slug: 'a', effectiveDate: new Date('2026-01-01Z'), effectiveDateSource: null })).toBeNull();
+  });
+
+  test('returns null on an unparseable date string', () => {
+    expect(deriveTimelineAnchor({ slug: 'a', title: 'A', effectiveDate: 'not-a-date', effectiveDateSource: 'date' })).toBeNull();
+  });
+
+  test('falls back to the slug basename when title is empty', () => {
+    const a = deriveTimelineAnchor({
+      slug: 'people/jane-example-com', title: '   ',
+      effectiveDate: '2025-12-31', effectiveDateSource: 'published',
+    });
+    expect(a?.summary).toBe('jane-example-com');
   });
 });
 
@@ -1448,9 +1601,45 @@ describe('parseTimelineEntries — Format 3: inline [Source: ..., YYYY-MM-DD] ci
     expect(entries[0].detail).toBe('Source: email re: offer, signed');
   });
 
+  test('uses the full paragraph for a wrapped inline citation summary', () => {
+    const entries = parseTimelineEntries(`The imported app showed product fit for commercial use
+after the prototype demo. [Source: user interview, 2026-07-30]`);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2026-07-30');
+    expect(entries[0].summary).toBe(
+      'The imported app showed product fit for commercial use after the prototype demo.',
+    );
+    expect(entries[0].detail).toBe('Source: user interview');
+  });
+
   test('does not double-extract a timeline bullet carrying its own citation', () => {
     const entries = parseTimelineEntries('- **2025-03-18** | Meeting notes [Source: notes, 2025-03-18]');
     expect(entries).toHaveLength(1); // bullet pass only
+  });
+
+  test('keeps a prose citation directly under a timeline bullet', () => {
+    const entries = parseTimelineEntries(`- **2025-03-18** | Meeting notes
+Follow-up decision recorded. [Source: memo, 2025-03-20]`);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].date).toBe('2025-03-18');
+    expect(entries[1]).toEqual({
+      date: '2025-03-20',
+      summary: 'Follow-up decision recorded.',
+      detail: 'Source: memo',
+    });
+  });
+
+  test('ignores dated citations inside fenced code blocks', () => {
+    const entries = parseTimelineEntries(`\`\`\`
+Fake claim. [Source: generated fixture, 2025-01-01]
+\`\`\`
+Real claim. [Source: memo, 2025-01-02]`);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toEqual({
+      date: '2025-01-02',
+      summary: 'Real claim.',
+      detail: 'Source: memo',
+    });
   });
 
   test('skips invalid calendar dates and bare citations', () => {
@@ -1628,5 +1817,77 @@ describe('extractFrontmatterLinks — [[wikilink]] related: values (end-to-end)'
     expect(candidates).toHaveLength(0);
     expect(unresolved).toHaveLength(1);
     expect(unresolved[0]).toEqual({ field: 'related', name: '[[99-archive/does-not-exist]]' });
+  });
+});
+
+// ─── #2367: normalizeBasename must keep non-Latin scripts ──────────────
+//
+// normalizeBasename previously stripped everything outside [a-z0-9\s-],
+// so a CJK basename collapsed to '' (every lookup missed) and accented
+// names diverged from slugifySegment ('Café' → 'caf' vs 'cafe'). It now
+// mirrors slugifySegment's normalization (NFD → strip accents → NFC →
+// lowercase → SLUG_WORD_CHARS filter), so display names in any script
+// produce the same key the slug grammar produces.
+
+describe('normalizeBasename — CJK + accent folding (#2367)', () => {
+  test('Korean display name normalizes to the slugifySegment form, not empty', () => {
+    expect(normalizeBasename('루카텍 올핸즈 미팅')).toBe('루카텍-올핸즈-미팅');
+  });
+
+  test('accented name folds like slugifySegment (Café → cafe, not caf)', () => {
+    expect(normalizeBasename('Café Notes')).toBe('cafe-notes');
+  });
+
+  test('ASCII keys unchanged from the old behavior', () => {
+    expect(normalizeBasename('Fast-Weigh')).toBe('fast-weigh');
+    expect(normalizeBasename('Alice Smith')).toBe('alice-smith');
+    expect(normalizeBasename('v1.0.0_beta!')).toBe('v100beta');
+  });
+
+  test('basename index: spaced CJK display name hits the hyphenated slug tail', () => {
+    const idx = buildBasenameIndex(['meetings/루카텍-올핸즈-미팅']);
+    expect(queryBasenameIndex(idx, '루카텍 올핸즈 미팅'))
+      .toEqual(['meetings/루카텍-올핸즈-미팅']);
+  });
+
+  test('end-to-end: bare CJK wikilink resolves via the basename index', async () => {
+    const idx = buildBasenameIndex(['meetings/루카텍-올핸즈-미팅']);
+    const resolver: SlugResolver = {
+      resolve: async () => null,
+      resolveBasenameMatches: async (name) => queryBasenameIndex(idx, name),
+    };
+    const { candidates } = await extractPageLinks(
+      'notes/weekly', '어제 [[루카텍 올핸즈 미팅]] 노트 참고.',
+      {}, 'concept', resolver, { globalBasename: true },
+    );
+    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
+    expect(resolved.map(c => c.targetSlug)).toEqual(['meetings/루카텍-올핸즈-미팅']);
+  });
+
+  test('makeResolver step 2 dir-hint slugifies accented names like the slug grammar', async () => {
+    // The resolver used an inline clone of the old ASCII-only normalizer for
+    // its dir-hint candidate ('Café Notes' + 'notes' → 'notes/caf-notes'),
+    // which could never match a page slugged by slugifySegment.
+    const engine = {
+      async getPage(slug: string) {
+        return slug === 'notes/cafe-notes' ? { slug } as any : null;
+      },
+      async findByTitleFuzzy() { return null; },
+      async searchKeyword() { return []; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'batch' });
+    expect(await r.resolve('Café Notes', 'notes')).toBe('notes/cafe-notes');
+  });
+
+  test('makeResolver.resolveBasenameMatches finds CJK slugs from getAllSlugs', async () => {
+    const engine = {
+      async getPage() { return null; },
+      async findByTitleFuzzy() { return null; },
+      async searchKeyword() { return []; },
+      async getAllSlugs() { return ['meetings/루카텍-올핸즈-미팅', 'people/alice']; },
+    } as unknown as BrainEngine;
+    const r = makeResolver(engine, { mode: 'batch' });
+    expect(await r.resolveBasenameMatches!('루카텍 올핸즈 미팅'))
+      .toEqual(['meetings/루카텍-올핸즈-미팅']);
   });
 });

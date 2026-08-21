@@ -4,7 +4,7 @@ import { join, basename } from 'path';
 import { createHash } from 'crypto';
 import { extname } from 'path';
 import { tmpdir } from 'os';
-import { collectFiles } from '../src/commands/files.ts';
+import { collectFiles, formatFileSizeKb } from '../src/commands/files.ts';
 import { operationsByName } from '../src/core/operations.ts';
 import * as db from '../src/core/db.ts';
 
@@ -49,6 +49,25 @@ beforeAll(() => {
 
 afterAll(() => {
   rmSync(TMP, { recursive: true, force: true });
+});
+
+describe('formatFileSizeKb', () => {
+  test('formats number, bigint, and string database values', () => {
+    expect(formatFileSizeKb(35 * 1024)).toBe('35KB');
+    expect(formatFileSizeKb(35n * 1024n)).toBe('35KB');
+    expect(formatFileSizeKb('35840')).toBe('35KB');
+  });
+
+  test('preserves zero-byte files instead of reporting an unknown size', () => {
+    expect(formatFileSizeKb(0)).toBe('0KB');
+    expect(formatFileSizeKb(0n)).toBe('0KB');
+  });
+
+  test('reports missing or invalid sizes as unknown', () => {
+    expect(formatFileSizeKb(null)).toBe('?');
+    expect(formatFileSizeKb('not-a-number')).toBe('?');
+    expect(formatFileSizeKb(-1)).toBe('?');
+  });
 });
 
 describe('getMimeType', () => {
@@ -198,23 +217,21 @@ describe('collectFiles (production import)', () => {
         mime_type: null, size_bytes: null, content_hash: 'h2',
         created_at: '2026-04-27' },
     ];
-    const fakeSql: any = (..._: unknown[]) => Promise.resolve(fakeRows);
-    const spy = spyOn(db, 'getConnection').mockReturnValue(fakeSql);
+    // file_list now routes through the connected OperationContext engine
+    // (sqlQueryForEngine) instead of the module-global db connection; pin the
+    // same BigInt invariant against the new seam.
+    const fakeEngine: any = { executeRaw: async () => fakeRows };
 
-    try {
-      const op = operationsByName['file_list'];
-      const ctx: any = { engine: null, config: {}, logger: { info() {}, warn() {}, error() {} }, dryRun: false, remote: true };
-      const result = await op.handler(ctx, {}) as Array<Record<string, unknown>>;
+    const op = operationsByName['file_list'];
+    const ctx: any = { engine: fakeEngine, config: {}, logger: { info() {}, warn() {}, error() {} }, dryRun: false, remote: true };
+    const result = await op.handler(ctx, {}) as Array<Record<string, unknown>>;
 
-      expect(result.length).toBe(2);
-      expect(typeof result[0].size_bytes).toBe('number');
-      expect(result[0].size_bytes).toBe(4096);
-      expect(result[1].size_bytes).toBeNull();
-      // The exact failure mode openclaw reported.
-      expect(() => JSON.stringify(result)).not.toThrow();
-    } finally {
-      spy.mockRestore();
-    }
+    expect(result.length).toBe(2);
+    expect(typeof result[0].size_bytes).toBe('number');
+    expect(result[0].size_bytes).toBe(4096);
+    expect(result[1].size_bytes).toBeNull();
+    // The exact failure mode openclaw reported.
+    expect(() => JSON.stringify(result)).not.toThrow();
   });
 
   test('collectFiles skips node_modules', () => {

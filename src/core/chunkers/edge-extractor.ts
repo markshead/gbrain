@@ -78,10 +78,10 @@ export const WALK_DEPTH_CAP = 32;
 
 /**
  * Which languages get receiver-type resolution at extraction time. Per D18
- * from eng review — JS/TS/TSX + Python at full depth; Ruby/Go/Rust/Java
- * keep TODAY's bare-token call edges. Honest scope: tree-sitter shapes are
- * very different across these languages and writing+testing per-language
- * scope walkers for all of them is a v0.35 expansion.
+ * from eng review — JS/TS/TSX + Python at full depth; Ruby/Go/Rust/Java/
+ * Kotlin keep TODAY's bare-token call edges. Honest scope: tree-sitter
+ * shapes are very different across these languages and writing+testing
+ * per-language scope walkers for all of them is a v0.35 expansion.
  */
 const RECEIVER_RESOLUTION_LANGS: ReadonlySet<SupportedCodeLanguage> = new Set([
   'typescript',
@@ -93,12 +93,16 @@ const RECEIVER_RESOLUTION_LANGS: ReadonlySet<SupportedCodeLanguage> = new Set([
 /**
  * Per-language call-expression configuration. `callNodeTypes` lists the
  * AST node types that are call sites in that language. `calleeFieldName`
- * optionally names the child field that holds the callee expression;
- * when absent, the call-site text itself is scanned for the identifier.
+ * names the child field that holds the callee expression. Grammars that
+ * define no fields on their call node (Kotlin: `call_expression =
+ * expression call_suffix`) set `calleeFirstNamedChild` instead — the
+ * callee is positional, so namedChild(0) IS the callee.
  */
 interface CallConfig {
   callNodeTypes: Set<string>;
   calleeFieldName?: string;
+  /** Callee is namedChild(0) — for grammars whose call node has no fields. */
+  calleeFirstNamedChild?: boolean;
 }
 
 const CALL_CONFIG: Partial<Record<SupportedCodeLanguage, CallConfig>> = {
@@ -110,6 +114,11 @@ const CALL_CONFIG: Partial<Record<SupportedCodeLanguage, CallConfig>> = {
   go:         { callNodeTypes: new Set(['call_expression']), calleeFieldName: 'function' },
   rust:       { callNodeTypes: new Set(['call_expression', 'method_call_expression']), calleeFieldName: 'function' },
   java:       { callNodeTypes: new Set(['method_invocation']), calleeFieldName: 'name' },
+  // tree-sitter-kotlin defines no fields on call_expression; the callee is
+  // the first named child (simple_identifier for bare calls,
+  // navigation_expression for `receiver.method(...)` — resolved to the
+  // method name by the navigation_expression case in extractCalleeName).
+  kotlin:     { callNodeTypes: new Set(['call_expression']), calleeFirstNamedChild: true },
 };
 
 /**
@@ -120,7 +129,11 @@ const CALL_CONFIG: Partial<Record<SupportedCodeLanguage, CallConfig>> = {
  * null to skip the edge.
  */
 function extractCalleeName(node: any, cfg: CallConfig): string | null {
-  const callee = cfg.calleeFieldName ? node.childForFieldName(cfg.calleeFieldName) : null;
+  const callee = cfg.calleeFieldName
+    ? node.childForFieldName(cfg.calleeFieldName)
+    : cfg.calleeFirstNamedChild
+      ? (node.namedChild?.(0) ?? null)
+      : null;
   if (!callee) return null;
 
   // Unwrap common wrappers until we hit an identifier-shaped node.
@@ -153,6 +166,15 @@ function extractCalleeName(node: any, cfg: CallConfig): string | null {
     if (cur.type === 'scoped_call_expression' || cur.type === 'scoped_identifier') {
       const name = cur.childForFieldName('name');
       if (name) { cur = name; continue; }
+      return null;
+    }
+    // navigation_expression (Kotlin): `receiver.method` — the callee is the
+    // simple_identifier inside the trailing navigation_suffix. No fields on
+    // this node either, so walk to the last named child's identifier.
+    if (cur.type === 'navigation_expression') {
+      const suffix = cur.namedChild?.(cur.namedChildCount - 1);
+      const ident = suffix?.namedChild?.(0);
+      if (ident) { cur = ident; continue; }
       return null;
     }
     // Fallback: read the node text and take the last identifier-looking token.
@@ -313,7 +335,96 @@ function resolveReceiverType(
  * upgrade the emit from bare `method` to qualified `Class::method` /
  * `module::method`. Falls back to bare-token emit on resolution miss.
  */
+/**
+ * Dart call sites, which `CALL_CONFIG` cannot describe.
+ *
+ * Every language in CALL_CONFIG has a call NODE whose callee is a field or
+ * the first named child. tree-sitter-dart has no call node at all: an
+ * invocation is a FLAT RUN OF SIBLINGS, where an argument-bearing node marks
+ * the call and the callee is written to its LEFT.
+ *
+ *   bare(1)        identifier "bare" · selector(argument_part)
+ *   obj.method(2)  identifier "obj"  · selector(unconditional_assignable_selector
+ *                                       identifier "method") · selector(argument_part)
+ *   obj?.method(3) same, conditional_assignable_selector
+ *   a.b().c()      one identifier, then alternating selector pairs
+ *   obj..m()       cascade_section(cascade_selector identifier "m", argument_part)
+ *   new Widget(2)  new_expression(type_identifier "Widget", arguments)
+ *
+ * So the rule is positional, not structural: find the argument list, then
+ * read the nearest name to its left. Emitted as bare tokens — Dart is not in
+ * RECEIVER_RESOLUTION_LANGS, matching the Ruby/Go/Rust/Java/Kotlin scope.
+ */
+function dartCalleeNode(argBearing: any): any | null {
+  // Walk left across siblings; the first name-carrying one wins.
+  let prev = argBearing.previousNamedSibling;
+  while (prev) {
+    if (prev.type === 'selector') {
+      const inner = prev.namedChild?.(0);
+      if (
+        inner &&
+        (inner.type === 'unconditional_assignable_selector' ||
+          inner.type === 'conditional_assignable_selector')
+      ) {
+        // `.method` / `?.method` — the method name is the call target.
+        const id = inner.namedChild?.(0);
+        return id?.type?.endsWith('identifier') ? id : null;
+      }
+      // A selector that names nothing means the thing being invoked is not a
+      // named symbol — `a()()` calls the RESULT of `a()`, and `list[0]()`
+      // calls an element. Emitting the nearest name to the left would
+      // double-count `a` for a single definition of it. Stop instead.
+      return null;
+    }
+    if (prev.type.endsWith('identifier')) return prev;
+    prev = prev.previousNamedSibling;
+  }
+  return null;
+}
+
+export function extractDartCallEdges(tree: any): ExtractedEdge[] {
+  const out: ExtractedEdge[] = [];
+  const root = tree?.rootNode;
+  if (!root) return out;
+
+  const stack: any[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node) continue;
+
+    // `new Widget(2)` — the one shape that does carry its own callee.
+    if (node.type === 'new_expression') {
+      const id = node.namedChildren.find((c: any) => c.type.endsWith('identifier'));
+      if (id) out.push({ callSiteByteOffset: id.startIndex, toSymbol: id.text, edgeType: 'calls' });
+    }
+
+    // `obj..method()` — argument_part sits beside cascade_selector, not in a selector.
+    if (node.type === 'cascade_section') {
+      const hasArgs = node.namedChildren.some((c: any) => c.type === 'argument_part');
+      const sel = node.namedChildren.find((c: any) => c.type === 'cascade_selector');
+      const id = sel?.namedChildren?.find((c: any) => c.type.endsWith('identifier'));
+      if (hasArgs && id) {
+        out.push({ callSiteByteOffset: id.startIndex, toSymbol: id.text, edgeType: 'calls' });
+      }
+    }
+
+    // The general shape: a selector holding the argument list.
+    if (
+      node.type === 'selector' &&
+      node.namedChildren.some((c: any) => c.type === 'argument_part')
+    ) {
+      const id = dartCalleeNode(node);
+      if (id) out.push({ callSiteByteOffset: id.startIndex, toSymbol: id.text, edgeType: 'calls' });
+    }
+
+    for (const child of node.namedChildren) stack.push(child);
+  }
+  return out;
+}
+
 export function extractCallEdges(tree: any, language: SupportedCodeLanguage): ExtractedEdge[] {
+  // Dart has no call node for CALL_CONFIG to name — see extractDartCallEdges.
+  if (language === 'dart') return extractDartCallEdges(tree);
   const cfg = CALL_CONFIG[language];
   if (!cfg) return [];
   const out: ExtractedEdge[] = [];
