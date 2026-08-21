@@ -1078,10 +1078,14 @@ const list_pages: Operation = {
     // list and never learns rows were dropped, and with the default
     // updated_desc sort the dropped rows are always the OLDEST, i.e. exactly
     // the pages such consumers exist to find.
-    // Empty/non-string slug_prefix leaves pre-existing behavior untouched
+    // `prefix` is accepted as an alias for `slug_prefix` (matches
+    // get_recent_salience's shorter param name — the same op family a
+    // caller migrating between the two would expect to compose the same
+    // way). Empty/non-string values leave pre-existing behavior untouched
     // (back-compat shape, mirroring the omitted-param case).
-    const slugPrefix = typeof p.slug_prefix === 'string' && p.slug_prefix.length > 0
-      ? p.slug_prefix
+    const rawSlugPrefix = typeof p.slug_prefix === 'string' ? p.slug_prefix : p.prefix;
+    const slugPrefix = typeof rawSlugPrefix === 'string' && rawSlugPrefix.length > 0
+      ? rawSlugPrefix
       : undefined;
     const rows = await ctx.engine.listPages({
       type: p.type as any,
