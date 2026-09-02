@@ -560,18 +560,6 @@ export interface NewFact {
    * set this — leaving it undefined preserves pre-v0.40 behavior.
    */
   event_type?: string | null;
-  /**
-   * 2026-09-02 (local patch) — page provenance for the LEGACY single-row
-   * `insertFact` path. The markdown-first fence lane already records this
-   * via `insertFacts`, but a brain with no `sources.local_path` (thin-client
-   * install) routes EVERY fact down the legacy path, whose INSERT column
-   * list omitted this column entirely — so `source_markdown_slug` came out
-   * NULL for every extracted fact and there was no way to ask which page
-   * produced a claim. gbn ran that way from 2026-08-23 (80k facts) and gbx
-   * likewise. Optional and defaulted to NULL, so every existing caller is
-   * byte-identical; only the facts backstop sets it.
-   */
-  source_markdown_slug?: string | null;
 }
 
 /** Options shared by list-facts methods. */

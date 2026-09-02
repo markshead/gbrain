@@ -52,12 +52,6 @@ export async function insertFact(
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
-    // 2026-09-02 (local patch): page provenance on the LEGACY single-row path.
-    // Thin-client brains (no sources.local_path) route EVERY fact here, so
-    // without this the column is NULL for every extracted fact. Both partial
-    // unique indexes on this column are gated on row_num / dimension IS NOT
-    // NULL, neither of which this path sets, so this cannot cause a conflict.
-    const sourceMarkdownSlug = input.source_markdown_slug ?? null;
 
     if (ctx.supersedeId !== undefined) {
       // Per-entity advisory lock + atomic insert + supersede in one txn.
@@ -72,12 +66,12 @@ export async function insertFact(
             source_id, entity_slug, fact, kind, visibility, notability, context,
             valid_from, valid_until, source, source_session, confidence,
             embedding, embedded_at,
-            claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
+            claim_metric, claim_value, claim_unit, claim_period
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
             ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
-            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}, ${sourceMarkdownSlug}
+            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
           ) RETURNING id
         `;
         const id = Number(ins[0].id);
@@ -99,12 +93,12 @@ export async function insertFact(
           source_id, entity_slug, fact, kind, visibility, notability, context,
           valid_from, valid_until, source, source_session, confidence,
           embedding, embedded_at,
-          claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
+          claim_metric, claim_value, claim_unit, claim_period
         ) VALUES (
           ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
           ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
           ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
-          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}, ${sourceMarkdownSlug}
+          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
         ) RETURNING id
       `;
       return Number(ins[0].id);

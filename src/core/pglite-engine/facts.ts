@@ -40,10 +40,6 @@ export async function insertFact(
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
-    // 2026-09-02 (local patch) — page provenance on the LEGACY single-row path.
-    // Mirrors the postgres engine: thin-client brains (no sources.local_path)
-    // route EVERY fact here, leaving source_markdown_slug NULL for all of them.
-    const sourceMarkdownSlug = input.source_markdown_slug ?? null;
 
     if (ctx.supersedeId !== undefined) {
       // Supersede flow: insert new + expire old in one txn so observers never
@@ -55,25 +51,25 @@ export async function insertFact(
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
-                 claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
+                 claim_metric, claim_value, claim_unit, claim_period
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  NULL, NULL,
-                 $13, $14, $15, $16, $17
+                 $13, $14, $15, $16
                ) RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
-                 claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
+                 claim_metric, claim_value, claim_unit, claim_period
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  $13::vector, $14,
-                 $15, $16, $17, $18, $19
+                 $15, $16, $17, $18
                ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug],
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
         );
         const newId = ins.rows[0].id;
         await tx.query(
@@ -92,25 +88,25 @@ export async function insertFact(
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
              embedding, embedded_at,
-             claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
+             claim_metric, claim_value, claim_unit, claim_period
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              NULL, NULL,
-             $13, $14, $15, $16, $17
+             $13, $14, $15, $16
            ) RETURNING id`
         : `INSERT INTO facts (
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
              embedding, embedded_at,
-             claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
+             claim_metric, claim_value, claim_unit, claim_period
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              $13::vector, $14,
-             $15, $16, $17, $18, $19
+             $15, $16, $17, $18
            ) RETURNING id`,
       embedStr === null
-        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug]
-        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug],
+        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
+        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
     );
     return { id: ins.rows[0].id, status: 'inserted' };
   }
