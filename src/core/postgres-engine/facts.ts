@@ -52,6 +52,14 @@ export async function insertFact(
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
+    // Page provenance on the legacy single-row path. Thin-client brains
+    // (no sources.local_path) route EVERY fact here, so without this the
+    // column is NULL for every extracted fact. Both partial unique indexes
+    // on this column are gated on `row_num IS NOT NULL` / `dimension IS
+    // NOT NULL`, neither of which this path sets, so it cannot introduce a
+    // conflict — and leaving row_num NULL is also what keeps the row out
+    // of the fence reconcile's wipe.
+    const sourceMarkdownSlug = input.source_markdown_slug ?? null;
 
     if (ctx.supersedeId !== undefined) {
       // Per-entity advisory lock + atomic insert + supersede in one txn.
@@ -66,12 +74,12 @@ export async function insertFact(
             source_id, entity_slug, fact, kind, visibility, notability, context,
             valid_from, valid_until, source, source_session, confidence,
             embedding, embedded_at,
-            claim_metric, claim_value, claim_unit, claim_period
+            claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
             ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
-            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}, ${sourceMarkdownSlug}
           ) RETURNING id
         `;
         const id = Number(ins[0].id);
@@ -93,12 +101,12 @@ export async function insertFact(
           source_id, entity_slug, fact, kind, visibility, notability, context,
           valid_from, valid_until, source, source_session, confidence,
           embedding, embedded_at,
-          claim_metric, claim_value, claim_unit, claim_period
+          claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
         ) VALUES (
           ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
           ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
           ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
-          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+          ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}, ${sourceMarkdownSlug}
         ) RETURNING id
       `;
       return Number(ins[0].id);
@@ -194,9 +202,25 @@ export async function deleteFactsForPage(
   ): Promise<{ deleted: number }> {
     const sql = deps.sql;
     const prefixes = opts?.excludeSourcePrefixes;
+    // Fence ownership is `row_num IS NOT NULL`, not "has a slug". This
+    // wipe rebuilds a page's index FROM its fence, so it may only delete
+    // rows the fence can put back. `source_markdown_slug` does not carry
+    // that meaning on its own: it also records which page a claim came
+    // from, and the legacy single-row insert path sets it while owning no
+    // fence row.
+    //
+    // No-op on existing data — every writer that sets
+    // `source_markdown_slug` sets `row_num` in the same statement
+    // (`insertFacts` types both as required; the v0_32_2 backfill UPDATEs
+    // them together), so no stored row has one without the other. This
+    // makes explicit the invariant the callers already document ("legacy
+    // rows live in a different keyspace"), so a provenance-bearing
+    // DB-only row cannot be swept up by a page wipe.
+    const fenceOwnedOnly = sql`AND row_num IS NOT NULL`;
     // #2646: keep soft-expired legacy rows (row_num NULL — never
     // fence-owned) so a fence reconcile can't destroy forget_fact's
-    // legacy DB-only forget record.
+    // legacy DB-only forget record. Subsumed by fenceOwnedOnly above;
+    // kept so the call sites that opt in still read explicitly.
     const expiredLegacyFilter = opts?.preserveExpiredLegacy
       ? sql`AND NOT (row_num IS NULL AND expired_at IS NOT NULL)`
       : sql``;
@@ -209,13 +233,14 @@ export async function deleteFactsForPage(
         DELETE FROM facts
         WHERE source_id = ${source_id}
           AND source_markdown_slug = ${slug}
+          ${fenceOwnedOnly}
           AND NOT (COALESCE(source, '') LIKE ANY(${patterns}))
           ${expiredLegacyFilter}
       `;
       return { deleted: result.count ?? 0 };
     }
     const result = await sql`
-      DELETE FROM facts WHERE source_id = ${source_id} AND source_markdown_slug = ${slug} ${expiredLegacyFilter}
+      DELETE FROM facts WHERE source_id = ${source_id} AND source_markdown_slug = ${slug} ${fenceOwnedOnly} ${expiredLegacyFilter}
     `;
     return { deleted: result.count ?? 0 };
   }

@@ -560,6 +560,21 @@ export interface NewFact {
    * set this — leaving it undefined preserves pre-v0.40 behavior.
    */
   event_type?: string | null;
+  /**
+   * Page provenance — which markdown page produced this claim.
+   *
+   * The fence lane always records it (`insertFacts` types it as
+   * required), but the legacy single-row `insertFact` path had no column
+   * for it. A brain with no `sources.local_path` (thin-client / DB-only
+   * install) routes EVERY fact down that path, so `source_markdown_slug`
+   * came out NULL for every extracted fact on those installs and the
+   * read-side `Fact.source_markdown_slug` was unusable there.
+   *
+   * Setting it does NOT claim fence ownership — that is `row_num`, which
+   * this path leaves NULL. Optional and defaulted to NULL, so existing
+   * callers are unchanged.
+   */
+  source_markdown_slug?: string | null;
 }
 
 /** Options shared by list-facts methods. */

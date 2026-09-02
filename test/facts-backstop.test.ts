@@ -325,7 +325,8 @@ describe('runFactsBackstop — sync.write_through opt-out', () => {
         { fact: 'joined widget-co as cto', kind: 'event', notability: 'high', entity: 'people/flag-test' },
       ]);
 
-      const r = await runFactsBackstop(meetingPage(), makeCtx({ mode: 'inline' }));
+      const page = meetingPage();
+      const r = await runFactsBackstop(page, makeCtx({ mode: 'inline' }));
 
       expect(r.mode).toBe('inline');
       if (r.mode === 'inline') {
@@ -339,12 +340,17 @@ describe('runFactsBackstop — sync.write_through opt-out', () => {
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const rows = await (engine as any).db.query(
-          `SELECT entity_slug, source_markdown_slug FROM facts WHERE id = $1`,
+          `SELECT entity_slug, source_markdown_slug, row_num FROM facts WHERE id = $1`,
           [r.fact_ids[0]],
         );
         expect(rows.rows[0].entity_slug).toBe('people/flag-test');
-        // DB-only rows have no .md of record.
-        expect(rows.rows[0].source_markdown_slug).toBeNull();
+        // The row records WHICH PAGE produced the claim even though the
+        // operator opted out of write-through and no .md backs it. That is
+        // provenance, not fence ownership: `row_num` stays NULL, so the
+        // extract_facts reconcile — which wipes a page's fence-owned rows
+        // and rebuilds them from the fence — leaves this row alone.
+        expect(rows.rows[0].source_markdown_slug).toBe(page.slug);
+        expect(rows.rows[0].row_num).toBeNull();
       }
     } finally {
       await engine.unsetConfig('sync.write_through');

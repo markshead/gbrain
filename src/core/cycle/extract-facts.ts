@@ -93,7 +93,16 @@ function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFac
 }
 
 /**
- * Fence-owned DB rows for one page coordinate. Excludes `cli:`-origin
+ * Fence-owned DB rows for one page coordinate. Fence ownership is
+ * `row_num IS NOT NULL` — a fence row always carries one. It is NOT
+ * "has a `source_markdown_slug`": that column also records which page a
+ * claim came from, and the legacy single-row insert path sets it while
+ * owning no fence row. Filtering on ownership rather than on provenance
+ * keeps a DB-only row from counting as "stale" against a fence it was
+ * never in, and keeps the wipe below from deleting a row the fence
+ * cannot put back.
+ *
+ * Excludes `cli:`-origin
  * conversation facts (#1928) — they are not fence-owned, so they must
  * neither count as "stale" (which would force a wipe every cycle) nor
  * be compared against the fence's row set. Mirrors the
@@ -127,6 +136,7 @@ async function listExistingFactsForPage(
        FROM facts
       WHERE source_id = $1
         AND source_markdown_slug = $2
+        AND row_num IS NOT NULL
         AND COALESCE(source, '') NOT LIKE 'cli:%'
         AND NOT (row_num IS NULL AND expired_at IS NOT NULL)
       ORDER BY row_num ASC, id ASC`,

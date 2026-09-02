@@ -40,6 +40,10 @@ export async function insertFact(
     const claimValue  = input.claim_value  ?? null;
     const claimUnit   = input.claim_unit   ?? null;
     const claimPeriod = input.claim_period ?? null;
+    // Page provenance on the legacy single-row path. Mirrors the postgres
+    // engine: thin-client brains (no sources.local_path) route EVERY fact
+    // here, leaving source_markdown_slug NULL for all of them.
+    const sourceMarkdownSlug = input.source_markdown_slug ?? null;
 
     if (ctx.supersedeId !== undefined) {
       // Supersede flow: insert new + expire old in one txn so observers never
@@ -51,25 +55,25 @@ export async function insertFact(
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
-                 claim_metric, claim_value, claim_unit, claim_period
+                 claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  NULL, NULL,
-                 $13, $14, $15, $16
+                 $13, $14, $15, $16, $17
                ) RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
-                 claim_metric, claim_value, claim_unit, claim_period
+                 claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  $13::vector, $14,
-                 $15, $16, $17, $18
+                 $15, $16, $17, $18, $19
                ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug],
         );
         const newId = ins.rows[0].id;
         await tx.query(
@@ -88,25 +92,25 @@ export async function insertFact(
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
              embedding, embedded_at,
-             claim_metric, claim_value, claim_unit, claim_period
+             claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              NULL, NULL,
-             $13, $14, $15, $16
+             $13, $14, $15, $16, $17
            ) RETURNING id`
         : `INSERT INTO facts (
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
              embedding, embedded_at,
-             claim_metric, claim_value, claim_unit, claim_period
+             claim_metric, claim_value, claim_unit, claim_period, source_markdown_slug
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
              $13::vector, $14,
-             $15, $16, $17, $18
+             $15, $16, $17, $18, $19
            ) RETURNING id`,
       embedStr === null
-        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
-        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
+        ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug]
+        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod, sourceMarkdownSlug],
     );
     return { id: ins.rows[0].id, status: 'inserted' };
   }
@@ -216,9 +220,16 @@ export async function deleteFactsForPage(
     opts?: { excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean },
   ): Promise<{ deleted: number }> {
     const prefixes = opts?.excludeSourcePrefixes;
+    // Fence ownership is `row_num IS NOT NULL`, not "has a slug". Mirrors
+    // the postgres engine — full rationale there. No-op on existing data
+    // (no writer sets `source_markdown_slug` without `row_num`); it keeps
+    // a provenance-bearing DB-only row from being swept up by a page wipe
+    // it could never be restored from.
+    const fenceOwnedOnly = ` AND row_num IS NOT NULL`;
     // #2646: keep soft-expired legacy rows (row_num NULL — never
     // fence-owned) so a fence reconcile can't destroy forget_fact's
-    // legacy DB-only forget record.
+    // legacy DB-only forget record. Subsumed by fenceOwnedOnly above;
+    // kept so the call sites that opt in still read explicitly.
     const expiredLegacyFilter = opts?.preserveExpiredLegacy
       ? ` AND NOT (row_num IS NULL AND expired_at IS NOT NULL)`
       : '';
@@ -229,14 +240,14 @@ export async function deleteFactsForPage(
       const patterns = prefixes.map(p => `${p}%`);
       const result = await deps.db.query(
         `DELETE FROM facts
-           WHERE source_id = $1 AND source_markdown_slug = $2
+           WHERE source_id = $1 AND source_markdown_slug = $2${fenceOwnedOnly}
              AND NOT (COALESCE(source, '') LIKE ANY($3::text[]))${expiredLegacyFilter}`,
         [source_id, slug, patterns],
       );
       return { deleted: result.affectedRows ?? 0 };
     }
     const result = await deps.db.query(
-      `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2${expiredLegacyFilter}`,
+      `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2${fenceOwnedOnly}${expiredLegacyFilter}`,
       [source_id, slug],
     );
     return { deleted: result.affectedRows ?? 0 };
