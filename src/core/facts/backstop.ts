@@ -450,6 +450,12 @@ async function runPipeline(
       turnText: parsedPage.compiled_truth,
       isDreamGenerated: false,  // eligibility check already rejected dream pages
       ref: parsedPage.slug,
+      // 2026-09-02 (local patch): explicit page provenance for the legacy
+      // DB-only bucket. Deliberately NOT reusing `ref` — that field is
+      // overloaded (page slug here, sessionId on the turn-text entry), so
+      // reading it downstream would stamp session ids into
+      // facts.source_markdown_slug for conversation-shaped calls.
+      pageSlug: parsedPage.slug,
     },
     ctx,
     abortSignal,
@@ -483,7 +489,7 @@ async function runPipeline(
  * fallback regardless of local_path.
  */
 async function runPipelineWithBody(
-  input: { turnText: string; isDreamGenerated: boolean; ref?: string },
+  input: { turnText: string; isDreamGenerated: boolean; ref?: string; pageSlug?: string },
   ctx: FactsBackstopCtx,
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
@@ -651,6 +657,9 @@ async function runPipelineWithBody(
       source_session: f.source_session ?? null,
       confidence: f.confidence,
       embedding: f.embedding ?? null,
+      // 2026-09-02 (local patch): without this, a brain with no
+      // sources.local_path loses page provenance on EVERY fact.
+      source_markdown_slug: input.pageSlug ?? null,
     };
     const result = await ctx.engine.insertFact(newFact, { source_id: ctx.sourceId }); // gbrain-allow-direct-insert: legacy DB-only fallback for unparented / thin-client facts (no entity page to fence onto)
     fact_ids.push(result.id);
