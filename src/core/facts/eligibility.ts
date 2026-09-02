@@ -73,6 +73,15 @@ const ELIGIBLE_TYPES: PageType[] = [
   // gbrain-base-v2 canonical types declared extractable in the pack
   // (concept deliberately omitted — see above)
   'media', 'tweet', 'atom', 'analysis',
+  // Local patch 2026-08-25 (Mark-authorised gbn facts sweep, board #72/#73
+  // continuation): newsroom-journalism-v1 pack types, which otherwise
+  // "silently drop out of facts extraction" (the F-ELIGIBLE defect class
+  // this list's comment already documents). Pack-aware lookup is still
+  // deferred upstream (v0.43+ note above); an upgrade reverts this patch
+  // harmlessly — the newsroom types simply skip again. 'concept' is
+  // included here BY MARK'S EXPLICIT ORDER for the gbn sweep, overriding
+  // the gbrain-base rationale above for this box only.
+  'story', 'concept', 'record', 'agenda', 'person', 'audio-transcript', 'minutes', 'org',
 ];
 
 const MIN_BODY_CHARS = 80;
