@@ -64,6 +64,22 @@ export async function resolveEntitySlug(
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return aliased;
 
+  // 1.7. Namespace-stripped lookup (slug-frag 2026-09-09): the extractor is
+  //      asked for "a canonical slug" and, knowing no vocabulary, MINTS one —
+  //      `companies/usd-234-fort-scott`, `organizations/usd-234`, `schools/usd-234`
+  //      — for an entity whose page is `ks/usd-234`. Exact misses, alias misses
+  //      (the invented prefix is not an alias), fuzzy scores ~0.45 against the
+  //      real page, and fallbackSlugify keeps the invention verbatim. Measured on
+  //      the newsroom brain: 12,533 distinct entity slugs for ~10,300 entities,
+  //      USD 234 alone spread over 13 namespace/qualifier variants. Here the
+  //      LAST path segment (optionally minus a configured qualifier suffix such
+  //      as `-inc` / `-llc` / `-ks`) is matched against live page slugs by
+  //      suffix and against page_aliases, requiring a unique hit.
+  if (looksLikeSlug(trimmed)) {
+    const ns = await tryNamespaceStripped(engine, source_id, trimmed);
+    if (ns) return ns.slug;
+  }
+
   // 2. Prefix-expansion match: when the input looks like a bare first name
   //    (no slash, no prefix, slugifies to a single short token), try
   //    `people/<token>-%` then `companies/<token>-%`. Short bare names
@@ -191,6 +207,11 @@ export async function resolveEntitySlugWithSource(
 
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
+
+  if (looksLikeSlug(trimmed)) {
+    const ns = await tryNamespaceStripped(engine, source_id, trimmed);
+    if (ns) return ns;
+  }
 
   if (isBareName(trimmed)) {
     const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
@@ -408,6 +429,14 @@ async function tryFuzzyMatch(
 ): Promise<string | null> {
   const lc = raw.toLowerCase();
   const fragment = slugify(raw);
+  // slug-frag 2026-09-09: an entity reference must never resolve to a
+  // DOCUMENT page. With no type filter, "Fort Scott" (the city) scored 0.786
+  // against the story titled "Fort Scott VA" and 382 city facts were filed
+  // under `stories/2020/03/fort-scott-va`; 1,276 facts across 78 story pages
+  // on the newsroom brain had the same shape. Document types and slug shapes
+  // are configurable (`entities.resolve_exclude_types`,
+  // `entities.resolve_exclude_slug_pattern`); defaults below.
+  const excl = await getResolveExclusions(engine);
   // Prefer titles (display names) over slug fragments since user input
   // tends to be display-name-shaped ("Alice Example" vs "alice-example"). Cap at
   // 3 candidates; pick the first deterministic one.
@@ -421,13 +450,15 @@ async function tryFuzzyMatch(
        FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
+         AND NOT (type = ANY($4::text[]))
+         AND slug !~ $5
          AND (
            lower(title) % $2
            OR slug ILIKE '%' || $3 || '%'
          )
        ORDER BY score DESC, slug ASC
        LIMIT 3`,
-      [source_id, lc, fragment],
+      [source_id, lc, fragment, excl.types, excl.slugPattern],
     );
     // 0.4 confidently misattributes names that share only a generic company
     // token (for example "Beacon Capital" → "Benton Capital"). Keep fuzzy
@@ -437,6 +468,157 @@ async function tryFuzzyMatch(
   } catch {
     // pg_trgm functions might not be available on every engine config;
     // fall through to slugify.
+  }
+  return null;
+}
+
+// ── slug-frag 2026-09-09 helpers ─────────────────────────────────────────
+
+const DEFAULT_EXCLUDE_TYPES = [
+  'story', 'meeting', 'meeting-page', 'document', 'document-page', 'record',
+  'transcript', 'audio-transcript', 'interview-transcript', 'agenda', 'minutes',
+  'source', 'index', 'history', 'external-reference', 'daily', 'chat',
+];
+// Slug shapes that are documents regardless of type: story/daily/chat trees,
+// meeting and record leaves, per-source documents and their pNNN pages.
+const DEFAULT_EXCLUDE_SLUG_PATTERN =
+  '^(stories|daily|chat|legacy-discovery-dump)/|/(meetings|source|records)/|/p[0-9]{3}$';
+const DEFAULT_STRIP_SUFFIXES = ['inc', 'llc', 'ltd'];
+
+interface ResolveExclusions { types: string[]; slugPattern: string }
+
+const CONFIG_TTL_MS = 60_000;
+const configCache = new Map<string, { at: number; value: string | null }>();
+
+async function cachedConfig(engine: BrainEngine, key: string): Promise<string | null> {
+  const hit = configCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < CONFIG_TTL_MS) return hit.value;
+  let value: string | null = null;
+  try {
+    value = typeof (engine as { getConfig?: unknown }).getConfig === 'function'
+      ? await engine.getConfig(key)
+      : null;
+  } catch {
+    value = null;
+  }
+  configCache.set(key, { at: now, value });
+  return value;
+}
+
+/** Test seam: drop the 60s config cache so a setConfig is seen immediately. */
+export function _resetResolveConfigCache(): void {
+  configCache.clear();
+}
+
+function splitList(raw: string | null, fallback: string[]): string[] {
+  if (!raw) return fallback;
+  const out = raw.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+  return out.length ? out : fallback;
+}
+
+async function getResolveExclusions(engine: BrainEngine): Promise<ResolveExclusions> {
+  const types = splitList(await cachedConfig(engine, 'entities.resolve_exclude_types'), DEFAULT_EXCLUDE_TYPES);
+  const pattern = (await cachedConfig(engine, 'entities.resolve_exclude_slug_pattern')) || DEFAULT_EXCLUDE_SLUG_PATTERN;
+  return { types, slugPattern: pattern };
+}
+
+/**
+ * Candidate base names for a slug-shaped reference, most specific first:
+ * the last path segment, then that segment minus one, then two, trailing
+ * qualifier tokens drawn from `entities.resolve_strip_suffixes` (comma list;
+ * default inc,llc,ltd — a newsroom brain adds its geography, e.g.
+ * `fort-scott,fort-scott-ks,fort-scott-kansas,ks,kansas`). Single-token
+ * bases are dropped: a bare `board` or `commission` must not suffix-match
+ * `ks/usd-234/board` — that is the surname-class ambiguity this file already
+ * refuses elsewhere.
+ */
+export function namespaceStripCandidates(raw: string, suffixes: string[]): string[] {
+  return namespaceStripCandidatesDetailed(raw, suffixes).filter((c) => c.suffixMatch).map((c) => c.cand);
+}
+
+/**
+ * Detailed form: every candidate, flagged with whether it may be matched by
+ * page-slug SUFFIX. Single-token bases (`board`, `evergy`) are alias-only —
+ * the curated alias table may name them, but `LIKE '%/board'` must not.
+ */
+export function namespaceStripCandidatesDetailed(
+  raw: string,
+  suffixes: string[],
+): Array<{ cand: string; suffixMatch: boolean }> {
+  const last = raw.split('/').filter(Boolean).pop() ?? '';
+  const out: Array<{ cand: string; suffixMatch: boolean }> = [];
+  const push = (c: string) => {
+    if (c && !out.some((o) => o.cand === c)) out.push({ cand: c, suffixMatch: c.includes('-') });
+  };
+  push(last);
+  let cur = last;
+  for (let round = 0; round < 2; round++) {
+    let stripped = false;
+    // longest suffix first so `fort-scott-ks` wins over `ks`
+    for (const q of [...suffixes].sort((a, b) => b.length - a.length)) {
+      if (cur.endsWith('-' + q) && cur.length > q.length + 1) {
+        cur = cur.slice(0, -(q.length + 1));
+        stripped = true;
+        break;
+      }
+    }
+    if (!stripped) break;
+    push(cur);
+  }
+  return out;
+}
+
+async function tryNamespaceStripped(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+): Promise<ResolveResult | null> {
+  const suffixes = splitList(await cachedConfig(engine, 'entities.resolve_strip_suffixes'), DEFAULT_STRIP_SUFFIXES);
+  const excl = await getResolveExclusions(engine);
+  for (const { cand, suffixMatch } of namespaceStripCandidatesDetailed(raw, suffixes)) {
+    // (a) a live entity page whose slug ends in /<cand>, unique in the source.
+    //     Two pages sharing the suffix (`ks/usd-234` + `orgs/usd-234`, a
+    //     page-level duplicate) is ambiguous for THIS arm only — the alias
+    //     table below may still name the canonical.
+    if (suffixMatch) {
+      try {
+        const rows = await engine.executeRaw<{ slug: string }>(
+          `SELECT slug FROM pages
+           WHERE source_id = $1 AND deleted_at IS NULL
+             AND (slug = $2 OR slug LIKE '%/' || $2)
+             AND NOT (type = ANY($3::text[]))
+             AND slug !~ $4
+           LIMIT 3`,
+          [source_id, cand, excl.types, excl.slugPattern],
+        );
+        if (rows.length === 1) return { slug: rows[0].slug, source: 'exact_page' };
+        // rows.length > 1: ambiguous suffix — never guess; try the alias arm.
+      } catch {
+        // fail open to the older chain
+      }
+    }
+    // (b) curated alias on the base name
+    const aliased = await tryAliasExact(engine, source_id, cand.replace(/-/g, ' '))
+      ?? await tryAliasExact(engine, source_id, cand);
+    if (aliased) return { slug: aliased, source: 'alias_exact' };
+    // (c) exact (not fuzzy) title match on a non-document page, unique —
+    //     `companies/evergy` → the page titled "Evergy". Equality, so a
+    //     single token is safe here; fuzzy stays refused for it.
+    try {
+      const rows = await engine.executeRaw<{ slug: string }>(
+        `SELECT slug FROM pages
+         WHERE source_id = $1 AND deleted_at IS NULL
+           AND lower(title) = $2
+           AND NOT (type = ANY($3::text[]))
+           AND slug !~ $4
+         LIMIT 2`,
+        [source_id, cand.replace(/-/g, ' '), excl.types, excl.slugPattern],
+      );
+      if (rows.length === 1) return { slug: rows[0].slug, source: 'exact_page' };
+    } catch {
+      // fail open
+    }
   }
   return null;
 }
