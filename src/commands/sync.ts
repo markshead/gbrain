@@ -815,11 +815,22 @@ function trackedSlugIndex(
   gitContextRoot: string,
   anchorCommit?: string,
   pathKey: (rel: string) => string = (rel) => rel,
+  // Fork carry (slug_prefix, d0a4cc16): every slug this index registers is
+  // compared against STORED slugs, which a prefixed source minted as
+  // `${prefix}/<derived>` (importFromFile applies the prefix after all
+  // resolution, frontmatter slugs included). Without mounting here, a live
+  // `news-server/agents/foo` row is looked up as `agents/foo`, missed, and
+  // classified stale — the #3583/#4597 guards would then delete live pages of
+  // every prefixed source. Derive unprefixed first: pathToSlug(rel, prefix)
+  // returns `prefix/` (not '') for a non-slug path, which would defeat the
+  // `slug === ''` fallback-regime test below.
+  slugPrefix?: string,
 ): TrackedSlugIndex {
   const slugs = new Set<string>();
   const anchorOnlyPaths = new Map<string, Set<string>>();
   let complete = true;
-  const addSlug = (slug: string): void => { slugs.add(slug); };
+  const mount = (slug: string): string => (slug !== '' && slugPrefix ? `${slugPrefix}/${slug}` : slug);
+  const addSlug = (slug: string): void => { slugs.add(mount(slug)); };
   // --cached --others --exclude-standard mirrors gitListSyncableFiles (see
   // docstring above): tracked-only would miss an unstaged new file that
   // collectSyncableFiles already imported, misclassifying its live page as
@@ -877,8 +888,12 @@ function trackedSlugIndex(
         if (!rel) continue;
         if (resolveSlugForPath(rel) !== '' || isCodeFilePath(rel)) continue;
         const res = anchorBlobSlugs(gitContextRoot, anchorCommit, rel, historicalFilter);
-        for (const s of res.slugs) {
-          addSlug(s);
+        for (const raw of res.slugs) {
+          // slugPrefix (fork carry): `slugs`/`currentSlugs` hold MOUNTED slugs
+          // (addSlug mounts), and slugLiveness looks anchorOnlyPaths up by the
+          // stored slug — so the key must be mounted too.
+          const s = mount(raw);
+          addSlug(raw);
           if (currentSlugs.has(s)) continue;
           let at = anchorOnlyPaths.get(s);
           if (!at) anchorOnlyPaths.set(s, (at = new Set()));
@@ -2854,7 +2869,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // consulted content states (see fallbackSlugsForFile). Anchor paths
       // are keyed through modePath so they compare against `from` under
       // #4342 source-root mode too.
-      treeSlugIndex ??= trackedSlugIndex(gitContextRoot, lastCommit, modePath);
+      treeSlugIndex ??= trackedSlugIndex(gitContextRoot, lastCommit, modePath, opts.slugPrefix);
       if (treeSlugIndex.slugs.has(s)) {
         // #4597: when the ONLY liveness proof is the anchor blob at THIS
         // rename's own from-path, that proof is the pre-rename state of the
@@ -2903,8 +2918,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     const renameOldSlugs = new Map<string, Set<string>>();
     for (const r of manifest.renamed) {
       const shapes = new Set<string>();
+      // slugPrefix (fork carry): mount the path-derived shape the same way the
+      // stored slug was minted, or the carried-rename guard never matches it.
       const derived = resolveSlugForPath(r.from);
-      if (derived !== '') shapes.add(derived);
+      if (derived !== '') shapes.add(opts.slugPrefix ? `${opts.slugPrefix}/${derived}` : derived);
       for (const s of dbSlugsByFrom.get(r.from) ?? []) shapes.add(s);
       renameOldSlugs.set(r.from, shapes);
     }
