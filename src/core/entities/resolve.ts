@@ -23,6 +23,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
+import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
 
 /**
@@ -168,7 +169,13 @@ function isBareName(raw: string): boolean {
   return true;
 }
 
-const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
+// hosts/projects joined people/companies after the 2026-08-06 memory eval: a
+// bare infra token ("hive") fell through to slugify and recall returned
+// nothing while the canonical hosts/<token> page + its facts sat one prefix
+// away. `infra/` is deliberately NOT here — it is a mixed namespace of
+// analysis/runbook documents (`infra/hive-dependency-audit-…`), and any such
+// doc would trip the ambiguity gate and re-break bare-token resolution.
+const PREFIX_EXPANSION_DIRS = ['people', 'companies', 'hosts', 'projects'] as const;
 
 /**
  * v0.40.2.0 — resolution-source-tagged variant for trajectory routing.
@@ -624,19 +631,27 @@ async function tryNamespaceStripped(
 }
 
 /**
- * Deterministic slugify: lowercase, replace non-alphanumerics with hyphens,
- * collapse repeated hyphens, trim leading/trailing hyphens.
+ * Deterministic slugify: lowercase, fold accents and stroke letters to their
+ * base letter, replace non-alphanumerics with hyphens, collapse repeated
+ * hyphens, trim leading/trailing hyphens.
  *
  * Exported for tests + callers who want the same fallback shape independently.
  */
 export function slugify(raw: string): string {
-  return raw
-    .toLowerCase()
-    .normalize('NFKD')
-    // NFKD decomposes accents into combining marks (U+0300..U+036F);
-    // strip them before replacing the rest with hyphens so "è" → "e",
-    // not "e" + "-".
-    .replace(/[̀-ͯ]/g, '')
+  // Stroke letters carry no decomposition, so the mark strip cannot fold them
+  // and the sweep below would DELETE them: "Đăng Example" slugged to
+  // "ang-example". Fold after the strip so composed forms reduce in one pass
+  // ("ǿ" → "ø" → "o").
+  const folded = foldNonDecomposingLatin(
+    raw
+      .toLowerCase()
+      .normalize('NFKD')
+      // NFKD decomposes accents into combining marks (U+0300..U+036F);
+      // strip them before replacing the rest with hyphens so "è" → "e",
+      // not "e" + "-".
+      .replace(/[̀-ͯ]/g, ''),
+  );
+  return folded
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '');

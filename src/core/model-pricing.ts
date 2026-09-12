@@ -41,7 +41,46 @@ export interface ModelPricing {
   input: number;
   /** USD per 1M output tokens. */
   output: number;
+  /**
+   * #4218 — USD per 1M prompt-cache-READ tokens. Optional: present only for
+   * providers whose published cache pricing we've verified (Anthropic:
+   * 0.1x input by default; Fable 5.1: 0.025x). Consumers that
+   * price cache tokens fall back to the input rate when absent (conservative
+   * over-estimate for reads).
+   */
+  cache_read?: number;
+  /**
+   * #4218 — USD per 1M prompt-cache-WRITE tokens at the default 5-minute
+   * TTL (Anthropic: 1.25x input; the 1h TTL bills 2x and is NOT modeled —
+   * gbrain's gateway requests the default TTL unless config overrides it,
+   * so 5m is the honest best-effort rate). Fall back to input rate when
+   * absent (under-estimate for writes; documented, not silent).
+   */
+  cache_write?: number;
 }
+
+/** Anthropic prompt-cache multipliers (verified 2026-08 against published
+ * provider pricing): reads bill 0.1x the base input rate; 5-minute-TTL
+ * writes bill 1.25x. Exported so the drift guard can assert every
+ * anthropic: row's cache fields stay derived from its input rate. */
+export const ANTHROPIC_CACHE_READ_MULT = 0.1;
+export const ANTHROPIC_CACHE_WRITE_5M_MULT = 1.25;
+function anthro(input: number, output: number, cacheReadMult = ANTHROPIC_CACHE_READ_MULT): ModelPricing {
+  return {
+    input,
+    output,
+    cache_read: input * cacheReadMult,
+    cache_write: input * ANTHROPIC_CACHE_WRITE_5M_MULT,
+  };
+}
+
+/** Per-model cache-read multiplier overrides. Anthropic bills cache hits at
+ *  ANTHROPIC_CACHE_READ_MULT (0.1x) except where listed here. Keys match
+ *  CANONICAL_PRICING keys; the drift guard asserts both directions. */
+export const ANTHROPIC_CACHE_READ_MULT_OVERRIDES: Record<string, number> = {
+  // Fable 5.1 bills cache hits at 0.025x base input ($0.25/MTok on $10).
+  'anthropic:claude-fable-5-1': 0.025,
+};
 
 /**
  * Canonical price table. Keys are provider-prefixed (`provider:model`),
@@ -52,25 +91,30 @@ export interface ModelPricing {
  */
 export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // ── Anthropic ──────────────────────────────────────────────────────────
+  // All Anthropic rows carry derived cache_read/cache_write fields (#4218);
+  // see the anthro() helper + multiplier constants above.
   // Fable 5: Anthropic's top tier, above Opus. $10 in / $50 out.
-  'anthropic:claude-fable-5':             { input: 10.00, output: 50.00 },
+  'anthropic:claude-fable-5':             anthro(10.00, 50.00),
+  // Fable 5.1: same $10/$50 sticker as Fable 5, but cache hits bill 0.025x
+  // ($0.25/MTok) instead of 0.1x — the only rate that changed.
+  'anthropic:claude-fable-5-1':           anthro(10.00, 50.00, ANTHROPIC_CACHE_READ_MULT_OVERRIDES['anthropic:claude-fable-5-1']),
   // Opus 4.x/5: $5 in / $25 out. Opus 5 (new generation) shares the same
   // per-token rate as 4.8 (released 2026-05-28) — closes gbrain#1819.
-  'anthropic:claude-opus-5':              { input:  5.00, output: 25.00 },
-  'anthropic:claude-opus-4-8':            { input:  5.00, output: 25.00 },
-  'anthropic:claude-opus-4-7':            { input:  5.00, output: 25.00 },
-  'anthropic:claude-opus-4-6':            { input:  5.00, output: 25.00 },
+  'anthropic:claude-opus-5':              anthro( 5.00, 25.00),
+  'anthropic:claude-opus-4-8':            anthro( 5.00, 25.00),
+  'anthropic:claude-opus-4-7':            anthro( 5.00, 25.00),
+  'anthropic:claude-opus-4-6':            anthro( 5.00, 25.00),
   // Sonnet 5 (released 2026-06-29): same $3/$15 sticker as 4.6. The launch
   // intro discount ($2/$10 through 2026-08-31) is deliberately NOT modeled —
   // the table carries standard rates so estimates stay conservative and
   // don't need a time-bombed edit when the promo lapses.
-  'anthropic:claude-sonnet-5':            { input:  3.00, output: 15.00 },
-  'anthropic:claude-sonnet-4-6':          { input:  3.00, output: 15.00 },
+  'anthropic:claude-sonnet-5':            anthro( 3.00, 15.00),
+  'anthropic:claude-sonnet-4-6':          anthro( 3.00, 15.00),
   // Haiku 4.5 — both the dateless canonical id and the dated snapshot.
-  'anthropic:claude-haiku-4-5':           { input:  1.00, output:  5.00 },
-  'anthropic:claude-haiku-4-5-20251001':  { input:  1.00, output:  5.00 },
-  'anthropic:claude-3-5-sonnet-20241022': { input:  3.00, output: 15.00 },
-  'anthropic:claude-3-5-haiku-20241022':  { input:  0.80, output:  4.00 },
+  'anthropic:claude-haiku-4-5':           anthro( 1.00,  5.00),
+  'anthropic:claude-haiku-4-5-20251001':  anthro( 1.00,  5.00),
+  'anthropic:claude-3-5-sonnet-20241022': anthro( 3.00, 15.00),
+  'anthropic:claude-3-5-haiku-20241022':  anthro( 0.80,  4.00),
 
   // ── OpenAI ─────────────────────────────────────────────────────────────
   'openai:gpt-4o':                        { input:  2.50, output: 10.00 },
@@ -91,18 +135,23 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   'openai:gpt-5.6':                       { input:  5.00, output: 30.00 },
   'openai:gpt-5.6-sol':                   { input:  5.00, output: 30.00 },
   'openai:gpt-5.6-terra':                 { input:  2.50, output: 15.00 },
-  'openai:gpt-5.6-luna':                  { input:  1.00, output:  6.00 },
+  'openai:gpt-5.6-luna':                  { input:  0.20, output:  1.20 },
 
   // ── Google ─────────────────────────────────────────────────────────────
   // `gemini-1.5-pro` was retired by Google (#3510); kept so historical
   // usage/audit rows still price. Not a valid default — it's deliberately
   // absent from the google recipe's chat list.
   'google:gemini-1.5-pro':                { input:  1.25, output:  5.00 },
-  // Gemini 2.0 Flash: $0.10 in / $0.40 out (verified 2026-06-03). Reconciled
-  // from a stale $0.30/$1.20 entry that had drifted in takes-quality-eval.
-  // `gemini-2-flash` kept as an alias for the legacy id spelling.
+  // The whole `gemini-2.0` family was retired the same way; kept for the same
+  // reason, and equally absent from the recipe's chat list. `gemini-2-flash`
+  // is the legacy id spelling of `gemini-2.0-flash` — keep the pair in
+  // lockstep (the drift guard asserts they agree).
   'google:gemini-2.0-flash':              { input:  0.10, output:  0.40 },
   'google:gemini-2-flash':                { input:  0.10, output:  0.40 },
+  // Gemini 2.5 Flash / Flash-Lite: the live successors, and what the recipe
+  // lists today. Rates from Google's published pricing (2026-08-02).
+  'google:gemini-2.5-flash':              { input:  0.30, output:  2.50 },
+  'google:gemini-2.5-flash-lite':         { input:  0.10, output:  0.40 },
 
   // ── Together / DeepSeek (cross-modal-eval panel) ───────────────────────
   'together:meta-llama/Llama-3.3-70B-Instruct-Turbo': { input: 0.88, output: 0.88 },

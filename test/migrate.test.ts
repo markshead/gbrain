@@ -3,6 +3,7 @@ import { LATEST_VERSION, runMigrations, MIGRATIONS, getIdleBlockers, hasPendingM
 import type { IdleBlocker } from '../src/core/migrate.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { withColdPglite } from './helpers/with-snapshot.ts';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
@@ -52,19 +53,18 @@ describe('hasPendingMigrations', () => {
   test('returns true when version config is missing entirely (defensive default)', async () => {
     // W0: opt out of the default-on snapshot — this test's premise is an
     // empty PGlite with no config table at all.
-    const priorSnapshot = process.env.GBRAIN_PGLITE_SNAPSHOT;
-    delete process.env.GBRAIN_PGLITE_SNAPSHOT;
-    const engine = new PGLiteEngine();
-    await engine.connect({});
-    if (priorSnapshot !== undefined) process.env.GBRAIN_PGLITE_SNAPSHOT = priorSnapshot;
-    try {
-      // Don't call initSchema. Probe against an empty PGlite — getConfig should
-      // either return null (treated as version=1) or throw on missing config
-      // table; either way the probe must say "yes pending."
-      expect(await hasPendingMigrations(engine)).toBe(true);
-    } finally {
-      await engine.disconnect();
-    }
+    await withColdPglite(async () => {
+      const engine = new PGLiteEngine();
+      await engine.connect({});
+      try {
+        // Don't call initSchema. Probe against an empty PGlite — getConfig
+        // should either return null (treated as version=1) or throw on missing
+        // config table; either way the probe must say "yes pending."
+        expect(await hasPendingMigrations(engine)).toBe(true);
+      } finally {
+        await engine.disconnect();
+      }
+    });
   }, 30000);
 });
 
@@ -250,7 +250,7 @@ describe('migrate v36 — subagent_provider_neutral_persistence_v0_27', () => {
   });
 
   test('embedded schema (src/core/schema-embedded.ts) reflects v36 columns', async () => {
-    const { SCHEMA_SQL } = await import('../src/core/schema-embedded.ts');
+    const { SCHEMA_SQL } = await import('../src/core/schema-embedded.generated.ts');
     expect(SCHEMA_SQL).toContain('schema_version');
     expect(SCHEMA_SQL).toContain('provider_id');
     expect(SCHEMA_SQL).toContain('idx_subagent_messages_provider');
@@ -802,7 +802,7 @@ describe('migrate — runner behavioral (v14 handler + v15 backfill)', () => {
 
   test('v15 backfilled any max_stalled=1 rows (smoke: schema default is 5)', async () => {
     await (engine as any).db.exec(
-      `INSERT INTO minion_jobs (name, queue, status, max_stalled) VALUES ('test', 'default', 'waiting', 1)`
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, max_stalled) VALUES ('{"version":1,"kind":"application"}'::jsonb, 'test', 'default', 'waiting', 1)`
     );
     await (engine as any).db.exec(
       `UPDATE minion_jobs SET max_stalled = 5

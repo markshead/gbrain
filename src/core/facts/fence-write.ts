@@ -38,14 +38,18 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative } from 'node:path';
 
-import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
-import { inferTypeFromPack } from '../markdown.ts';
+import type { BrainEngine, NewFact, FactVisibility, FactKind } from '../engine.ts';
+import type { ResolutionSource } from '../entities/resolve.ts';
+import { inferTypeFromPack, parseMarkdown } from '../markdown.ts';
+import { sanitizeText } from '../batch-rows.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
+import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesystemLock } from '../minions/source-filesystem.ts';
 import { gbrainPath } from '../config.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
+import { contentHash } from '../utils.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 
@@ -57,6 +61,15 @@ export interface FenceTarget {
   localPath: string | null;
   /** Entity slug — also becomes source_markdown_slug + the file basename. */
   slug: string;
+  /**
+   * #4108: how `slug` was resolved. REQUIRED (not optional) so no caller can
+   * silently skip provenance: 'fallback_slugify' and null (resolver returned
+   * nothing / caller has no resolution step) are blocked from stub-creating a
+   * page — a fallback-minted slug names an entity nothing verified exists.
+   * 'exact_page' / 'alias_exact' / 'fuzzy_match' all verified a live page, so
+   * stub-create (DB↔file drift repair) stays allowed for them.
+   */
+  resolutionSource: ResolutionSource | null;
 }
 
 /** Input fact prepared by runPipelineWithBody (post-dedup). */
@@ -91,12 +104,15 @@ export interface FenceWriteResult {
   fenceWriteFailed?: true;
   /**
    * True when the stub-creation guard refused to spawn a phantom entity
-   * page for an unprefixed bare slug (e.g. `jared` with no `people/`
-   * directory). Rows were NOT inserted; the caller is expected to route
-   * the facts to the legacy DB-only path so they aren't silently dropped.
+   * page — either for an unprefixed bare slug (e.g. `jared` with no
+   * `people/` directory), or (#4108) for a slug whose resolutionSource is
+   * 'fallback_slugify'/null, i.e. a slug the resolver invented rather than
+   * verified. Rows were NOT inserted; the caller is expected to route the
+   * facts to the legacy DB-only path so they aren't silently dropped.
    *
-   * This is the v0.34.5 fix for the entity-resolution bug where `"Jared"`
-   * fell through resolution and produced a top-level `jared.md` stub.
+   * The unprefixed arm is the v0.34.5 fix for the entity-resolution bug
+   * where `"Jared"` fell through resolution and produced a top-level
+   * `jared.md` stub.
    */
   stubGuardBlocked?: true;
   /**
@@ -293,6 +309,9 @@ export async function writeFactsToFence(
     return { inserted: 0, ids: [], targetUnresolvable: true };
   }
   const { filePath, writeRoot } = resolved;
+  if (!hasSourceFilesystemLock(writeRoot)) {
+    return withSourceFilesystemLock(engine, writeRoot, () => writeFactsToFence(engine, target, facts));
+  }
   const tmpPath = `${filePath}.tmp`;
   const durabilityEnabled = isDurabilityHardened(writeRoot);
 
@@ -304,32 +323,55 @@ export async function writeFactsToFence(
       if (existsSync(filePath)) {
         body = readFileSync(filePath, 'utf-8');
       } else {
-        // Stub-creation guard. Phantom entity pages at the brain root were
-        // being spawned when resolveEntitySlug fell through to a bare
-        // slugify because pg_trgm scored too low on short bare names. The
-        // resolver now has a prefix-expansion step that catches most of
-        // those, but this guard is the second wall: refuse to stub-create
-        // a page whose slug has no directory prefix (people/, companies/,
-        // deals/, topics/, etc.). The caller routes these facts to the
-        // legacy DB-only path so they aren't silently dropped — the fact
-        // still gets recorded, it just doesn't spawn a phantom entity
-        // page on disk.
+        // Stub-creation guard, two arms:
         //
-        // Sunset target: v0.36. Once `stub_guard_24h` (the gbrain doctor
-        // surface backed by the audit log written here) reads <5 hits/week
-        // for 3 consecutive weeks on production brains, the prefix-expansion
-        // in resolveEntitySlug is sufficient and this guard can be removed.
-        // The audit log under `~/.gbrain/audit/stub-guard-YYYY-Www.jsonl`
-        // is the operator visibility surface for that retirement decision.
-        if (!target.slug.includes('/')) {
+        // 1. Unprefixed slug (v0.34.5). Phantom entity pages at the brain
+        //    root were being spawned when resolveEntitySlug fell through to
+        //    a bare slugify because pg_trgm scored too low on short bare
+        //    names. The resolver now has a prefix-expansion step that
+        //    catches most of those, but this arm is the second wall: refuse
+        //    to stub-create a page whose slug has no directory prefix
+        //    (people/, companies/, deals/, topics/, etc.).
+        //
+        // 2. Fallback/absent resolution provenance (#4108). A PREFIXED
+        //    fallback_slugify result (e.g. "companies/zeta-widgets" for an
+        //    entity no page backs) sailed past arm 1 and materialized as a
+        //    canonical stub page; after sync it resolved as exact_page,
+        //    closing a fallback→stub→exact-match feedback loop. Blocklist
+        //    shape on purpose: only 'fallback_slugify' and null are blocked,
+        //    so future ResolutionSource members that verify a live page
+        //    (like v0.46.15's 'alias_exact') fence without touching this.
+        //
+        // Either way the caller routes these facts to the legacy DB-only
+        // path so they aren't silently dropped — the fact still gets
+        // recorded (entity_slug retained), it just doesn't spawn a phantom
+        // entity page on disk.
+        //
+        // Sunset target: v0.36, for arm 1 ONLY (the 'unprefixed' reason in
+        // the audit log). Once `stub_guard_24h` (the gbrain doctor surface
+        // backed by the audit log written here) reads <5 unprefixed
+        // hits/week for 3 consecutive weeks on production brains, the
+        // prefix-expansion in resolveEntitySlug is sufficient and arm 1 can
+        // be removed. Arm 2 does NOT sunset: it is the only wall between
+        // resolver-invented slugs and canonical page creation, and no
+        // resolver improvement can retire it (the fallback floor is by
+        // design). The audit log under
+        // `~/.gbrain/audit/stub-guard-YYYY-Www.jsonl` is the operator
+        // visibility surface, with per-arm `reason` fields.
+        const fallbackResolved =
+          target.resolutionSource === 'fallback_slugify' || target.resolutionSource == null;
+        if (!target.slug.includes('/') || fallbackResolved) {
           logStubGuardEvent({
             slug: target.slug,
             source_id: target.sourceId,
             fact_count: facts.length,
+            reason: !target.slug.includes('/') ? 'unprefixed' : 'fallback_resolution',
           });
           // eslint-disable-next-line no-console
           console.warn(
-            `[facts] refusing to stub-create unprefixed entity page slug=${target.slug} — routing to legacy DB-only path. Provide a directory prefix (people/, companies/, etc.) to opt into fence writes.`,
+            !target.slug.includes('/')
+              ? `[facts] refusing to stub-create unprefixed entity page slug=${target.slug} — routing to legacy DB-only path. Provide a directory prefix (people/, companies/, etc.) to opt into fence writes.`
+              : `[facts] refusing to stub-create entity page slug=${target.slug} from a fallback-resolved reference (no live page verified) — routing to legacy DB-only path.`,
           );
           return { inserted: 0, ids: [], stubGuardBlocked: true };
         }
@@ -387,7 +429,7 @@ export async function writeFactsToFence(
         const { body: updated, rowNum } = upsertFactRow(body, {
           rowNum:      nextRowNum++,
           claim:       f.fact,
-          kind:        (f.kind ?? 'fact') as 'fact' | 'event' | 'preference' | 'commitment' | 'belief',
+          kind:        (f.kind ?? 'fact') as FactKind,
           confidence:  f.confidence ?? 1.0,
           visibility:  f.visibility,
           notability:  f.notability ?? 'medium',
@@ -412,6 +454,7 @@ export async function writeFactsToFence(
         : 'clean';
 
       // 3. Atomic write: .tmp first, then parse-validate, then rename.
+      assertSourceFilesystemActive();
       writeFileSync(tmpPath, body, 'utf-8');
 
       // 4. Parse-before-rename: re-read the .tmp content and verify the
@@ -427,6 +470,28 @@ export async function writeFactsToFence(
       // 5. Rename .tmp → file. POSIX atomic; the canonical file is
       //    either the old content or the new content, never partial.
       renameSync(tmpPath, filePath);
+
+      // #4872: mirror the rewritten file into pages.compiled_truth. get_page
+      // and the extract_facts reconcile read the DB body, not the file — left
+      // stale, a plain get→put round-trip flattens the new row off disk and
+      // the next reconcile deletes it from the facts table. Same recipe as
+      // forget.ts (#4696): parse + sanitize the FILE bytes as import-file.ts
+      // does. Body-only: content_chunks are untouched, so the row KEEPS its
+      // old content_hash and the next sync re-imports + re-chunks. Stamping
+      // the importer's hash here made sync skip the page and left search
+      // blind to the new row forever. Never persist an EMPTY hash: a row
+      // that had none gets a row-shaped hash of its pre-mirror content,
+      // which the rewritten file can't match. Best-effort: the file is
+      // already committed; a stub page with no DB row is created by sync.
+      try {
+        const reparsed = parseMarkdown(tmpBody, `${target.slug}.md`);
+        const existing = await engine.getPage(target.slug, { sourceId: target.sourceId });
+        if (existing) {
+          await engine.refreshPageBody(target.slug, target.sourceId,
+            sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
+            existing.content_hash || contentHash(existing));
+        }
+      } catch { /* degrades to the pre-#4872 window (stale until the next sync) */ }
 
       // 6. Stamp the DB. extractFactsFromFenceText handles the
       //    validFrom/validUntil date derivation + the strikethrough
@@ -449,6 +514,14 @@ export async function writeFactsToFence(
       }));
 
       const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
+      // v0.46 (#3014) — an unresolvable `superseded by #N` reference (self
+      // / dangling / struck target) leaves superseded_by NULL; log it rather
+      // than swallow it. The row still lands (expired_at set for struck
+      // rows), never a bad FK.
+      for (const w of result.warnings) {
+        // eslint-disable-next-line no-console
+        console.warn(`[facts.supersession] ${w}`);
+      }
       if (durabilityEnabled) {
         await commitFactFenceFile(
           writeRoot,

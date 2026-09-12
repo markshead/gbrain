@@ -20,7 +20,8 @@
  * AND lose to new-key config when both are set.
  */
 
-import type { BrainEngine } from './engine.ts';
+import type { ConfigReader } from './config-snapshot.ts';
+import { openrouterModelSupportsSubagentLoop } from './ai/openrouter-families.ts';
 import { splitProviderModelId } from './model-id.ts';
 import type { GBrainConfig } from './config.ts';
 import { loadConfig } from './config.ts';
@@ -40,13 +41,14 @@ export interface ResolveModelOpts {
   /** Env var to consult after global default. Defaults to `GBRAIN_MODEL`. */
   envVar?: string;
   /**
-   * Tier classification (v0.31.12). Looked up after `models.default` and
-   * before the env var. Routing groups: `utility` (haiku-class, classification
-   * + expansion + verdict), `reasoning` (sonnet-class, default chat +
-   * synthesis + fact extraction), `deep` (opus-class, expensive reasoning),
-   * `subagent` (Anthropic-only multi-turn tool loop — never inherits a
-   * non-Anthropic `models.default`; falls back to TIER_DEFAULTS.subagent
-   * with a one-shot stderr warn instead).
+   * Tier classification (v0.31.12). Looked up after the per-feature config
+   * keys and BEFORE `models.default` (#3873 — tier-specific beats generic),
+   * then before the env var. Routing groups: `utility` (haiku-class,
+   * classification + expansion + verdict), `reasoning` (sonnet-class,
+   * default chat + synthesis + fact extraction), `deep` (opus-class,
+   * expensive reasoning), `subagent` (Anthropic-only multi-turn tool loop —
+   * never inherits a non-Anthropic `models.default`; falls back to
+   * TIER_DEFAULTS.subagent with a one-shot stderr warn instead).
    */
   tier?: ModelTier;
   /** Hardcoded last-resort fallback. */
@@ -63,7 +65,13 @@ export const DEFAULT_ALIASES: Record<string, string> = {
   opus:   'anthropic:claude-opus-4-7',
   sonnet: 'anthropic:claude-sonnet-4-6',
   haiku:  'anthropic:claude-haiku-4-5-20251001',
-  gemini: 'google:gemini-3-pro',
+  // `gemini` repointed (#2507): `gemini-3-pro` only ever existed as a preview
+  // id (`gemini-3-pro-preview`) and was shut down — it was never chat-listed
+  // in the google recipe nor priced. 2.5-flash is the recipe's chat models[0];
+  // there is NO GA pro-class Gemini chat target today, so the alias
+  // deliberately sits a capability class below the opus convention until
+  // Google ships a GA pro. Guarded by test/default-alias-liveness.test.ts.
+  gemini: 'google:gemini-2.5-flash',
   // `gpt` resolves DYNAMICALLY in resolveAlias (account-discovered OpenAI
   // flagship, recipe-ranked static floor) — this entry keeps the alias
   // enumerable but the value here is only the documentation floor; a pinned
@@ -158,19 +166,39 @@ function realEnv(env: Record<string, string | undefined>): Record<string, string
 }
 
 /**
+ * Explicit tier→file-plane pin key map (utility→expansion_model, everything
+ * else→chat_model): an unmapped future caller mislabeling the warn would be a
+ * silent doc bug with a ternary.
+ */
+const PIN_KEY_BY_TIER: Record<ModelTier, 'expansion_model' | 'chat_model'> = {
+  utility: 'expansion_model', reasoning: 'chat_model', deep: 'chat_model', subagent: 'chat_model',
+};
+
+/**
  * Resolve the default model for a tier, honoring which provider keys are
  * actually present. When `env` is passed it is used EXCLUSIVELY (no config
  * read — hermetic for tests and pre-merged callers); when omitted, the merged
- * env is computed from the file-plane config + process.env.
+ * env is computed from the file-plane config + process.env, and a SERVABLE
+ * file-plane pin for the tier is consulted below the key walk (#3813).
  */
 export function resolveTierDefault(
   tier: ModelTier,
   env?: Record<string, string | undefined>,
 ): string {
-  const merged = env ? realEnv(env) : mergedProviderEnv(throwSafeLoadConfig(), process.env);
+  const fileCfg = env ? null : throwSafeLoadConfig();
+  const merged = env ? realEnv(env) : mergedProviderEnv(fileCfg, process.env);
   for (const entry of PROVIDER_TIER_DEFAULTS) {
     if (merged[entry.envKey]) return entry.tiers(tier);
   }
+  // #3813: no anthropic/openai key. PROVIDER_TIER_DEFAULTS knows only those
+  // two, so a single-provider install (deepseek, openrouter, together, ...)
+  // used to land on the Anthropic floor and every bare-default caller
+  // (extract_atoms, facts classify, page-summary, ...) called a provider with
+  // no key. A servable pin for this tier beats the floor. Sits BELOW the key
+  // walk so keyed installs route byte-for-byte as before.
+  const rawPin = fileCfg?.[PIN_KEY_BY_TIER[tier]]?.trim();
+  const pin = rawPin ? (DEFAULT_ALIASES[rawPin] ?? rawPin) : undefined;
+  if (pin && providerKeyReady(pin, merged)) return pin;
   return TIER_DEFAULTS[tier];
 }
 
@@ -242,11 +270,6 @@ function resolveEffectiveModelForTier(
     if (providerKeyReady(fullPin, merged)) return { model: fullPin, source: 'file_pin' };
     if (!_unservablePinWarningsEmitted.has(fullPin)) {
       _unservablePinWarningsEmitted.add(fullPin);
-      // Explicit tier→config-key map: an unmapped future caller mislabeling
-      // the warn would be a silent doc bug with a ternary.
-      const PIN_KEY_BY_TIER: Record<ModelTier, string> = {
-        utility: 'expansion_model', reasoning: 'chat_model', deep: 'chat_model', subagent: 'chat_model',
-      };
       // A prefix-less pin is a DIFFERENT problem than a missing key — saying
       // "no usable provider key" for `chat_model: "claude-sonnet-4-6"` sends
       // the user hunting for a key problem they may not have.
@@ -304,6 +327,32 @@ export function isAnthropicProvider(modelString: string): boolean {
   return model.toLowerCase().startsWith('claude-');
 }
 
+/**
+ * OpenRouter Anthropic routes (`openrouter:anthropic/…`). These are NOT
+ * native Anthropic (`isAnthropicProvider` stays false — the Messages SDK
+ * cannot speak OR). The legacy `!useGatewayLoop && !isAnthropicProvider`
+ * pin treats them as an exception and auto-routes through gateway.toolLoop().
+ */
+export function isOpenRouterAnthropic(modelString: string): boolean {
+  if (!modelString) return false;
+  const { provider, model } = splitProviderModelId(modelString);
+  return provider?.trim().toLowerCase() === 'openrouter'
+    && model.toLowerCase().startsWith('anthropic/');
+}
+
+/**
+ * `openrouter:<family>/…` where the family has a live abort/retry pin for the
+ * subagent loop (anthropic/, deepseek/ — see src/core/ai/openrouter-families.ts).
+ * The subagent handler auto-enables the gateway loop for these, because the
+ * legacy Anthropic-direct pin would otherwise refuse them when
+ * `agent.use_gateway_loop` is off.
+ */
+export function isOpenRouterSubagentFamily(modelString: string): boolean {
+  if (!modelString) return false;
+  const { provider, model } = splitProviderModelId(modelString);
+  return provider?.trim().toLowerCase() === 'openrouter' && openrouterModelSupportsSubagentLoop(model);
+}
+
 const _subagentTierWarningsEmitted = new Set<string>();
 
 // Module-level set of deprecated config keys we've already warned about.
@@ -324,6 +373,22 @@ function emitDeprecationWarning(oldKey: string, newKey: string, ignored: boolean
     );
   }
 }
+
+/**
+ * #4575 — the config-key precedence the subagent tier resolves through at
+ * runtime (`resolveModelDetailed` with configKey 'models.subagent' + tier
+ * 'subagent': steps 2 → 4 → 5 below). Doctor's `subagent_capability` check
+ * iterates THIS list so the check and the runtime cannot drift again —
+ * #3873 hoisted `models.tier.<tier>` above `models.default` in the runtime
+ * and the check kept the pre-fix order, producing an unclearable false
+ * positive whose own suggested fix (set models.tier.subagent) was the key
+ * the check read last.
+ */
+export const SUBAGENT_CONFIG_KEY_PRECEDENCE = [
+  'models.subagent',
+  'models.tier.subagent',
+  'models.default',
+] as const;
 
 /** Which step of the resolution chain produced the model. */
 export type ResolveSource =
@@ -346,7 +411,7 @@ export type ResolveSource =
  * unservable Anthropic default.
  */
 export async function resolveModelDetailed(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   opts: ResolveModelOpts,
 ): Promise<{ model: string; source: ResolveSource }> {
   const envVar = opts.envVar ?? 'GBRAIN_MODEL';
@@ -381,20 +446,23 @@ export async function resolveModelDetailed(
       }
     }
 
-    // 4. Global default
-    const def = await engine.getConfig('models.default');
-    if (def && def.trim()) {
-      const resolved = await resolveAlias(engine, def.trim());
-      return { model: enforceSubagentCapable(resolved, opts.tier, 'models.default'), source: 'models_default' };
-    }
-
-    // 5. Tier override (v0.31.12)
+    // 4. Tier override (v0.31.12; hoisted above models.default by #3873).
+    //    `models.tier.<tier>` is strictly more specific than the generic
+    //    `models.default`, so it must win — pre-fix, setting a cheap utility
+    //    tier was silently ignored on any brain that also set models.default.
     if (opts.tier) {
       const tierVal = await engine.getConfig(`models.tier.${opts.tier}`);
       if (tierVal && tierVal.trim()) {
         const resolved = await resolveAlias(engine, tierVal.trim());
         return { model: enforceSubagentCapable(resolved, opts.tier, `models.tier.${opts.tier}`), source: 'tier_config' };
       }
+    }
+
+    // 5. Global default
+    const def = await engine.getConfig('models.default');
+    if (def && def.trim()) {
+      const resolved = await resolveAlias(engine, def.trim());
+      return { model: enforceSubagentCapable(resolved, opts.tier, 'models.default'), source: 'models_default' };
     }
   }
 
@@ -422,7 +490,7 @@ export async function resolveModelDetailed(
  * `resolveModelDetailed` for the ~30 callers that don't care which step won.
  */
 export async function resolveModel(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   opts: ResolveModelOpts,
 ): Promise<string> {
   return (await resolveModelDetailed(engine, opts)).model;
@@ -537,7 +605,7 @@ void enforceSubagentAnthropic;
  * to `super-opus` which aliases to `opus`, we return `super-opus` and stop.
  */
 export async function resolveAlias(
-  engine: BrainEngine | null,
+  engine: ConfigReader | null,
   name: string,
   depth = 0,
 ): Promise<string> {

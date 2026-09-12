@@ -226,6 +226,73 @@ async function factsColumns(engine: BrainEngine): Promise<string[]> {
  * `consolidated_at` still marks the rows as promoted, so the consolidate
  * phase won't double-promote them.
  */
+/**
+ * v0.47 open-loop engine: open_loops + loop_suppressions carry
+ * NON-derivable state (manual mutes, manual done/dropped decisions) — a
+ * Gmail re-sync on the target cannot reconstruct them, so the engine
+ * migration copies them like facts. Column-intersection + table_missing
+ * tolerance mirrors copyMigrationFacts; ids are preserved (fact_id
+ * references survive because facts ids are preserved too).
+ */
+export interface MigrateSimpleTableResult {
+  copied: number;
+  failed: number;
+  table_missing: boolean;
+}
+
+export async function copyMigrationSimpleTable(
+  source: BrainEngine,
+  target: BrainEngine,
+  table: 'open_loops' | 'loop_suppressions',
+  onRow?: () => void,
+): Promise<MigrateSimpleTableResult> {
+  const colsOf = async (engine: BrainEngine): Promise<string[]> => {
+    try {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = $1`,
+        [table],
+      );
+      return rows.map((r) => r.column_name);
+    } catch {
+      return [];
+    }
+  };
+  const sourceCols = await colsOf(source);
+  if (sourceCols.length === 0) return { copied: 0, failed: 0, table_missing: true };
+  const targetColSet = new Set(await colsOf(target));
+  if (targetColSet.size === 0) return { copied: 0, failed: 0, table_missing: true };
+  const cols = sourceCols.filter((c) => targetColSet.has(c));
+
+  const rows = await source.executeRaw<Record<string, unknown>>(
+    `SELECT ${cols.map((c) => (c === 'evidence' ? 'evidence::text AS evidence' : `"${c}"`)).join(', ')} FROM ${table} ORDER BY id`,
+  );
+  await target.executeRaw(`DELETE FROM ${table}`);
+  const insertSql = `INSERT INTO ${table} (${cols.map((c) => `"${c}"`).join(', ')})
+    VALUES (${cols.map((c, i) => (c === 'evidence' ? `$${i + 1}::text::jsonb` : `$${i + 1}`)).join(', ')})`;
+  const result: MigrateSimpleTableResult = { copied: 0, failed: 0, table_missing: false };
+  for (const raw of rows) {
+    const row = nullifyUndefinedColumns(raw);
+    try {
+      await target.executeRaw(insertSql, cols.map((c) => row[c]));
+      result.copied++;
+    } catch {
+      result.failed++;
+    }
+    onRow?.();
+  }
+  // Explicit-id copy leaves the BIGSERIAL sequence at 1 — the first new
+  // insert would collide with a copied row's PRIMARY KEY (and the ON
+  // CONFLICT dedup arbiter does NOT absorb a pkey 23505). Mirror the facts
+  // copy's setval.
+  try {
+    await target.executeRaw(
+      `SELECT setval(pg_get_serial_sequence('${table}', 'id'), (SELECT COALESCE(MAX(id), 0) + 1 FROM ${table}), false)`,
+    );
+  } catch { /* sequence bump is best-effort on exotic schemas */ }
+  return result;
+}
+
 export async function copyMigrationFacts(
   source: BrainEngine,
   target: BrainEngine,
@@ -434,6 +501,23 @@ export async function copyPageToTarget(
     content_hash: page.content_hash,
   }), { ...sourceOpts, allowEmptyOverwrite: true });
 
+  // #4527: putPage stamps created_at/updated_at with now() (PageInput has no
+  // timestamp fields), so without this every migrated page loses its
+  // chronology — recency ranking, `--since` filters, and timeline ordering
+  // all silently reset to the migration date. Restore the source row's
+  // timestamps directly; COALESCE keeps the putPage-stamped value if the
+  // source engine ever hands back a NULL (never expected, but a copy must
+  // not null out a NOT NULL column).
+  if (page.created_at != null || page.updated_at != null) {
+    await target.executeRaw(
+      `UPDATE pages
+          SET created_at = COALESCE($1, created_at),
+              updated_at = COALESCE($2, updated_at)
+        WHERE slug = $3 AND source_id = $4`,
+      [page.created_at ?? null, page.updated_at ?? null, page.slug, page.source_id ?? 'default'],
+    );
+  }
+
   // Copy chunks with embeddings.
   const chunks = await source.getChunksWithEmbeddings(page.slug, sourceOpts);
   if (chunks.length > 0) {
@@ -453,8 +537,11 @@ export async function copyPageToTarget(
     await target.addTag(page.slug, tag, sourceOpts);
   }
 
-  // Copy timeline
-  const timeline = await source.getTimeline(page.slug, sourceOpts);
+  // Copy timeline. #4485: getTimeline defaults to LIMIT 100 (newest-first)
+  // in both engines, so a page with a longer history silently lost everything
+  // past its newest 100 entries — pass an explicit unbounded limit (max int4,
+  // safely above any real per-page timeline).
+  const timeline = await source.getTimeline(page.slug, { ...sourceOpts, limit: 2_147_483_647 });
   for (const entry of timeline) {
     await target.addTimelineEntry(page.slug, {
       date: entry.date,
@@ -873,6 +960,8 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   const rowCounts: PageCopyCounts = { chunks: 0, tags: 0, timeline_entries: 0, raw_data: 0 };
   let linksCopied = 0;
   let factsResult: MigrateFactsResult = { copied: 0, failed: [], embeddings_dropped: 0, table_missing: false };
+  let openLoopsResult: MigrateSimpleTableResult = { copied: 0, failed: 0, table_missing: true };
+  let loopSuppressionsResult: MigrateSimpleTableResult = { copied: 0, failed: 0, table_missing: true };
   let configResult: { copied: number; skipped: string[] } = { copied: 0, skipped: [] };
   try {
     sourcesCopied = await copyMigrationSources(sourceEngine, targetEngine);
@@ -957,6 +1046,8 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     console.log('Copying facts...');
     progress.start('migrate.copy_facts');
     factsResult = await copyMigrationFacts(sourceEngine, targetEngine, () => progress.tick(1));
+    openLoopsResult = await copyMigrationSimpleTable(sourceEngine, targetEngine, 'open_loops', () => progress.tick(1));
+    loopSuppressionsResult = await copyMigrationSimpleTable(sourceEngine, targetEngine, 'loop_suppressions', () => progress.tick(1));
     progress.finish();
     if (factsResult.failed.length > 0) {
       console.error(`\n${factsResult.failed.length} fact row(s) FAILED to copy:`);
@@ -1045,6 +1136,12 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     ].filter(Boolean).join('; ');
     summaryRow('facts', factsNotes ? `${factsResult.copied} (${factsNotes})` : String(factsResult.copied));
   }
+  const loopsRow = (label: string, r: MigrateSimpleTableResult) =>
+    summaryRow(label, r.table_missing
+      ? '0 (source schema predates the open-loop tables)'
+      : r.failed > 0 ? `${r.copied} (${r.failed} FAILED)` : String(r.copied));
+  loopsRow('open loops', openLoopsResult);
+  loopsRow('loop suppressions', loopSuppressionsResult);
   summaryRow('config rows', configResult.skipped.length > 0
     ? `${configResult.copied} (skipped engine-local: ${configResult.skipped.join(', ')})`
     : String(configResult.copied));
@@ -1071,7 +1168,21 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   // warnings and keeps going so the user sees the full picture.
   console.log('\nVerifying target...');
   try {
-    await verifyTarget(targetEngine, sourceStats.page_count);
+    // #4485: compare timeline counts too — the LIMIT-100 truncation class of
+    // bug (a bounded read inside the copy) is invisible to the page-count
+    // check, so verify pins the row-level tables it can count cheaply on
+    // both sides. wave-g: counts are scoped to the COPIED page set (live
+    // pages), not the whole table — the copy iterates listPages() output,
+    // which excludes soft-deleted pages, so a soft-deleted source page that
+    // still owns timeline rows produced a false WARN under whole-table
+    // counts. Both sides use the identical predicate.
+    let sourceTimelineCount: number | undefined;
+    try {
+      const rows = await sourceEngine.executeRaw<{ count: string }>(COPIED_TIMELINE_COUNT_SQL);
+      sourceTimelineCount = Number(rows[0]?.count ?? NaN);
+      if (!Number.isFinite(sourceTimelineCount)) sourceTimelineCount = undefined;
+    } catch { /* older schema: skip the timeline parity check */ }
+    await verifyTarget(targetEngine, sourceStats.page_count, sourceTimelineCount);
   } catch (e) {
     console.warn(`  Verification could not complete: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -1080,16 +1191,50 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
 }
 
 /**
+ * wave-g (#4485 follow-up): timeline parity counts rows over the COPIED page
+ * set — timeline entries whose page is live (`deleted_at IS NULL`). The
+ * migration copies listPages() output, which excludes soft-deleted pages, so
+ * whole-table counts false-WARNed whenever a soft-deleted page still owned
+ * timeline rows on the source. Shared by the source read and verifyTarget so
+ * the two sides can never drift; throws on pre-deleted_at schemas, which the
+ * callers' try/catch already fail-opens to "skip the parity check".
+ * Exported for the test surface only.
+ */
+export const COPIED_TIMELINE_COUNT_SQL =
+  `SELECT count(*)::text AS count
+     FROM timeline_entries te
+     JOIN pages p ON p.id = te.page_id
+    WHERE p.deleted_at IS NULL`;
+
+/**
  * Lightweight doctor-style verify run against the migrated target.
  * Prints a small table of signals; does not exit. Callers own engine
  * lifecycle.
  */
-async function verifyTarget(engine: BrainEngine, expectedPages: number): Promise<void> {
+async function verifyTarget(engine: BrainEngine, expectedPages: number, expectedTimelineEntries?: number): Promise<void> {
   const stats = await engine.getStats();
   if (stats.page_count === expectedPages) {
     console.log(`  ok  pages: ${stats.page_count} (matches source)`);
   } else {
     console.warn(`  WARN pages: ${stats.page_count} (source had ${expectedPages})`);
+  }
+
+  // #4485: row-level parity for the timeline table — a bounded read inside
+  // the copy (the old LIMIT-100 truncation) passes the page-count check just
+  // fine, so the verify step counts the rows themselves. wave-g: scoped to
+  // the copied (live) page set on BOTH sides — see COPIED_TIMELINE_COUNT_SQL.
+  if (expectedTimelineEntries !== undefined) {
+    try {
+      const rows = await engine.executeRaw<{ count: string }>(COPIED_TIMELINE_COUNT_SQL);
+      const targetTimeline = Number(rows[0]?.count ?? NaN);
+      if (targetTimeline === expectedTimelineEntries) {
+        console.log(`  ok  timeline entries: ${targetTimeline} (matches source)`);
+      } else {
+        console.warn(`  WARN timeline entries: ${targetTimeline} (source had ${expectedTimelineEntries})`);
+      }
+    } catch (e) {
+      console.warn(`  WARN timeline entries: could not count (${e instanceof Error ? e.message : String(e)})`);
+    }
   }
 
   try {

@@ -88,7 +88,7 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     await queryEngine.initSchema();
     await queryEngine.executeRaw(
       `INSERT INTO sources (id, name, archived)
-       VALUES ($1, $1, false), ($2, $2, true), ($3, $3, false)
+       VALUES ($1, $1, false), ($2, $2, false), ($3, $3, false)
        ON CONFLICT (id) DO UPDATE
        SET name = EXCLUDED.name, archived = EXCLUDED.archived`,
       [liveSourceId, archivedSourceId, rescopeTargetSourceId],
@@ -96,7 +96,8 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
 
     const registerClient = registerClientForRescope;
 
-    // Register unscoped, live-source-scoped, and archived-source-scoped clients.
+    // All clients are granted while their source is active. The archive test
+    // archives its source after minting a token to exercise live revocation.
     // The write scope is what POST /ingest gates on.
     const suffix = Date.now();
     const defaultClient = registerClient(`e2e-webhook-default-${suffix}`);
@@ -512,8 +513,9 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect((await waitForPage(slug)).source_id).toBe('default');
   });
 
-  test('archived-source client falls back to default', async () => {
+  test('archiving a granted source rejects ingest without falling back to default', async () => {
     const token = await mintToken('read write', archivedClient);
+    await queryEngine!.executeRaw('UPDATE sources SET archived = true WHERE id = $1', [archivedSourceId]);
     const slug = `webhook/test/archived-${Date.now()}`;
     const res = await postIngest(
       token,
@@ -521,12 +523,10 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
       '# archived OAuth source',
       { 'X-Gbrain-Slug': slug },
     );
-    expect([200, 202]).toContain(res.status);
-    // Enqueue-time intent is the client's scoped source; the archived-source
-    // redirect happens later, in the job. The 202 therefore still names the
-    // requested source while the page lands under default.
-    expect(((await res.json()) as { write_source_id: string }).write_source_id).toBe(archivedSourceId);
-    expect((await waitForPage(slug)).source_id).toBe('default');
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { job_id?: unknown }).job_id).toBeUndefined();
+    expect(await queryEngine!.executeRaw('SELECT id FROM minion_jobs WHERE data->>\'slug\' = $1', [slug])).toHaveLength(0);
+    expect(await queryEngine!.executeRaw('SELECT source_id FROM pages WHERE slug = $1', [slug])).toHaveLength(0);
   });
 
   test('an unscoped client cannot opt into a real source via X-Gbrain-Source-Id', async () => {
@@ -624,4 +624,64 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect(secondBody.job_id).toBeDefined();
     expect(secondBody.job_id).not.toBe(firstBody.job_id);
   });
+
+  // =========================================================================
+  // A12: pre-v85 schema rung — fence projection degrade fails CLOSED
+  // =========================================================================
+
+  // Deliberately the LAST test in the file: it mutates the live shared
+  // schema mid-run. The rename-back sits in a `finally` so sibling suites
+  // and later runs of this file survive even if the assertions throw.
+  test('pre-v85 rung (bound_slug_prefixes missing) → 403 fail-closed with apply-migrations remediation', async () => {
+    // Simulates the case the fence-degrade comment in oauth-provider.ts names
+    // as the one that matters: oauth_clients missing bound_slug_prefixes
+    // (interrupted migration / dump restored without the v85 column), so
+    // verifyAccessToken's projection ladder walks down to the v85-missing
+    // rung and stamps fenceProjectionDegraded — POST /ingest must refuse
+    // rather than silently unfence clients whose bindings it cannot see.
+    //
+    // Mechanism: RENAME (not DROP) the column on the live DB — the least
+    // invasive real-behavior path. The server's next per-request projection
+    // hits SQLSTATE 42703 exactly as a dropped column would (there is no
+    // token-verification cache; requireBearerAuth re-runs the ladder every
+    // request), and the rename back preserves every client's binding data.
+    // The token is minted while the schema is intact so only the route's
+    // verify-time behavior is under test, not /token.
+    const token = await mintToken('read write');
+    const content = `# pre-v85 fence degrade probe ${Date.now()}`;
+
+    // Allowed control: with the column intact, the exact same request is
+    // accepted per the route's real contract (200/202 + job_id).
+    const control = await postIngest(token, 'text/markdown', content);
+    expect([200, 202]).toContain(control.status);
+    expect(((await control.json()) as { job_id?: number | string }).job_id).toBeDefined();
+
+    await queryEngine!.executeRaw(
+      `ALTER TABLE oauth_clients RENAME COLUMN bound_slug_prefixes TO bound_slug_prefixes_a12_hidden`,
+    );
+    try {
+      const res = await postIngest(token, 'text/markdown', content);
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error?: string; message?: string; job_id?: unknown };
+      expect(body.error).toBe('permission_denied');
+      // Pin the real remediation copy from serve-http.ts's degraded branch.
+      expect(body.message).toContain(
+        "POST /ingest is unavailable: this brain's oauth_clients projection is missing bound_slug_prefixes",
+      );
+      expect(body.message).toContain('client write bindings cannot be evaluated');
+      expect(body.message).toContain('Run `gbrain apply-migrations --yes` on the brain host.');
+      // Fail-closed means no job was enqueued for this request.
+      expect(body.job_id).toBeUndefined();
+    } finally {
+      await queryEngine!.executeRaw(
+        `ALTER TABLE oauth_clients RENAME COLUMN bound_slug_prefixes_a12_hidden TO bound_slug_prefixes`,
+      );
+    }
+
+    // Recovery: with the column restored, the same request is accepted again
+    // (queue dedup may hand back the control's job_id — still a 2xx accept).
+    const recovered = await postIngest(token, 'text/markdown', content);
+    expect([200, 202]).toContain(recovered.status);
+    expect(((await recovered.json()) as { job_id?: number | string }).job_id).toBeDefined();
+  }, 30_000);
 });

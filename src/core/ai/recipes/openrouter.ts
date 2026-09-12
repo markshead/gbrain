@@ -1,4 +1,6 @@
 import type { Recipe } from '../types.ts';
+import { openrouterModelSupportsSubagentLoop } from '../openrouter-families.ts';
+import { deepseekReasoningContentCompatFetch } from './deepseek.ts';
 import { openaiModelSupportsPromptCache } from './openai.ts';
 
 /**
@@ -48,6 +50,28 @@ export function openrouterRequiresExplicitPromptCache(modelId: string): boolean 
 }
 
 /**
+ * Native DeepSeek v4 thinks by default (recipe `thinking_by_default: true`,
+ * #4172) and OpenRouter's DeepSeek hosts serve the same models — reasoning
+ * bills as OUTPUT tokens against max_tokens, so output-cap sizing must grant
+ * the same headroom on the OR route (#4758).
+ */
+export function openrouterThinkingByDefault(modelId: string): boolean {
+  return modelId.trim().toLowerCase().startsWith('deepseek/');
+}
+
+/**
+ * Which proxied families may drive the subagent loop. The gateway loop keys
+ * replay on gbrain_tool_use_id, not the raw provider id, so a family only
+ * needs a live abort/retry pin proving its tool-call envelope survives a
+ * resume. Anthropic and DeepSeek have one (test/e2e/openrouter-*-subagent-
+ * replay.live.test.ts); other families stay refused until they do
+ * (TODOS.md OpenRouter follow-up). List lives in ../openrouter-families.ts.
+ */
+export function openrouterSupportsSubagentLoop(modelId: string): boolean {
+  return openrouterModelSupportsSubagentLoop(modelId);
+}
+
+/**
  * Rewrite the last system message's string content into OpenRouter's
  * documented Anthropic caching shape: a content-part array carrying
  * `cache_control: { type: 'ephemeral' }` on the text block. (A top-level
@@ -78,9 +102,13 @@ function withSystemCacheControl(body: unknown): unknown {
 }
 
 /**
- * Compat fetch: honors the OPENROUTER_CACHE_HEADER marker by splicing an
+ * Compat fetch: (1) honors the OPENROUTER_CACHE_HEADER marker by splicing an
  * Anthropic cache_control breakpoint onto the system block, then strips the
- * marker. Fail-open: any parse problem sends the original body unchanged.
+ * marker; (2) composes the native DeepSeek `reasoning_content` promote so
+ * OpenRouter-hosted thinking models (DeepSeek V4, etc.) do not arrive at the
+ * AI SDK adapter as empty `content` (#4753). Fail-open: any parse problem
+ * sends the original body unchanged. Tool-call turns are never promoted
+ * (that logic lives in `deepseekReasoningContentCompatFetch`).
  *
  * @internal exported for tests. Cast through `unknown` because TS's
  * `typeof fetch` includes a `preconnect` member (matches azure-openai.ts).
@@ -89,9 +117,11 @@ export const openrouterCompatFetch = (async (
   input: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<Response> => {
-  if (!init?.headers) return fetch(input as any, init as any);
+  const promote = (nextInit?: RequestInit) =>
+    deepseekReasoningContentCompatFetch(input as any, nextInit as any);
+  if (!init?.headers) return promote(init);
   const headers = new Headers(init.headers as any);
-  if (!headers.has(OPENROUTER_CACHE_HEADER)) return fetch(input as any, init as any);
+  if (!headers.has(OPENROUTER_CACHE_HEADER)) return promote(init);
   headers.delete(OPENROUTER_CACHE_HEADER);
   let body = init.body;
   if (typeof body === 'string') {
@@ -106,7 +136,7 @@ export const openrouterCompatFetch = (async (
       // Non-JSON body: let the provider surface the original problem.
     }
   }
-  return fetch(input as any, { ...init, headers, body } as any);
+  return promote({ ...init, headers, body } as any);
 }) as unknown as typeof fetch;
 
 /**
@@ -147,14 +177,12 @@ export const openrouterCompatFetch = (async (
  * downstream agent stacks (OpenClaw deployments, etc.) get their own
  * attribution on OR's leaderboard instead of polluting gbrain's.
  *
- * Subagent loops: `supports_subagent_loop: false` is enforced by
- * `classifyCapabilities()` in `src/core/ai/capabilities.ts` — the subagent
- * tier refuses OR-proxied models at submit or handler dispatch because tool_use_id
- * stability across crashes/replays can't be guaranteed through the proxy.
- * (The legacy Anthropic-direct path additionally gates on
- * `isAnthropicProvider()` in `src/core/model-config.ts` when
- * `agent.use_gateway_loop` is off.) Relaxing this is a deeper architectural
- * change tracked in TODOS.md.
+ * Subagent loops: Anthropic (`anthropic/…`) and DeepSeek (`deepseek/…`)
+ * routes declare `supports_subagent_loop` so classifyCapabilities() allows
+ * them, and the handler auto-routes those jobs through `gateway.toolLoop()`
+ * (OR is not a native Anthropic provider, so the Messages SDK path is never
+ * used for `openrouter:*`). Other OR families stay refused until they get a
+ * live abort/retry pin (TODOS.md).
  */
 export const openrouter: Recipe = {
   id: 'openrouter',
@@ -240,11 +268,13 @@ export const openrouter: Recipe = {
         'deepseek/deepseek-chat',
       ],
       supports_tools: true,
-      // Enforced — classifyCapabilities() refuses the subagent tier on this flag.
-      supports_subagent_loop: false,
+      supports_subagent_loop: openrouterSupportsSubagentLoop,
       // Family-scoped: OpenAI routes cache automatically; Anthropic routes
       // cache via the compat fetch shim's cache_control rewrite.
       supports_prompt_cache: openrouterSupportsPromptCache,
+      // DeepSeek v4 via OpenRouter thinks by default (same as native
+      // deepseek:). Other OR families stay default-off.
+      thinking_by_default: openrouterThinkingByDefault,
       // No max_context_tokens: catalog spans 128K to 1M+; a single recipe-wide
       // value is either unsafe for smaller models or wasteful for larger ones.
       // Let upstream errors surface per-model.

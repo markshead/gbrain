@@ -37,7 +37,7 @@ import type {
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { loadConfig, isConfigTruthy } from '../../config.ts';
-import { buildBrainTools, filterAllowedTools } from '../tools/brain-allowlist.ts';
+import { buildBrainTools, selectAllowedTools } from '../tools/brain-allowlist.ts';
 import {
   acquireLease,
   releaseLease,
@@ -48,11 +48,11 @@ import {
   logSubagentSubmission,
   logSubagentHeartbeat,
 } from './subagent-audit.ts';
-import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-config.ts';
+import { resolveModel, isAnthropicProvider, isOpenRouterSubagentFamily, TIER_DEFAULTS } from '../../model-config.ts';
 import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
-import { toolLoop as gatewayToolLoop, isThinkingByDefaultModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
+import { toolLoop as gatewayToolLoop, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
 import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
@@ -70,6 +70,11 @@ import {
   type PersistedToolExec,
 } from './subagent-persistence.ts';
 import { randomUUIDv7 } from 'bun';
+import { snapshotFromJob } from '../delegated-policy.ts';
+import { applyDelegatedData, guardDelegatedTools } from '../delegated-tools.ts';
+import { withDelegatedSpend } from '../delegated-spend.ts';
+import { invokeAI, sdkInvocationUsage, hasAIInvocationGuard } from '../../ai/invocation-guard.ts';
+import { chatInvocation } from '../../ai/guarded-generation.ts';
 
 // ── Defaults ────────────────────────────────────────────────
 
@@ -81,9 +86,9 @@ const DEFAULT_RATE_KEY = 'anthropic:messages';
 /**
  * Resolve the per-turn output-token cap (#2778). Per-job data wins, then the
  * `agent.max_output_tokens` config row, then a model-aware default: 32000 for
- * thinking-by-default Claude 5 models (#4087 — they burn most of the budget on
- * internal reasoning; the flat 8192 default produced zero-tool-call truncated
- * runs even after the gateway learned to detect them), 8192 for everything
+ * thinking-by-default models (#4087 Claude 5 by name, #4172 recipe-declared
+ * such as DeepSeek v4: they burn most of the budget on internal reasoning; the
+ * flat 8192 default produced zero-tool-call truncated runs), 8192 for everything
  * else (was a hardcoded 4096 that made pages >~12KB unwritable via put_page).
  * Invalid values (NaN / zero / negative) fall through to the next tier.
  */
@@ -99,7 +104,7 @@ export function resolveMaxOutputTokens(
     const n = Number(configRaw);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
-  return isThinkingByDefaultModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
+  return isThinkingModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 /**
@@ -139,7 +144,7 @@ const DEFAULT_SYSTEM = DEFAULT_SUBAGENT_SYSTEM;
  * structurally; tests can substitute a mock without the SDK import.
  */
 export interface MessagesClient {
-  create(params: Anthropic.MessageCreateParamsNonStreaming, opts?: { signal?: AbortSignal }): Promise<Anthropic.Message>;
+  create(params: Anthropic.MessageCreateParamsNonStreaming, opts?: { signal?: AbortSignal; maxRetries?: number }): Promise<Anthropic.Message>;
 }
 
 export interface SubagentDeps {
@@ -214,6 +219,26 @@ async function runLoopConvertingLeaseLoss<T>(
     if (wasLeaseLost()) {
       throw new RateLeaseUnavailableError(leaseKey, maxConcurrent, maxConcurrent);
     }
+    // Same terminal classification the legacy raw-SDK path applies below
+    // (see isPromptTooLongError's call site): a 400 "prompt is too long" is
+    // unrecoverable — retrying with the same prompt will always fail the
+    // same way. `e` here is already normalizeAIError()-wrapped (thrown by
+    // gateway.chat()'s catch boundary), which copies only the OUTER message
+    // onto the new error and stores the raw provider error on `.cause` —
+    // isPromptTooLongError() walks that cause chain so the SDK's inner
+    // `.error.message` shape (Anthropic's actual wire shape) still matches
+    // post-wrap. Without this, a gateway-native subagent job (required for
+    // any non-Anthropic model) retries a prompt-too-long condition like any
+    // other transient failure up to max_stalled instead of fast-failing —
+    // the exact dream-cycle queue-clog class the legacy-path fix was built
+    // to prevent, just on the newer path.
+    // Single walk: extractPromptTooLongDetail is non-null exactly when
+    // isPromptTooLongError matches (both wrap the same matcher). The detail is
+    // the matched provider text ("prompt is too long: N tokens > max"), not
+    // `e.message` — post-normalizeAIError that is only the generic outer
+    // wrapper; the useful token counts live on `.cause`, same as the match.
+    const detail = extractPromptTooLongDetail(e);
+    if (detail !== null) throw new UnrecoverableError(`prompt_too_long: ${detail}`);
     throw e;
   }
 }
@@ -252,7 +277,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       fallbackReason?: OneshotFallbackReason;
       oneshotTokens?: { in: number; out: number; cache_read: number; cache_create: number };
     } = {};
-    const inner = await subagentHandlerInner(ctx, modeState);
+    const submitted = snapshotFromJob(ctx.data);
+    const inner = await withDelegatedSpend(engine, submitted, ctx.id, () => subagentHandlerInner(ctx, modeState));
     // #4216: stamp which execution path produced the result. Jobs with no
     // `mode` field keep the legacy result shape (REGRESSION pin).
     // Honesty rule: 'agentic_fallback' is stamped ONLY when the oneshot
@@ -300,7 +326,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     oneshotTokens?: { in: number; out: number; cache_read: number; cache_create: number };
   } = {},
   ): Promise<SubagentResult> {
-    const data = (ctx.data ?? {}) as unknown as SubagentHandlerData;
+    const data = { ...(ctx.data ?? {}) } as unknown as SubagentHandlerData;
+    const submitted = snapshotFromJob(ctx.data);
+    await applyDelegatedData(engine, submitted, ctx.id, data);
     if (!data.prompt || typeof data.prompt !== 'string') {
       throw new Error('subagent job data.prompt is required (string)');
     }
@@ -417,7 +445,11 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // #2753: share the doctor's truthiness set. Before this, the doctor accepted
     // yes/on but the worker did not, so `config set ... yes` reported healthy
     // here and still refused the job below.
-    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw);
+    // OpenRouter routes are not `isAnthropicProvider` (the Messages SDK
+    // cannot speak OR). Auto-enable the gateway loop for the OR families
+    // that have a live abort/retry pin (anthropic/, deepseek/) so the legacy
+    // pin does not refuse them when the flag is off.
+    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw) || isOpenRouterSubagentFamily(model);
     if (!useGatewayLoop && !isAnthropicProvider(model)) {
       throw new Error(
         `subagent job: resolved model "${model}" is non-Anthropic but agent.use_gateway_loop is not enabled. ` +
@@ -442,9 +474,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       // #1586: cycle-resolved source scope for tool-call OperationContexts.
       sourceId: data.source_id,
     });
-    const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
-      ? filterAllowedTools(registry, data.allowed_tools)
-      : registry;
+    const selectedTools = selectAllowedTools(registry, data.allowed_tools);
+    const guardTools = (tools: ToolDef[], deferEmbeds = false) => guardDelegatedTools(engine, config, submitted, ctx.id, tools, deps.toolRegistry !== undefined, deferEmbeds);
+    const toolDefs = guardTools(selectedTools);
 
     // v0.41 Approach C: render the final system prompt now that toolDefs
     // is known. Splices a deterministic tool-usage preamble listing each
@@ -512,9 +544,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         // that scoped its job read-only must not gain write capability by
         // setting mode: oneshot (put_page filtered out → no_put_page_tool
         // fallback → the equally-filtered loop).
-        const oneshotTools = data.allowed_tools && data.allowed_tools.length > 0
-          ? filterAllowedTools(oneshotRegistry, data.allowed_tools)
-          : oneshotRegistry;
+        const oneshotSelectedTools = selectAllowedTools(oneshotRegistry, data.allowed_tools);
+        const oneshotTools = guardTools(oneshotSelectedTools, true);
         const outcome = await runSubagentOneshot({
           engine,
           ctx,
@@ -525,7 +556,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           leaseKey: gatewayLeaseKey,
           maxConcurrent,
           leaseTtlMs,
-          _chat: deps._chat,
+          _chat: deps._chat ? opts => invokeAI(chatInvocation('subagent_oneshot', normalizeModelId(model), maxOutputTokens),
+            () => deps._chat!(opts), sdkInvocationUsage) : undefined,
         });
         if (outcome.kind === 'done') return outcome.result;
         modeState.fallbackReason = outcome.reason;
@@ -861,7 +893,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         };
 
         const combinedSignal = mergeSignals(mergeSignals(ctx.signal, ctx.shutdownSignal), leaseLost.signal);
-        assistantMsg = await client.create(params, { signal: combinedSignal });
+        assistantMsg = await invokeAI({ ...chatInvocation('subagent_legacy', normalizeModelId(model), maxOutputTokens), cacheWriteTtl: '5m' },
+          () => client.create(params, { signal: combinedSignal, ...(hasAIInvocationGuard() ? { maxRetries: 0 } : {}) }), sdkInvocationUsage);
       } catch (err) {
         // Release lease eagerly on error so we don't starve capacity.
         clearInterval(leaseRenewTimer);
@@ -1690,6 +1723,12 @@ function adaptContentBlocksToChatBlocks(blocks: unknown): ChatBlock[] | string {
       : {};
     if (t === 'text' && typeof block.text === 'string') {
       out.push({ type: 'text', text: block.text, ...meta });
+    } else if (t === 'reasoning' && typeof block.text === 'string') {
+      // OpenAI Responses API reasoning-item id (providerMetadata.openai.itemId)
+      // — see the ChatBlock doc comment. Must survive crash-replay the same
+      // way tool-call providerMetadata does, or a resumed reasoning-model
+      // tool loop dead-letters on its next turn.
+      out.push({ type: 'reasoning', text: block.text, ...meta });
     } else if (t === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
       // v1 Anthropic shape
       out.push({
@@ -1781,16 +1820,53 @@ export { RateLeaseUnavailableError } from '../rate-leases.ts';
  * Case-insensitive on the phrase. Also matches `request_too_large` and
  * `invalid_request_error` types when accompanied by the same message.
  *
+ * Walks up to 3 levels of `.cause` (bounded, same depth as
+ * classifyGlobalLlmError in errors.ts): gateway.chat()'s catch boundary
+ * wraps every error via normalizeAIError(), which copies only the OUTER
+ * `.message` onto the new AIConfigError/AITransientError and stores the
+ * original raw error on `.cause` — the SDK's `.error.message` inner shape
+ * (the one Anthropic actually uses, per the existing "matches when message
+ * is on the inner .error.message field" unit test below) is otherwise lost
+ * post-normalization, silently defeating detection on the gateway-native
+ * path where callers only ever see the already-normalized error.
+ *
  * Exported for unit testing.
  */
 export function isPromptTooLongError(err: unknown): boolean {
-  if (!err) return false;
+  return findPromptTooLongMatch(err) !== null;
+}
+
+/**
+ * Same bounded `.cause` walk as isPromptTooLongError, but returns the
+ * matched phrase-bearing text (e.g. "prompt is too long: 1707509 tokens >
+ * 1000000 maximum") instead of a boolean — used at the terminal-classification
+ * call site so a normalizeAIError()-wrapped error's dead-letter message
+ * carries the actually useful provider detail instead of the generic outer
+ * wrapper text (e.g. "BadRequestError"). Returns null when no match (mirrors
+ * isPromptTooLongError returning false for the same input).
+ */
+export function extractPromptTooLongDetail(err: unknown): string | null {
+  return findPromptTooLongMatch(err);
+}
+
+function findPromptTooLongMatch(err: unknown): string | null {
+  let cur: unknown = err;
+  for (let depth = 0; depth < 3 && cur != null; depth++) {
+    const matched = matchesPromptTooLong(cur);
+    if (matched !== null) return matched;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+function matchesPromptTooLong(err: unknown): string | null {
+  if (!err) return null;
   // Walk both `.message` and `.error?.message` shapes.
   const msg = (err as { message?: unknown })?.message;
   const inner = (err as { error?: { message?: unknown } })?.error?.message;
   const candidates = [msg, inner].filter((s): s is string => typeof s === 'string');
   for (const c of candidates) {
-    if (/prompt is too long/i.test(c)) return true;
+    if (/prompt is too long/i.test(c)) return c;
   }
   // Anthropic SDK wraps with .status; 400 + 'invalid_request_error' /
   // 'request_too_large' types both indicate the same class. Only treat
@@ -1800,10 +1876,10 @@ export function isPromptTooLongError(err: unknown): boolean {
   const errType = (err as { error?: { type?: unknown } })?.error?.type;
   if (status === 400 && (errType === 'invalid_request_error' || errType === 'request_too_large')) {
     for (const c of candidates) {
-      if (/too long|exceed|maximum/i.test(c)) return true;
+      if (/too long|exceed|maximum/i.test(c)) return c;
     }
   }
-  return false;
+  return null;
 }
 
 // ── Testing surface ─────────────────────────────────────────

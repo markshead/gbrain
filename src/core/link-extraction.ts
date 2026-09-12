@@ -16,8 +16,22 @@ import type { PageType, EffectiveDateSource } from './types.ts';
 import { ensureWellFormed } from './text-safe.ts';
 import { stripCodeBlocks } from './markdown-code.ts';
 import { parseInlineCitationTimelineEntries } from './timeline-citations.ts';
-import { slugifyPath } from './sync.ts';
+import { slugifyPath, slugifySegment } from './sync.ts';
 import { SLUG_WORD_CHARS } from './cjk.ts';
+import { foldNonDecomposingLatin } from './latin-fold.ts';
+// #3190: pack-aware link typing. link-inference imports only manifest-v1
+// (zod) + redos-guard (node:vm) — no cycle back into this module.
+import type { SchemaPackManifest } from './schema-pack/manifest-v1.ts';
+import { inferLinkTypeFromPack, frontmatterLinkTypeFromPack } from './schema-pack/link-inference.ts';
+import { PageRegexBudget } from './schema-pack/redos-guard.ts';
+
+/**
+ * #3190: the slice of a schema-pack manifest link extraction consumes.
+ * Callers thread the ACTIVE pack's manifest (loadActivePackForLocalEngine /
+ * loadActivePackBestEffort → `.manifest`); null/undefined keeps the legacy
+ * in-code inference exactly as before.
+ */
+export type LinkExtractionPack = Pick<SchemaPackManifest, 'link_types' | 'frontmatter_links'>;
 
 export { stripCodeBlocks } from './markdown-code.ts';
 export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidate } from './timeline-citations.ts';
@@ -35,6 +49,9 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
+// 2026-09-06: #4873 — pass 1b accepts a leading `./` (and, same wave, the
+// `../` / `./../` sibling forms + the folded bare-wikilink grammar), so pages
+// whose links were pruned by the sweep reconcile re-extract on `extract --stale`.
 // 2026-08-21: re-bumped for #2367 — normalizeBasename semantics changed
 // (non-Latin scripts kept, accents folded like the slug grammar), so
 // pre-#2367 extractions must re-run to pick up the newly-resolvable links.
@@ -49,7 +66,7 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // PRE-wave code after this date reads as fresh and won't re-extract until
 // the page is next edited; no fixed watermark can cover code that keeps
 // running past it.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-08-21T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-09-06T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -91,6 +108,15 @@ export interface EntityRef {
    * — the reason subtree-scoped / nested brains got zero cross-dir edges.
    */
   upLevels?: number;
+  /**
+   * #3190: set for a same-directory markdown link — `[Name](slug.md)` with
+   * no directory segment and no scheme. `slug` holds the target basename
+   * (`.md` stripped); the caller (`extractPageLinks`) resolves it against
+   * the LINKING page's directory, mirroring the FS path's `resolveSlug`.
+   * Pre-fix these refs were silently dropped (pass 1 requires `dir/`),
+   * so flat directories and sibling links produced zero DB-path edges.
+   */
+  sameDir?: boolean;
 }
 
 /**
@@ -211,6 +237,24 @@ const WIKILINK_GENERIC_RE = /\[\[([^|\]#\n[]+?)(?:#[^|\]]*?)?(?:\|([^\]]+?))?\]\
  * span out of the 2c scan so a wikilink inside a markdown label is inert.
  */
 const MARKDOWN_LABEL_WIKILINK_RE = /\[[^\]\n]*\[\[[^\]\n]+\]\][^\]\n]*\]\([^)\n]+\)/g;
+
+/**
+ * #3190: same-directory markdown link — `[Name](slug.md)` whose target has
+ * NO directory segment and NO scheme/anchor (`/`, `:`, `#` all excluded).
+ * #4873: an explicit `./` prefix (`[Name](./slug.md)`, `[Name](./sub/x.md)`)
+ * is the same page-dir-relative intent — the FS walker's join() eats it — so
+ * the relative arm admits `/` in the tail. The arm takes ANY leading run of
+ * `./` / `../` segments (`[Name](../slug.md)`, `[Name](./../slug.md)`): pass 1
+ * only claims `../` targets that carry a directory segment, so a parent-dir
+ * sibling link had no DB candidate at all while the FS walker's join() linked
+ * it — the sweep reconcile then pruned the edge (same class as #4873).
+ * Captures: name, dot-prefix run, relative tail, bare tail. The `.md` suffix
+ * is REQUIRED (mirrors the FS extractor's mdPattern) so bare parenthetical
+ * prose (`[sic](reference)`) never produces a ref. Resolution against the
+ * linking page's directory happens in extractPageLinks (this module has no
+ * page context here).
+ */
+const SAME_DIR_MD_RE = /\[([^\]]+)\]\((?:((?:\.{1,2}\/)+)([^):#\s]+?)|([^)/:#\s]+?))\.md\)/g;
 
 /**
  * A code-reference found in markdown prose. Created by extractCodeRefs and
@@ -349,6 +393,30 @@ export function extractEntityRefs(content: string): EntityRef[] {
     markdownRanges.push([match.index, match.index + match[0].length]);
   }
 
+  // 1b. #3190/#4873: same-directory markdown links — `[Name](slug.md)`,
+  //     `[Name](./slug.md)`, `[Name](../slug.md)` (no scheme). Pass 1 requires
+  //     a `dir/` segment, so sibling and dot-relative links were silently
+  //     dropped on the DB path while the FS walker (extractMarkdownLinks →
+  //     resolveSlug) linked them. Tagged `sameDir: true`; the `..` depth of
+  //     the prefix rides on `upLevels` and extractPageLinks resolves against
+  //     the page's dir. A `../dir/x.md` span pass 1 already claimed is skipped
+  //     so the two passes never double-emit.
+  const sameDirPattern = new RegExp(SAME_DIR_MD_RE.source, SAME_DIR_MD_RE.flags);
+  while ((match = sameDirPattern.exec(stripped)) !== null) {
+    const at = match.index;
+    if (markdownRanges.some(([s, e]) => at >= s && at < e)) continue;
+    const name = match[1];
+    let target = match[3] ?? match[4];
+    if (target.includes('%')) {
+      try { target = decodeURIComponent(target); } catch { /* keep raw */ }
+    }
+    const ref: EntityRef = { name, slug: target, dir: '', sameDir: true };
+    const ups = match[2] ? match[2].split('/').filter(seg => seg === '..').length : 0;
+    if (ups) ref.upLevels = ups;
+    refs.push(ref);
+    markdownRanges.push([at, at + match[0].length]);
+  }
+
   // 2a. v0.17.0 qualified wikilinks: [[source-id:path]] or [[source-id:path|Display]]
   //     Must run BEFORE the unqualified pass or we'd double-emit. We also
   //     mask out the matched spans so pass 2b can't grab them.
@@ -356,7 +424,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
   const qualPattern = new RegExp(QUALIFIED_WIKILINK_RE.source, QUALIFIED_WIKILINK_RE.flags);
   while ((match = qualPattern.exec(stripped)) !== null) {
     const sourceId = match[1];
-    let slug = match[2].trim();
+    let slug = stripEscapedPipeTail(match[2].trim());
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
@@ -372,7 +440,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
   const unmasked = maskRanges(stripped, qualifiedRanges);
   const wikiPattern = new RegExp(WIKILINK_RE.source, WIKILINK_RE.flags);
   while ((match = wikiPattern.exec(unmasked)) !== null) {
-    let slug = match[1].trim();
+    let slug = stripEscapedPipeTail(match[1].trim());
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.endsWith('.md')) slug = slug.slice(0, -3);
@@ -403,7 +471,7 @@ export function extractEntityRefs(content: string): EntityRef[] {
   );
   const genericPattern = new RegExp(WIKILINK_GENERIC_RE.source, WIKILINK_GENERIC_RE.flags);
   while ((match = genericPattern.exec(genericMasked)) !== null) {
-    let slug = match[1].trim();
+    let slug = stripEscapedPipeTail(match[1].trim());
     if (!slug) continue;
     if (slug.includes('://')) continue;
     if (slug.includes(':')) continue; // qualified-syntax token; 2a owns these
@@ -414,6 +482,20 @@ export function extractEntityRefs(content: string): EntityRef[] {
   }
 
   return refs;
+}
+
+/**
+ * #4062: strip the trailing backslash(es) an escaped pipe leaves on a
+ * wikilink target. Inside a markdown table cell the pipe separating the
+ * target from its display alias MUST be escaped (`[[dir/slug\|Alias]]`,
+ * Obsidian's own table syntax) or it would end the cell. The wikilink
+ * slug captures stop at the literal `|`, so the escape backslash lands as
+ * the final character of the captured target — a slug shape that can
+ * never match a real page. Slugs never legitimately contain backslashes,
+ * so stripping the trailing run is lossless. Applied to passes 2a/2b/2c.
+ */
+function stripEscapedPipeTail(slug: string): string {
+  return slug.replace(/\\+$/, '');
 }
 
 /**
@@ -522,12 +604,59 @@ export async function extractPageLinks(
   frontmatter: Record<string, unknown>,
   pageType: PageType,
   resolver: SlugResolver,
-  opts: { globalBasename?: boolean; skipFrontmatter?: boolean } = {},
+  opts: { globalBasename?: boolean; skipFrontmatter?: boolean; pack?: LinkExtractionPack | null } = {},
 ): Promise<PageLinksResult> {
   const candidates: LinkCandidate[] = [];
 
+  // #3190: pack-aware verb inference. Pack-declared verbs win (page-type
+  // bindings, then pack regexes under the shared per-page ReDoS budget);
+  // the in-code inferLinkType stays the fall-through for everything the
+  // pack doesn't claim — matching the resolution order extract-ner already
+  // ships (schema-pack/link-inference.ts header). Pre-fix a user pack's
+  // `link_types[].inference.regex` (e.g. parent_of) was silently ignored
+  // here and every such edge landed as 'mentions'.
+  const pack = opts.pack ?? null;
+  const packBudget = pack ? new PageRegexBudget() : undefined;
+  const typeFor = (ctx: string, targetSlug: string): string => {
+    if (pack) {
+      const packVerb = inferLinkTypeFromPack(pack, pageType as string, ctx, packBudget);
+      if (packVerb) return packVerb;
+    }
+    return inferLinkType(pageType, ctx, content, targetSlug);
+  };
+
   // 1. Markdown entity refs.
   for (const ref of extractEntityRefs(content)) {
+    // #3190: same-directory markdown link — resolve against THIS page's
+    // directory (the FS path's resolveSlug does exactly this via
+    // join(fileDir, target)). Slugified through the sync grammar so
+    // `[Alice](Alice%20Chen.md)` reaches `people/alice-chen`. Downstream
+    // existence checks drop targets that aren't pages.
+    if (ref.sameDir) {
+      const segs = slug.includes('/') ? slug.split('/').slice(0, -1) : [];
+      // `../` / `./../` prefixes (upLevels) and any mid-path `.`/`..` fold
+      // the way the FS walker's join() does; a run that would climb above
+      // the root is a dangling link there too, so it yields no candidate.
+      let climbed = false;
+      for (const seg of ('../'.repeat(ref.upLevels ?? 0) + ref.slug).split('/')) {
+        if (seg === '' || seg === '.') continue;
+        if (seg !== '..') { segs.push(seg); continue; }
+        if (segs.length === 0) { climbed = true; break; }
+        segs.pop();
+      }
+      const target = climbed ? '' : slugifyPath(segs.join('/'));
+      if (target && target !== slug) {
+        const idx = content.indexOf(ref.name);
+        const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
+        candidates.push({
+          targetSlug: target,
+          linkType: typeFor(context, target),
+          context,
+          linkSource: 'markdown',
+        });
+      }
+      continue;
+    }
     // Issue #972: refs from the generic `[[bare-name]]` pass carry the
     // literal wikilink text, not a real page slug. When global_basename
     // mode is on AND the resolver implements basename lookup, resolve
@@ -551,10 +680,39 @@ export async function extractPageLinks(
         const litContext = litIdx >= 0 ? excerpt(content, litIdx, 240) : ref.name;
         candidates.push({
           targetSlug: ref.slug,
-          linkType: inferLinkType(pageType, litContext, content, ref.slug),
+          linkType: typeFor(litContext, ref.slug),
           context: litContext,
           linkSource: 'markdown',
         });
+      }
+      // #4062: a bare `[[name]]` (no slash) gets a direct verb-typed
+      // candidate for its root-exact slugified form, emitted regardless of
+      // the global_basename flag — mirroring the FS path, where resolveSlug's
+      // ancestor walk resolves `[[x]]` to a root page `x` before the
+      // basename fallback ever runs. Pre-fix the DB path dropped these
+      // entirely flag-off (0 candidates) while the FS path linked them.
+      // Downstream existence checks (resolveCandidateSources / put_page's
+      // allSlugs filter / addLinksBatch's INNER JOINs) drop the candidate
+      // when no root page exists, exactly as for slash-shaped refs above.
+      // #4855 twin: both slug grammars — sync's slugifyPath keeps stroke
+      // letters (`đuc-example`), normalizeBasename folds them (`duc-example`)
+      // — so `[[Đức Example]]` reaches whichever root page exists with the
+      // flag off. Exact slugs only; downstream existence checks drop the miss.
+      const bareDirect = new Set<string>();
+      if (slashIdx === -1) {
+        for (const form of new Set([slugifyPath(ref.slug), normalizeBasename(ref.slug)])) {
+          // Self-loop guard: `[[own-basename]]` on the root page itself.
+          if (!form || form === slug) continue;
+          bareDirect.add(form);
+          const litIdx = content.indexOf(ref.slug);
+          const litContext = litIdx >= 0 ? excerpt(content, litIdx, 240) : ref.name;
+          candidates.push({
+            targetSlug: form,
+            linkType: typeFor(litContext, form),
+            context: litContext,
+            linkSource: 'markdown',
+          });
+        }
       }
       if (typeof resolver.resolveBasenameMatches !== 'function') continue;
       // Issue #972 (codex): resolve by the wikilink TARGET (ref.slug — the
@@ -579,7 +737,11 @@ export async function extractPageLinks(
         matches = (await resolver.resolveBasenameMatches(tail))
           .filter(m => m !== ref.slug && (m === slugified || m.endsWith(`/${slugified}`)));
       } else if (opts.globalBasename) {
-        matches = await resolver.resolveBasenameMatches(ref.slug);
+        // #4062: exclude the root-exact slugified form — the direct typed
+        // candidate above already covers it (same rule the dir-qualified
+        // branch applies to its raw literal). Keeping it would double-emit.
+        matches = (await resolver.resolveBasenameMatches(ref.slug))
+          .filter(m => !bareDirect.has(m));
       }
       if (matches.length === 0) continue;
       const idx = content.indexOf(ref.slug);
@@ -609,7 +771,7 @@ export async function extractPageLinks(
     const targetSlug = resolveRelativeSlug(slug, ref);
     candidates.push({
       targetSlug,
-      linkType: inferLinkType(pageType, context, content, targetSlug),
+      linkType: typeFor(context, targetSlug),
       context,
       linkSource: 'markdown',
     });
@@ -643,7 +805,7 @@ export async function extractPageLinks(
     const context = excerpt(strippedContent, m.index, 240);
     candidates.push({
       targetSlug: m[1],
-      linkType: inferLinkType(pageType, context, content, m[1]),
+      linkType: typeFor(context, m[1]),
       context,
       linkSource: 'markdown',
     });
@@ -659,7 +821,7 @@ export async function extractPageLinks(
   // path needed `resolveBasenameMatches` on the real resolver.
   let fmUnresolved: UnresolvedFrontmatterRef[] = [];
   if (!opts.skipFrontmatter) {
-    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver, opts.globalBasename);
+    const fm = await extractFrontmatterLinks(slug, pageType, frontmatter, resolver, opts.globalBasename, pack);
     candidates.push(...fm.candidates);
     fmUnresolved = fm.unresolved;
   }
@@ -951,14 +1113,24 @@ export interface SlugResolver {
  * build/query through these two functions so they cannot drift.
  *
  * Keying: raw tail + lowercase tail + slugified tail (the final `/`-segment,
- * or the whole slug when it has no `/`). #2367: slugified keys mirror
+ * or the whole slug when it has no `/`). #2367: slugified keys follow
  * slugifySegment (NFD → strip accents → NFC → lowercase → SLUG_WORD_CHARS
- * filter); the old ASCII-only strip emptied CJK basenames.
+ * filter) and then fold stroke letters through latin-fold (#4855), so for
+ * names with đ/ø/ł/ß… the key is NOT byte-identical to the page slug sync
+ * mints; the dir-hint candidate step (makeResolver step 2, the FS resolver)
+ * tries both forms. The old ASCII-only strip emptied CJK basenames.
  */
 const BASENAME_KEEP_RE = new RegExp(`[^${SLUG_WORD_CHARS}\\s\\-]`, 'gu');
 export function normalizeBasename(s: string): string {
-  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC')
-    .toLowerCase().replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-');
+  // The accent strip cannot fold stroke letters \u2014 Unicode gives them no
+  // decomposition \u2014 so the shared table runs after it, on both the index and
+  // the query side. Without it a display name keeps the unfolded letter while
+  // the ASCII page slug does not, and the lookup misses in silence:
+  // `[[\u0110\u1ee9c Example]]` keyed `\u0111uc-example` and never found `people/duc-example`.
+  const folded = foldNonDecomposingLatin(
+    s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').normalize('NFC').toLowerCase(),
+  );
+  return folded.replace(BASENAME_KEEP_RE, '').trim().replace(/\s+/g, '-');
 }
 
 /** Stable order: shorter slug first (likely closer to brain root), then lexical. */
@@ -1085,15 +1257,21 @@ export function makeResolver(
         }
       }
 
-      // Step 2: dir-hint + slugify → exact getPage
-      const slugified = normalizeBasename(trimmed); // #2367: shared normalizer
+      // Step 2: dir-hint + slugify → exact getPage. Two grammars (#4855):
+      // normalizeBasename (#2367) folds stroke letters to ASCII via latin-fold,
+      // while slugifySegment — the page-slug grammar sync mints — keeps them
+      // (#3417), so a page synced from `Đức Example.md` lives at the unfolded
+      // slug. Exact lookups only, so trying both can never false-positive.
+      const forms = new Set([normalizeBasename(trimmed), slugifySegment(trimmed)]);
       for (const hint of hints) {
         if (!hint) continue;
-        const candidate = `${hint}/${slugified}`;
-        const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
-        if (page) {
-          cache.set(cacheKey, candidate);
-          return candidate;
+        for (const form of forms) {
+          const candidate = `${hint}/${form}`;
+          const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+          if (page) {
+            cache.set(cacheKey, candidate);
+            return candidate;
+          }
         }
       }
 
@@ -1186,11 +1364,34 @@ export async function extractFrontmatterLinks(
   frontmatter: Record<string, unknown>,
   resolver: SlugResolver,
   globalBasename = false,
+  pack?: LinkExtractionPack | null,
 ): Promise<FrontmatterExtractResult> {
   const candidates: LinkCandidate[] = [];
   const unresolved: UnresolvedFrontmatterRef[] = [];
 
-  for (const mapping of FRONTMATTER_LINK_MAP) {
+  // #3190: append pack-declared frontmatter_links as OUTGOING mappings.
+  // Pre-fix a pack's `frontmatter_links` table (e.g. `parents:` →
+  // parent_of) was dead weight — only the hardcoded FRONTMATTER_LINK_MAP
+  // ever ran, so pack-declared fields produced 0 candidates. Field → verb
+  // resolution goes through frontmatterLinkTypeFromPack (first matching
+  // pack rule for this page type wins, the helper's documented contract).
+  // Built-ins keep their table order; pack mappings run after, and the
+  // final within-page dedup collapses exact duplicates.
+  const packMappings: FrontmatterFieldMapping[] = [];
+  if (pack && pack.frontmatter_links.length > 0) {
+    const seenFields = new Set<string>();
+    for (const fl of pack.frontmatter_links) {
+      for (const field of fl.fields) {
+        if (seenFields.has(field)) continue;
+        seenFields.add(field);
+        const type = frontmatterLinkTypeFromPack(pack, pageType as string, field);
+        if (!type) continue; // no pack rule for this page type
+        packMappings.push({ fields: [field], type, direction: 'outgoing', dirHint: '' });
+      }
+    }
+  }
+
+  for (const mapping of [...FRONTMATTER_LINK_MAP, ...packMappings]) {
     if (mapping.pageType && mapping.pageType !== pageType) continue;
     for (const field of mapping.fields) {
       const value = frontmatter[field];
@@ -1276,15 +1477,59 @@ export interface TimelineCandidate {
   summary: string;
   /** Optional detail (subsequent lines until next entry/heading). */
   detail: string;
+  /**
+   * #3957: source label. Pipe-separated bullets split `Source — Summary`
+   * (via findTimelineSourceDelimiter, the SAME split the FS extractor in
+   * timeline-extract.ts applies), inline citations carry their `[Source: X]`
+   * label, everything else defaults to 'markdown'. Pre-fix the DB path left
+   * this unset, so callers wrote source='' while the FS path wrote the split
+   * label + trimmed summary — the (page_id, date, summary, source) dedup
+   * index saw two shapes for the same bullet and every FS-then-DB (or
+   * DB-then-FS) re-extraction duplicated the row.
+   */
+  source?: string;
+}
+
+/**
+ * #3957 (moved from timeline-extract.ts so BOTH parsers share it): index of
+ * the first dash (—, –, -) that can serve as the `Source — Summary`
+ * delimiter: it must have whitespace on both sides and sit outside every
+ * markdown-link span. Hyphens inside link targets
+ * (`../people/alice-example.md`) and dashes inside link labels
+ * (`[Deals — Q1 Review](...)`) are content, not delimiters — splitting on
+ * them shatters one entry into two fragments whose halves re-insert on
+ * every sync (the (page_id, date, summary, source) uniqueness sees each
+ * fragment shape as a new row). Returns -1 when the line has no delimiter.
+ */
+export function findTimelineSourceDelimiter(text: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '[' || c === '(') depth++;
+    else if (c === ']' || c === ')') { if (depth > 0) depth--; }
+    else if (
+      depth === 0 &&
+      (c === '—' || c === '–' || c === '-') &&
+      i > 0 && /\s/.test(text[i - 1]) &&
+      i + 1 < text.length && /\s/.test(text[i + 1])
+    ) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 // Match: `- **YYYY-MM-DD** | summary` or `- **YYYY-MM-DD** -- summary`
 // or `- **YYYY-MM-DD** - summary` or just `**YYYY-MM-DD** | summary`.
-const TIMELINE_LINE_RE = /^\s*-?\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[|\-–—]+\s*(.+?)\s*$/;
+// #3957: the separator run is captured so the parser can apply the
+// `Source — Summary` split ONLY to pipe-separated bullets (the canonical
+// shape the FS extractor matches); a dash-separated bullet's rest is one
+// summary and must not be shattered on its first interior dash.
+const TIMELINE_LINE_RE = /^\s*-?\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*([|\-–—]+)\s*(.+?)\s*$/;
 // Chinese date lines: `- 2020年1月2日 | summary` (bold optional). Requires the
 // 年/月 markers so plain ASCII `- 2020-01-02 - text` does NOT match — non-bold
 // ASCII dates were never timeline entries and must stay that way.
-const TIMELINE_LINE_RE_CN = /^\s*-?\s*(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*[|\-–—]+\s*(.+?)\s*$/;
+const TIMELINE_LINE_RE_CN = /^\s*-?\s*(?:\*\*)?(\d{4})年(\d{1,2})月(\d{1,2})日?(?:\*\*)?\s*([|\-–—]+)\s*(.+?)\s*$/;
 
 /**
  * Parse timeline entries from content. Looks at:
@@ -1305,17 +1550,43 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
     const m = TIMELINE_LINE_RE.exec(lines[i]);
     let date: string;
     let summary: string;
+    let separator: string;
     if (m) {
       date = m[1];
-      summary = m[2].trim();
+      separator = m[2];
+      summary = m[3].trim();
     } else {
       const cm = TIMELINE_LINE_RE_CN.exec(lines[i]);
       if (!cm) { i++; continue; }
       // Normalize Chinese date to YYYY-MM-DD
       date = `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}`;
-      summary = cm[4].trim();
+      separator = cm[4];
+      summary = cm[5].trim();
     }
     if (!isValidDate(date) || summary.length === 0) { i++; continue; }
+    // #4277: backlink materialization historically wrote dated navigation
+    // receipts such as `- **2026-06-13** | Referenced in [Acme](../companies/acme.md)`.
+    // The date belongs to the backlink write, not to an event involving this
+    // entity — treating it as timeline evidence both invents event dates and
+    // lets graph-maintenance noise satisfy timeline coverage. Guard on the
+    // PRE-split rest (must START with the marker) so a write-through rendered
+    // `source — summary` bullet whose summary merely mentions the phrase is
+    // untouched. Mirrored in extractTimelineFromContent (timeline-extract.ts)
+    // so FS- and DB-side extraction stay in lockstep.
+    if (/^Referenced in\s+\[/i.test(summary)) { i++; continue; }
+    // #3957: pipe-separated bullets carry the canonical `Source — Summary`
+    // shape; split them exactly like the FS extractor (extractTimelineFromContent
+    // Format 1) so FS- and DB-extracted rows share one (source, summary) shape
+    // and the DB dedup index collapses re-extractions instead of duplicating.
+    // Dash-separated bullets (`- **DATE** - text`) are one summary — no split.
+    let source = 'markdown';
+    if (separator.includes('|')) {
+      const at = findTimelineSourceDelimiter(summary);
+      if (at >= 0) {
+        source = summary.slice(0, at).trim();
+        summary = summary.slice(at + 1).trim();
+      }
+    }
     // Collect optional detail lines (indented, until next date or heading).
     const detailLines: string[] = [];
     let j = i + 1;
@@ -1338,7 +1609,7 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
       }
       break;
     }
-    result.push({ date, summary, detail: detailLines.join(' ').trim() });
+    result.push({ date, summary, detail: detailLines.join(' ').trim(), source });
     i = j;
   }
 
@@ -1352,7 +1623,10 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   for (const entry of parseInlineCitationTimelineEntries(content, {
     skipLine: (line) => TIMELINE_LINE_RE.test(line) || TIMELINE_LINE_RE_CN.test(line),
   })) {
-    result.push({ date: entry.date, summary: entry.summary, detail: `Source: ${entry.source}` });
+    // #3957: carry the citation's source label in `source` (the dedup-key
+    // column) so the row shape matches the FS extractor's Format 3; the
+    // human-readable detail is kept for existing consumers.
+    result.push({ date: entry.date, summary: entry.summary, detail: `Source: ${entry.source}`, source: entry.source });
   }
   return result;
 }
@@ -1461,6 +1735,45 @@ export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<bool
     return ['1', 'true', 'yes', 'on'].includes(normalized);
   }
   const val = await engine.getConfig('link_resolution.global_basename');
+  if (val == null) return false;
+  const normalized = val.trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
+
+/**
+ * Read the `link_resolution.cross_source` config flag. Defaults to FALSE
+ * (opt-in only; the historical same-source-or-'default' edge gate is
+ * preserved for existing brains).
+ *
+ * When TRUE: a wikilink whose target slug exists ONLY in other sources
+ * (neither the origin page's source nor 'default') still produces an edge,
+ * with `to_source_id` picked deterministically (lexicographically smallest
+ * matching source). When FALSE, those candidates are dropped — but counted
+ * and surfaced in the extract summary, never silent (issue #2589: the drop
+ * was previously indistinguishable from an unresolved link).
+ *
+ * SCOPE: the DB extract paths (`extract links --source db`, `extract --stale`),
+ * the mention scan (`findMentionedEntities` callers lift their guard under it),
+ * and the serve-resident maintenance sweep (`sweep.ts`, #3757 — it threads the
+ * same flag so its reconcile keeps the edges the CLI lanes created).
+ * The FS-walk paths (dir-driven, incl. the autopilot cycle's extract phase)
+ * build their slug set from the walked files of ONE source, so cross-source
+ * targets aren't resolvable there; FS-walk parity is a filed follow-up.
+ *
+ * Resolution order (highest → lowest):
+ *   1. Env var `GBRAIN_LINK_RESOLUTION_CROSS_SOURCE=1` (operator override)
+ *   2. DB plane via `engine.getConfig('link_resolution.cross_source')`
+ *   3. Default false
+ *
+ * Closes https://github.com/garrytan/gbrain/issues/2589.
+ */
+export async function isCrossSourceLinksEnabled(engine: BrainEngine): Promise<boolean> {
+  const envVal = process.env.GBRAIN_LINK_RESOLUTION_CROSS_SOURCE;
+  if (envVal != null) {
+    const normalized = envVal.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  const val = await engine.getConfig('link_resolution.cross_source');
   if (val == null) return false;
   const normalized = val.trim().toLowerCase();
   return ['1', 'true', 'yes', 'on'].includes(normalized);

@@ -44,8 +44,10 @@ import { chat as gatewayChat, getChatModel, probeChatModel } from '../ai/gateway
 import { createGlobalLlmHaltTracker, haltedClassOf, type GlobalLlmErrorClass } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
-import { upsertExtractRollup } from '../extract/rollup-writer.ts';
+import { upsertExtractRollup, classifyRunStop } from '../extract/rollup-writer.ts';
 import { GBrainError } from '../types.ts';
+import { isConfigTruthy } from '../config.ts';
+import { TAKE_KIND_VALUES } from '../takes-fence.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
@@ -55,7 +57,7 @@ import type { PhaseStatus, CyclePhase } from '../cycle.ts';
  * verdicts in `take_proposals` (composite key includes prompt_version) stay
  * valid as audit history; new runs re-spend LLM tokens on every page.
  */
-export const PROPOSE_TAKES_PROMPT_VERSION = 'v0.36.1.0-tuned-cat15';
+export const PROPOSE_TAKES_PROMPT_VERSION = 'v0.36.1.0-tuned-cat15-kinds4736';
 
 /**
  * Sentinel claim_text for the tombstone row written when a page extracts
@@ -89,8 +91,15 @@ export const EMPTY_EXTRACTION_TOMBSTONE_TEXT = '(no gradeable claims)';
  *     (pure facts, direct quotes, restatements).
  *   - conviction inference rules anchored to specific hedging language
  *     ("I bet"/"strong conviction"=0.7-0.85, "I think"/"moderate"=0.5-0.7).
- *   - kind enum kept narrow ('prediction'|'judgment'|'bet') — the v1
- *     stub's 4-tag enum bled into noise classification.
+ *   - kind enum kept narrow — three tags; the v1 stub's 4-tag enum bled
+ *     into noise classification. #4736: the tags now use the fence
+ *     vocabulary parseExtractorOutput accepts ('take'|'bet'|'hunch'); the
+ *     tuned prompt asked for prediction|judgment|bet, which the parser
+ *     allowlist (fact|take|bet|hunch) coerced wholesale to 'take',
+ *     destroying kind provenance on every extraction. Label-only change:
+ *     what counts as gradeable is untouched, so the cat15 F1 numbers above
+ *     still describe the extraction behavior. prediction/judgment stay
+ *     mapped in the parser for cached/old-model outputs.
  *
  * Replaces the v0.36.1.0-stub. If you re-tune, run cat15 against the
  * fixtures before bumping PROPOSE_TAKES_PROMPT_VERSION; the train-holdout
@@ -100,10 +109,11 @@ export const EXTRACT_TAKES_PROMPT = `Extract gradeable claims from the prose bel
 
 A "gradeable claim" is a prediction, recommendation, or interpretive judgment
 that could turn out wrong over time. Examples:
-- "X company will hit ARR milestone by Q3" (prediction)
-- "Y founder is going to struggle with execution" (judgment)
-- "Z market will compress in 18 months" (prediction)
+- "X company will hit ARR milestone by Q3" (take: a prediction)
+- "Y founder is going to struggle with execution" (take: a judgment)
+- "Z market will compress in 18 months" (take: a prediction)
 - "I bet alice wins the round" (bet)
+- "Maybe DTC is quietly coming back" (hunch)
 
 NOT gradeable (do NOT extract these):
 - Pure facts ("X was founded in 2020")
@@ -112,7 +122,7 @@ NOT gradeable (do NOT extract these):
 
 For each gradeable claim, output a JSON object with:
 - claim_text   (string, <=200 chars, paraphrase or near-verbatim from prose)
-- kind         ('prediction' | 'judgment' | 'bet')
+- kind         ('take' = prediction or interpretive judgment | 'bet' = explicit wager language | 'hunch' = low-conviction guess)
 - holder       ('world' | 'people/<slug>' | 'companies/<slug>' | 'brain' — default 'brain' when author asserts the claim)
 - weight       (number 0..1 inferred from hedging language: 'I bet'/'strong conviction'=0.7-0.85,
                 'I think'/'moderate conviction'=0.5-0.7, 'maybe'/'I'd guess'=0.3-0.5)
@@ -135,6 +145,14 @@ export interface ProposedTake {
   holder: string;
   weight: number;
   domain?: string;
+  /**
+   * #4737: 'provider:modelId' of the model that ACTUALLY answered the
+   * extraction call (ChatResult.model — alias/provider-recipe resolution
+   * can differ from the configured string). Stamped by defaultExtractor;
+   * optional so injected test extractors need not care. When present it
+   * wins over the requested model for take_proposals.model_id provenance.
+   */
+  served_model?: string;
 }
 
 /** Extractor function signature — injected for tests; production calls gateway. */
@@ -143,6 +161,17 @@ export type ProposeTakesExtractor = (input: {
   pageBody: string;
   existingTakes: Array<{ claim: string; kind: string; holder: string; weight: number }>;
   modelHint?: string;
+  /**
+   * #4494: output cap for the extractor call (default
+   * PROPOSE_TAKES_MAX_TOKENS). Configurable via dream.propose_takes.max_tokens
+   * because thinking models spend reasoning tokens INSIDE maxTokens — at the
+   * 2048 default a thinking model can burn the whole budget before emitting
+   * any JSON, truncating EVERY page into a permanent per-page retry loop.
+   */
+  maxTokens?: number;
+  /** #4494: escalated cap for the one truncation retry (default
+   *  PROPOSE_TAKES_RETRY_MAX_TOKENS; clamped to >= maxTokens). */
+  retryMaxTokens?: number;
 }) => Promise<ProposedTake[]>;
 
 export interface ProposeTakesOpts extends BasePhaseOpts {
@@ -160,6 +189,12 @@ export interface ProposeTakesOpts extends BasePhaseOpts {
   skipPagesWithFence?: boolean;
   /** Override the phase wall-clock deadline (tests). Default: 30 min. */
   deadlineMs?: number;
+  /**
+   * #4102 — `gbrain dream --phase propose_takes --once` bypasses the
+   * `cycle.propose_takes.enabled` off switch for THIS call only (mirrors the
+   * conversation_facts_backfill `once` semantics; never reads/writes config).
+   */
+  once?: boolean;
 }
 
 export interface ProposeTakesResult {
@@ -180,6 +215,14 @@ export interface ProposeTakesResult {
    * hide behind a green summary.
    */
   aborted_global_error?: GlobalLlmErrorClass;
+  /**
+   * #3763: set when the page loop halted because EVERY extractor call failed
+   * (zero successes) for EXTRACTOR_FAILURE_HALT_STREAK consecutive pages —
+   * a dead extractor lane (bad model id, broken recipe, systematic truncation)
+   * that would otherwise re-bill every remaining page. Folds into `halted`
+   * and reports the phase as 'fail'.
+   */
+  aborted_failure_streak?: boolean;
   /** Extractor calls that returned (idempotency cache hits don't count). */
   llm_calls_succeeded: number;
   /** Extractor calls that threw (global or per-page alike). */
@@ -209,7 +252,10 @@ async function listCandidatePages(
   scope: ScopedReadOpts,
   limit: number,
 ): Promise<ProposeTakesPageRow[]> {
-  const where = ['deleted_at IS NULL'];
+  const where = [
+    'deleted_at IS NULL',
+    "type IS DISTINCT FROM 'extract_receipt'",
+  ];
   const params: unknown[] = [];
   if (scope.sourceIds && scope.sourceIds.length > 0) {
     params.push(scope.sourceIds);
@@ -287,6 +333,36 @@ export function extractExistingTakesForDedup(pageBody: string): Array<{
 const EXTRACTOR_CALL_TIMEOUT_MS = 90_000;
 
 /**
+ * #3763 — output caps for the extractor call. A stopReason 'length' response
+ * at the base cap retries ONCE at the escalated cap (facts/extract.ts #2113
+ * parity); a still-truncated retry throws an error NAMING the truncation
+ * instead of the old generic 'transient — retry' (which re-billed the page
+ * every cycle forever while hiding the real cause).
+ *
+ * #4494 — these are now DEFAULTS, overridable via
+ * `dream.propose_takes.max_tokens` / `dream.propose_takes.retry_max_tokens`
+ * (floor 256; retry clamped >= base), mirroring dream.triage.max_tokens.
+ * Thinking models (DeepSeek-R1, MiniMax-M3, Claude with extended thinking)
+ * spend reasoning tokens INSIDE the maxTokens budget, so field deployments
+ * saw every dense page truncate at 2048 → retry at 4096 → truncate again →
+ * throw → re-bill next cycle, forever. Raising the config key breaks that
+ * loop without inflating the default for non-thinking models.
+ */
+export const PROPOSE_TAKES_MAX_TOKENS = 2048;
+export const PROPOSE_TAKES_RETRY_MAX_TOKENS = 4096;
+
+/**
+ * #3763 — halt streak for a dead extractor lane. When EVERY extractor call in
+ * the run has failed (zero successes) and the failure count reaches this
+ * streak, the page loop halts instead of burning an LLM call (and its input
+ * tokens) on every remaining page. Any single success disarms the halt for
+ * the rest of the run — a mixed run is per-page noise, not a dead lane.
+ * Deliberately NO failure tombstone (#3910 policy): failed pages retry next
+ * cycle once the underlying cause clears.
+ */
+export const EXTRACTOR_FAILURE_HALT_STREAK = 5;
+
+/**
  * Production extractor — calls gateway.chat with the EXTRACT_TAKES_PROMPT
  * and parses the JSON array output. Returns [] on parse failure (logged as
  * warning, not thrown — one bad page must not abort the phase).
@@ -303,15 +379,50 @@ export async function defaultExtractor(
     .replace('{EXISTING_TAKES_JSON}', JSON.stringify(input.existingTakes, null, 2))
     .replace('{PAGE_BODY}', input.pageBody);
 
+  // #4494: per-run configurable caps (dream.propose_takes.max_tokens /
+  // .retry_max_tokens), threaded by the phase; the #3763 constants stay as
+  // defaults. Retry is clamped >= base so a partial override can't shrink
+  // the escalation below the first attempt.
+  const baseMaxTokens = Math.max(256, Math.floor(input.maxTokens ?? PROPOSE_TAKES_MAX_TOKENS));
+  const retryMaxTokens = Math.max(
+    baseMaxTokens,
+    Math.floor(input.retryMaxTokens ?? PROPOSE_TAKES_RETRY_MAX_TOKENS),
+  );
+
   // Bound each call so one stalled provider socket can't pin the phase for the
   // full gateway default (GBRAIN_AI_CHAT_TIMEOUT_MS, 300s) x pageLimit. The
   // caller already catches per-page errors, logs a warning, and continues.
-  const result = await gatewayChat({
+  const call = (maxTokens: number) => gatewayChat({
     messages: [{ role: 'user', content: prompt }],
     ...(input.modelHint ? { model: input.modelHint } : {}),
-    maxTokens: 2048,
+    maxTokens,
     abortSignal: AbortSignal.timeout(EXTRACTOR_CALL_TIMEOUT_MS),
   });
+  let result = await call(baseMaxTokens);
+
+  // #3763: a truncated response (stopReason 'length' — e.g. reasoning tokens
+  // eating the cap, or a dense page extracting many claims) produced
+  // unparseable JSON that the ambiguity guard below rethrew as a GENERIC
+  // 'transient — retry', so the page was re-billed at the same too-small cap
+  // every cycle forever. Retry ONCE at the escalated cap (#2113 parity);
+  // still-truncated throws a message that NAMES the truncation so the phase
+  // warning tells the operator what actually happened.
+  if (result.stopReason === 'length') {
+    process.stderr.write(
+      `[propose_takes] WARN: extractor output truncated at maxTokens=${baseMaxTokens} ` +
+      `(${input.pagePath}); retrying once at ${retryMaxTokens}\n`,
+    );
+    result = await call(retryMaxTokens);
+    if (result.stopReason === 'length') {
+      throw new Error(
+        `propose_takes extractor: output truncated (stopReason=length) even at ` +
+        `maxTokens=${retryMaxTokens} on ${input.pagePath} — ` +
+        `page prose extracts more than the cap can carry; raise ` +
+        `dream.propose_takes.max_tokens (thinking models spend reasoning tokens ` +
+        `inside this budget); no tombstone written, page retries next cycle`,
+      );
+    }
+  }
 
   // ChatResult.text is already the concatenated text content.
   const takes = parseExtractorOutput(result.text);
@@ -326,7 +437,11 @@ export async function defaultExtractor(
   if (takes.length === 0 && !isWellFormedEmptyExtraction(result.text)) {
     throw new Error('propose_takes extractor: no parseable takes JSON (transient — retry)');
   }
-  return takes;
+  // #4737: model_id provenance comes from the RESPONSE, not the request —
+  // ChatResult.model is the 'provider:modelId' that actually answered.
+  const servedModel =
+    typeof result.model === 'string' && result.model.trim() !== '' ? result.model : undefined;
+  return servedModel ? takes.map((t) => ({ ...t, served_model: servedModel })) : takes;
 }
 
 /**
@@ -356,11 +471,25 @@ export function isWellFormedEmptyExtraction(raw: string): boolean {
   }
 }
 
+
+/**
+ * #4736: kinds the pre-fix EXTRACT_TAKES_PROMPT asked for. Cached and
+ * old-model outputs still emit them; map them onto the fence vocabulary
+ * deterministically so their provenance classifies instead of relying on
+ * the blind coerce-to-'take' default.
+ */
+const LEGACY_EXTRACTOR_KIND_MAP: Record<string, ProposedTake['kind']> = {
+  prediction: 'take',
+  judgment: 'take',
+};
+
 /**
  * Parse extractor output into ProposedTake[]. Handles common LLM output
  * sins (markdown fence wrapping, leading/trailing prose, single-object
  * instead of array). Returns [] on any unrecoverable parse error rather
- * than throwing.
+ * than throwing. Kind tokens are case/whitespace-normalized, matched
+ * against the fence vocabulary (with the #4736 legacy mapping), and
+ * anything else coerces to 'take'.
  */
 export function parseExtractorOutput(raw: string): ProposedTake[] {
   if (!raw || raw.trim().length === 0) return [];
@@ -402,9 +531,10 @@ export function parseExtractorOutput(raw: string): ProposedTake[] {
     const r = raw as Record<string, unknown>;
     const claim_text = typeof r.claim_text === 'string' ? r.claim_text.trim() : '';
     if (!claim_text || claim_text.length > 500) continue;
-    const kind = ['fact', 'take', 'bet', 'hunch'].includes(r.kind as string)
-      ? (r.kind as ProposedTake['kind'])
-      : 'take';
+    const kindRaw = typeof r.kind === 'string' ? r.kind.trim().toLowerCase() : '';
+    const kind = TAKE_KIND_VALUES.has(kindRaw)
+      ? (kindRaw as ProposedTake['kind'])
+      : (LEGACY_EXTRACTOR_KIND_MAP[kindRaw] ?? 'take');
     const holder = typeof r.holder === 'string' && r.holder.length > 0 ? r.holder : 'brain';
     const weightRaw = typeof r.weight === 'number' ? r.weight : 0.5;
     const weight = Math.max(0, Math.min(1, weightRaw));
@@ -496,6 +626,37 @@ class ProposeTakesPhase extends BaseCyclePhase {
     _ctx: OperationContext,
     opts: ProposeTakesOpts,
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
+    // #4102 — off switch. The phase is ON by default (it ships in the default
+    // phase list), but `gbrain config set cycle.propose_takes.enabled false`
+    // must actually stop the LLM spend. Only an EXPLICIT falsy value skips
+    // (unset = default on, fail-open on read errors so a config-plane blip
+    // never silently disables the phase); `--once` bypasses for one run.
+    if (!opts.once) {
+      let enabledRaw: string | null = null;
+      try {
+        enabledRaw = await engine.getConfig?.('cycle.propose_takes.enabled') ?? null;
+      } catch {
+        enabledRaw = null;
+      }
+      if (enabledRaw != null && !isConfigTruthy(enabledRaw)) {
+        return {
+          summary: 'propose_takes skipped: cycle.propose_takes.enabled=false',
+          details: {
+            reason: 'disabled',
+            enable_hint: 'gbrain config set cycle.propose_takes.enabled true',
+            pages_scanned: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            proposals_inserted: 0,
+            tombstones_written: 0,
+            budget_exhausted: false,
+            warnings: [],
+          },
+          status: 'skipped',
+        };
+      }
+    }
+
     const extractor = opts.extractor ?? defaultExtractor;
     const promptVersion = opts.promptVersion ?? PROPOSE_TAKES_PROMPT_VERSION;
     const pageLimit = opts.pageLimit ?? 100;
@@ -514,6 +675,27 @@ class ProposeTakesPhase extends BaseCyclePhase {
     const proposalRunId = `propose-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${randomUUID().slice(0, 8)}`;
 
     const modelId = opts.model ?? getChatModel();
+
+    // #4494: configurable extractor output caps (dream.triage.max_tokens
+    // precedent — floor 256, retry clamped >= base, fail-open to the #3763
+    // defaults on any config-plane error). Thinking models spend reasoning
+    // tokens inside maxTokens, so the hardcoded 2048/4096 pair put dense
+    // pages into a permanent truncate → retry → truncate → re-bill loop.
+    let extractorMaxTokens = PROPOSE_TAKES_MAX_TOKENS;
+    let extractorRetryMaxTokens = PROPOSE_TAKES_RETRY_MAX_TOKENS;
+    try {
+      const readCap = async (key: string): Promise<number | null> => {
+        const raw = await engine.getConfig?.(key);
+        if (raw == null || String(raw).trim() === '') return null;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : null;
+      };
+      const baseCap = await readCap('dream.propose_takes.max_tokens');
+      if (baseCap != null) extractorMaxTokens = Math.max(256, Math.floor(baseCap));
+      const retryCap = await readCap('dream.propose_takes.retry_max_tokens');
+      if (retryCap != null) extractorRetryMaxTokens = Math.floor(retryCap);
+    } catch { /* keep defaults */ }
+    extractorRetryMaxTokens = Math.max(extractorMaxTokens, extractorRetryMaxTokens);
 
     // With the default (gateway) extractor, skip cheaply when the resolved
     // model's provider can't run — same probe semantics as patterns.ts /
@@ -678,6 +860,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
           pageBody: body,
           existingTakes,
           modelHint: opts.model,
+          // #4494: configurable output caps (see resolution above).
+          maxTokens: extractorMaxTokens,
+          retryMaxTokens: extractorRetryMaxTokens,
         });
       } catch (err) {
         result.llm_calls_failed += 1;
@@ -693,6 +878,22 @@ class ProposeTakesPhase extends BaseCyclePhase {
           break;
         }
         result.warnings.push(detail);
+        // #3763: N consecutive failures with ZERO successes = dead lane.
+        // Halt instead of spending an LLM call on every remaining page. A
+        // single success anywhere in the run keeps llm_calls_succeeded > 0
+        // and permanently disarms this halt (mixed runs are per-page noise).
+        if (
+          result.llm_calls_succeeded === 0 &&
+          result.llm_calls_failed >= EXTRACTOR_FAILURE_HALT_STREAK
+        ) {
+          result.aborted_failure_streak = true;
+          result.warnings.push(
+            `aborting phase at page ${result.pages_scanned}/${pages.length}: ` +
+            `${result.llm_calls_failed} consecutive extractor failures with zero successes — ` +
+            `halting to avoid re-billing every remaining page (no tombstones written; pages retry next cycle)`,
+          );
+          break;
+        }
         continue;
       }
       result.llm_calls_succeeded += 1;
@@ -707,7 +908,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           `INSERT INTO take_proposals
              (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
               claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text::jsonb, $12)
            ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING
            RETURNING id`,
           [
@@ -722,7 +923,9 @@ class ProposeTakesPhase extends BaseCyclePhase {
             p.weight,
             p.domain ?? null,
             JSON.stringify(existingTakes),
-            modelId,
+            // #4737: prefer the response-derived model (what actually
+            // answered) over the requested one for provenance.
+            p.served_model ?? modelId,
           ],
         );
         result.proposals_inserted += inserted.length;
@@ -744,7 +947,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
           `INSERT INTO take_proposals
              (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
               claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'rejected')
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text::jsonb, $12, 'rejected')
            ON CONFLICT (source_id, page_slug, content_hash, prompt_version, md5(claim_text)) DO NOTHING`,
           [
             sourceId,
@@ -788,18 +991,29 @@ class ProposeTakesPhase extends BaseCyclePhase {
         console.error(`[propose_takes] receipt write failed: ${(err as Error).message}`);
       }
     }
-    // A deadline-hit run halted mid-list the same way a budget-exhausted one
-    // does — record it as a halt, not a completed round. A global-error
-    // abort (#3044) is the same posture: the round did not complete.
+    // #4482: three-way stop classification. A budget/deadline cap is the
+    // extractor working as designed (partial progress banked; the rest
+    // drains over future runs) — recorded as expected_limit_delta, a
+    // capacity signal doctor's failure rate excludes. A global-error abort
+    // (#3044) or an all-failures streak (#3763) is a REAL halt, unchanged
+    // from today. An error alongside a cap counts as the error.
+    // `halted` (any incomplete round, caps included) is kept for the phase
+    // result's status/details below — the diagnostic split is rollup-only.
     const halted =
       result.budget_exhausted ||
       result.deadline_hit === true ||
-      result.aborted_global_error !== undefined;
+      result.aborted_global_error !== undefined ||
+      result.aborted_failure_streak === true;
     await upsertExtractRollup(engine, {
       kind: 'takes.proposed',
       source_id: sourceIdForReceipt,
-      round_completed_delta: halted ? 0 : 1,
-      halt_delta: halted ? 1 : 0,
+      ...classifyRunStop({
+        budget_exhausted: result.budget_exhausted === true,
+        deadline_hit: result.deadline_hit === true,
+        error:
+          result.aborted_global_error !== undefined ||
+          result.aborted_failure_streak === true,
+      }),
     });
 
     // Status folds warnings in (the extract_facts precedent from #1928): a
@@ -810,13 +1024,19 @@ class ProposeTakesPhase extends BaseCyclePhase {
     // the autopilot handler deliberately does not throw on partial). A halt
     // after some successes is a partial run → 'warn'.
     const warningCount = result.warnings.length;
+    // #3763: an all-failures streak halt is the same severity as a
+    // zero-success global halt — the whole extractor lane is down.
     const phaseFailed =
-      result.aborted_global_error !== undefined && result.llm_calls_succeeded === 0;
+      (result.aborted_global_error !== undefined && result.llm_calls_succeeded === 0) ||
+      result.aborted_failure_streak === true;
     return {
       summary:
         `propose_takes: scanned ${result.pages_scanned} pages, ${result.cache_hits} cached, ${result.proposals_inserted} new proposals, ${result.tombstones_written} empty (run ${proposalRunId})` +
         (result.aborted_global_error
           ? `; aborted on ${result.aborted_global_error} error after ${result.pages_scanned} page(s)`
+          : '') +
+        (result.aborted_failure_streak
+          ? `; aborted after ${result.llm_calls_failed} consecutive extractor failures (zero successes)`
           : '') +
         (warningCount > 0 ? ` (${warningCount} warning(s))` : ''),
       details: { ...result, halted, proposal_run_id: proposalRunId, prompt_version: promptVersion },

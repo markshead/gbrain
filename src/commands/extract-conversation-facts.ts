@@ -73,7 +73,7 @@ import {
   type ExtractedFact,
 } from '../core/facts/extract.ts';
 import { configureGatewayIfUninitialized, isAvailable, withBudgetTracker } from '../core/ai/gateway.ts';
-import { BudgetTracker, BudgetExhausted } from '../core/budget/budget-tracker.ts';
+import { BudgetTracker, BudgetExhausted, loadPricingOverrides } from '../core/budget/budget-tracker.ts';
 import { listSources } from '../core/sources-ops.ts';
 import {
   loadOpCheckpoint,
@@ -92,9 +92,15 @@ import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.
 import { withRefreshingLock, LockUnavailableError } from '../core/db-lock.ts';
 import { assertFactsEmbeddingDimMatchesConfig } from '../core/embedding-dim-check.ts';
 import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
-import { upsertExtractRollup } from '../core/extract/rollup-writer.ts';
+import { upsertExtractRollup, classifyRunStop } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
 import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../core/facts/audit-sources.ts';
+import {
+  emptySaveTimeResolutionCounts,
+  formatSaveTimeResolutionCounts,
+  mergeSaveTimeResolutionCounts,
+  resolveExtractedEntitiesForSave,
+} from '../core/entities/resolve-on-save.ts';
 
 // Re-exported verbatim so existing importers (this file's own helpers below
 // and this file's tests) keep working unchanged; doctor.ts, jobs.ts,
@@ -366,6 +372,10 @@ export interface ExtractConversationFactsResult {
   segments_processed: number;
   facts_extracted: number;
   facts_inserted: number;
+  /** Entity values that reached the shipped deterministic fallback slug path. */
+  fallback_slugify_count: number;
+  /** Entity values kept raw after a best-effort resolution failure. */
+  resolution_errors: number;
   budget_exhausted?: boolean;
   spent_usd?: number;
 }
@@ -391,7 +401,7 @@ import {
 } from '../core/conversation-parser/parse.ts';
 import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
-import { resolveModel } from '../core/model-config.ts';
+import { resolveModel, resolveTierDefault } from '../core/model-config.ts';
 
 /**
  * v0.41.13.0 — back-compat shape for direct callers + the existing
@@ -1052,6 +1062,7 @@ async function processPage(
   let newestEnd: string | null = null;
   let segmentsThisPage = 0;
   let pageInsertedTotal = 0;
+  const pageResolution = emptySaveTimeResolutionCounts();
 
   for (const seg of segments) {
     if (state.segmentLimit > 0 && segmentsThisPage >= state.segmentLimit) break;
@@ -1103,10 +1114,32 @@ async function processPage(
     segmentsThisPage++;
     state.result.facts_extracted += extracted.length;
 
+    // This bulk path bypasses writeSingleFact and writes through insertFacts.
+    // Canonicalize every extractor-provided entity via the shipped resolver
+    // (alias_exact / prefix / fuzzy / slugify) while source scope is known.
+    const segmentResolution = await resolveExtractedEntitiesForSave(
+      state.engine,
+      state.sourceId,
+      extracted,
+      (raw, message) => {
+        process.stderr.write(
+          `[extract-conversation-facts] ${page.slug} segment ${seg.startIso}..${seg.endIso} ` +
+          `entity resolution failed for ${JSON.stringify(raw)}: ${message}; keeping raw value\n`,
+        );
+      },
+    );
+    const commitSegmentResolutionTelemetry = () => {
+      mergeSaveTimeResolutionCounts(pageResolution, segmentResolution);
+      state.result.fallback_slugify_count += segmentResolution.fallback_slugify_count;
+      state.result.resolution_errors += segmentResolution.resolution_errors;
+    };
+
     if (!state.dryRun && extracted.length > 0) {
-      // Eng-v2 C1 / E11: page-global row_num. Each fact in this batch gets
-      // a unique row_num within (source_id, source_markdown_slug); the
-      // accumulator increments across the segment loop.
+      // Eng-v2 C1 / E11: page-global row_num stays unique across segments.
+      // entity_slug is already canonical here — resolveExtractedEntitiesForSave
+      // (above) ran every fact through the shipped resolver cascade (#3729/#4052),
+      // so master's per-row resolveEntitySlug mapper (#4567's independent fix for
+      // the same issue) is superseded rather than layered on top.
       const rows = extracted.map((fact, i) => ({
         ...fact,
         row_num: rowNum + i,
@@ -1126,9 +1159,11 @@ async function processPage(
       pageInsertedTotal += ins.inserted;
       state.result.facts_inserted += ins.inserted;
       rowNum += extracted.length;
+      commitSegmentResolutionTelemetry();
     } else {
       // dry-run: count for reporting, no DB write.
       rowNum += extracted.length;
+      commitSegmentResolutionTelemetry();
     }
 
     newestEnd = seg.endIso;
@@ -1161,7 +1196,10 @@ async function processPage(
     process.stderr.write(
       `[extract-conversation-facts] ${page.slug} changed during extraction; leaving it unfinished for replay\n`,
     );
-    newestEnd = null;
+    // #4869: no terminal, no checkpoint — this claim did not reach a durable
+    // outcome, so it counts as failed (CLI exit 1 / cycle 'warn'), not processed.
+    state.result.pages_failed++;
+    return { newEndIso: null };
   }
 
   if (!state.dryRun && newestEnd !== null) {
@@ -1174,7 +1212,8 @@ async function processPage(
   }
 
   process.stderr.write(
-    `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments\n`,
+    `[extract-conversation-facts] ${page.slug}: ${pageInsertedTotal} facts inserted across ${segmentsThisPage} segments ` +
+    `entity_resolution_counts=${formatSaveTimeResolutionCounts(pageResolution.counts)}\n`,
   );
 
   state.result.pages_processed++;
@@ -1266,6 +1305,8 @@ export async function runExtractConversationFactsCore(
     segments_processed: 0,
     facts_extracted: 0,
     facts_inserted: 0,
+    fallback_slugify_count: 0,
+    resolution_errors: 0,
   };
 
   // F2: honor brain-wide kill-switch unless overridden.
@@ -1314,7 +1355,8 @@ export async function runExtractConversationFactsCore(
   const llmFallbackModel = llmFallbackEnabled
     ? await resolveModel(engine, {
         tier: 'utility',
-        fallback: 'anthropic:claude-haiku-4-5-20251001',
+        // #3813: last-resort fallback stays key-aware, never hardcoded Anthropic.
+        fallback: resolveTierDefault('utility'),
       })
     : null;
 
@@ -1543,6 +1585,7 @@ export async function runExtractConversationFactsCore(
       const tracker = new BudgetTracker({
         maxCostUsd: opts.maxCostUsd ?? DEFAULT_MAX_COST_USD,
         label: `extract-conversation-facts:${sourceId}`,
+        pricingOverrides: await loadPricingOverrides(engine),
       });
       ownedTracker = tracker;
       try {
@@ -1652,13 +1695,20 @@ async function writeRunReceiptAndRollup(
   // Rollup UPSERT: ALWAYS fire so doctor's extract_health sees the
   // cycle ran (even no-op runs are signal — they prove the extractor
   // was alive). Best-effort per F-OUT-19.
-  const incomplete = halted || result.pages_failed > 0;
+  //
+  // #4482: a run that stopped ONLY because it hit its per-source budget cap
+  // is working as designed (partial progress banked; the backlog drains over
+  // future runs) — record it as expected_limit_delta, not halt_delta, so
+  // doctor's extract_health failure rate stops warning on normal
+  // bigger-backlog-than-budget operation. Per-page failures stay error halts.
   await upsertExtractRollup(engine, {
     kind: 'facts.conversation',
     source_id: sourceId,
     cost_delta: result.spent_usd ?? 0,
-    round_completed_delta: incomplete ? 0 : 1,
-    halt_delta: incomplete ? 1 : 0,
+    ...classifyRunStop({
+      budget_exhausted: halted,
+      error: result.pages_failed > 0,
+    }),
   });
 }
 
@@ -1903,6 +1953,8 @@ export async function runExtractConversationFacts(
     segments_processed: 0,
     facts_extracted: 0,
     facts_inserted: 0,
+    fallback_slugify_count: 0,
+    resolution_errors: 0,
   };
   let totalSpent = 0;
   let anyBudgetExhausted = false;
@@ -1949,6 +2001,8 @@ export async function runExtractConversationFacts(
       aggregate.segments_processed += perSource.segments_processed;
       aggregate.facts_extracted += perSource.facts_extracted;
       aggregate.facts_inserted += perSource.facts_inserted;
+      aggregate.fallback_slugify_count += perSource.fallback_slugify_count;
+      aggregate.resolution_errors += perSource.resolution_errors;
       if (perSource.budget_exhausted) anyBudgetExhausted = true;
       if (perSource.spent_usd) totalSpent += perSource.spent_usd;
 
@@ -1999,6 +2053,12 @@ export async function runExtractConversationFacts(
   if (aggregate.orphan_facts_cleaned > 0) {
     console.log(`  Cleaned ${aggregate.orphan_facts_cleaned} orphan fact(s) from prior partial runs (D11 replay safety).`);
   }
+  if (aggregate.fallback_slugify_count > 0) {
+    console.log(`  Minted ${aggregate.fallback_slugify_count} entity slug(s) via fallback_slugify.`);
+  }
+  if (aggregate.resolution_errors > 0) {
+    console.log(`  Kept ${aggregate.resolution_errors} raw entity value(s) after best-effort resolution errors.`);
+  }
   if (anyBudgetExhausted) {
     console.log(`  Budget cap reached. Re-run with a higher --max-cost-usd to continue.`);
   }
@@ -2037,7 +2097,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isAbortError(err: unknown): boolean {
+export function isAbortError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === 'AbortError' || /aborted|cancell?ed/i.test(err.message);
 }

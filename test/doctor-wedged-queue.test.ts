@@ -51,8 +51,8 @@ async function seed(
   extra: { lockUntilSql?: string; updatedAtSql?: string; createdAtSql?: string } = {},
 ): Promise<void> {
   await base.executeRaw(
-    `INSERT INTO minion_jobs (name, queue, status, lock_until, updated_at, created_at)
-     VALUES ($1, $2, $3, ${extra.lockUntilSql ?? 'NULL'}, ${extra.updatedAtSql ?? 'now()'}, ${extra.createdAtSql ?? 'now()'})`,
+    `INSERT INTO minion_jobs (submission_authority, name, queue, status, lock_until, updated_at, created_at)
+     VALUES ('{"version":1,"kind":"application"}'::jsonb, $1, $2, $3, ${extra.lockUntilSql ?? 'NULL'}, ${extra.updatedAtSql ?? 'now()'}, ${extra.createdAtSql ?? 'now()'})`,
     [name, queue, status],
   );
 }
@@ -94,6 +94,56 @@ describe('issue #1801 fix #3 — computeWedgedQueueCheck', () => {
     expect(check.message).toContain("'default'");
   });
 
+  // #3063: the check must not claim "worker alive" when no worker is
+  // registered for the wedged queue, and must keep the original "worker
+  // alive but stuck" wording when one genuinely is.
+  it('says "No worker subscribed" (not "worker alive") when no live worker is registered for the wedged queue', async () => {
+    await seed('default', 'cycle', 'waiting');
+    await seed('default', 'cycle', 'completed', { updatedAtSql: "now() - interval '20 min'" });
+    const check = await computeWedgedQueueCheck(pgLike, { readWorkers: () => [] });
+    expect(check.status).toBe('fail');
+    expect(check.message).toContain('No worker subscribed');
+    expect(check.message).not.toContain('worker alive but not claiming work');
+  });
+
+  it('keeps "worker alive but not claiming work" when a live worker IS registered for the wedged queue', async () => {
+    await seed('default', 'cycle', 'waiting');
+    await seed('default', 'cycle', 'completed', { updatedAtSql: "now() - interval '20 min'" });
+    const check = await computeWedgedQueueCheck(pgLike, { readWorkers: () => [{ queue: 'default' }] });
+    expect(check.status).toBe('fail');
+    expect(check.message).toContain('worker alive but not claiming work');
+    expect(check.message).not.toContain('No worker subscribed');
+  });
+
+  it('a throwing registry read → still fail, but liveness-unknown wording (no fabricated verdict)', async () => {
+    await seed('default', 'cycle', 'waiting');
+    await seed('default', 'cycle', 'completed', { updatedAtSql: "now() - interval '20 min'" });
+    const check = await computeWedgedQueueCheck(pgLike, {
+      readWorkers: () => { throw new Error('registry dir unreadable'); },
+    });
+    expect(check.status).toBe('fail');
+    expect(check.message).toContain('worker registry unreadable');
+    expect(check.message).not.toContain('worker alive but not claiming work');
+    expect(check.message).not.toContain('No worker subscribed');
+    expect(check.details?.worker_registry_unreadable).toBe(true);
+  });
+
+  it('mixed stuck + no-worker queues → both messages, details count each subset', async () => {
+    await seed('default', 'cycle', 'waiting');
+    await seed('default', 'cycle', 'completed', { updatedAtSql: "now() - interval '20 min'" });
+    await seed('q-orphan', 'cycle', 'waiting');
+    await seed('q-orphan', 'cycle', 'completed', { updatedAtSql: "now() - interval '20 min'" });
+    const check = await computeWedgedQueueCheck(pgLike, { readWorkers: () => [{ queue: 'default' }] });
+    expect(check.status).toBe('fail');
+    expect(check.message).toContain('worker alive but not claiming work');
+    expect(check.message).toContain("'default'");
+    expect(check.message).toContain('No worker subscribed');
+    expect(check.message).toContain("'q-orphan'");
+    expect(check.details?.stuck_worker_queues).toBe(1);
+    expect(check.details?.no_worker_queues).toBe(1);
+    expect(check.details?.wedged_queues).toBe(2);
+  });
+
   it('does NOT flag when a job holds a live lock (active_healthy > 0)', async () => {
     await seed('default', 'cycle', 'waiting');
     await seed('default', 'cycle', 'active', { lockUntilSql: "now() + interval '5 min'" });
@@ -132,9 +182,12 @@ describe('issue #1801 fix #3 — computeWedgedQueueCheck', () => {
   it('shell-escapes an embedded single quote in the restart hint (producer-controlled queue names)', async () => {
     // The hint is copy-pasted by operators AND remediation agents, so a
     // queue named q-wedge'd must arrive POSIX-escaped, never raw.
+    // A live worker must be registered for the queue, or the #3063
+    // liveness split routes this to the "no worker" branch instead,
+    // which never builds the restart-hint string at all.
     await seed("q-wedge'd", 'cycle', 'waiting');
     await seed("q-wedge'd", 'cycle', 'completed', { updatedAtSql: "now() - interval '30 min'" });
-    const check = await computeWedgedQueueCheck(pgLike);
+    const check = await computeWedgedQueueCheck(pgLike, { readWorkers: () => [{ queue: "q-wedge'd" }] });
     expect(check.status).toBe('fail');
     expect(check.message).toContain(String.raw`--queue 'q-wedge'\''d'`);
   });
@@ -144,7 +197,12 @@ describe('issue #1801 fix #3 — computeWedgedQueueCheck', () => {
     await seed('default', 'cycle', 'completed', { updatedAtSql: "now() - interval '30 min'" });
     await seed('q-side', 'cycle', 'waiting');
     await seed('q-side', 'cycle', 'completed', { updatedAtSql: "now() - interval '30 min'" });
-    const check = await computeWedgedQueueCheck(pgLike);
+    // Both queues need a live worker registered so the #3063 liveness
+    // split routes them into the "stuck" branch that builds this
+    // restart-hint union, not the "no worker" branch.
+    const check = await computeWedgedQueueCheck(pgLike, {
+      readWorkers: () => [{ queue: 'default' }, { queue: 'q-side' }],
+    });
     expect(check.status).toBe('fail');
     // The bare pair (for 'default') terminates with a backtick — no --queue —
     // and the comma-join carries the per-queue variant right behind it.
@@ -226,12 +284,12 @@ describe('orphaned private dream queues', () => {
     // Terminal owner + expired lease → the classifier verdict is 'orphan':
     // auto-recovery cancels it at the next worker spawn / cycle start.
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at) VALUES ('parent', 'cycle', 'completed', now() - interval '3 hours')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at) VALUES ('{"version":1,"kind":"application"}'::jsonb, 'parent', 'cycle', 'completed', now() - interval '3 hours')`,
     );
     const owner = await base.executeRaw<{ id: number }>(`SELECT max(id)::int AS id FROM minion_jobs`);
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until)
-       VALUES ('child', 'dream-inline-owned-dead', 'waiting', now() - interval '2 hours', now() - interval '2 hours', $1, 'tok', now() - interval '1 hour')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'child', 'dream-inline-owned-dead', 'waiting', now() - interval '2 hours', now() - interval '2 hours', $1, 'tok', now() - interval '1 hour')`,
       [owner[0].id],
     );
     const check = await computeOrphanedPrivateQueueCheck(pgLike);
@@ -242,8 +300,8 @@ describe('orphaned private dream queues', () => {
 
   it('suppresses a queue whose owner lease is still in the future (live, never flagged)', async () => {
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, private_queue_owner_token, private_queue_lease_until)
-       VALUES ('child', 'dream-inline-leased', 'waiting', now() - interval '2 hours', 'tok', now() + interval '30 min')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, private_queue_owner_token, private_queue_lease_until)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'child', 'dream-inline-leased', 'waiting', now() - interval '2 hours', 'tok', now() + interval '30 min')`,
     );
     const check = await computeOrphanedPrivateQueueCheck(pgLike);
     expect(check.status).toBe('ok');
@@ -259,8 +317,8 @@ describe('orphaned private dream queues — cycle-lock liveness + ownership corr
     extra: { createdAtSql?: string } = {},
   ): Promise<void> {
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, data, created_at)
-       VALUES ($1, $2, $3, $4::text::jsonb, ${extra.createdAtSql ?? 'now()'})`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, data, created_at)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, $1, $2, $3, $4::text::jsonb, ${extra.createdAtSql ?? 'now()'})`,
       ['subagent', queue, status, JSON.stringify(dataJson)],
     );
   }
@@ -382,8 +440,8 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
     // 101 metadata-backed orphan candidates (aged, waiting, expired lease —
     // classifier verdict 'orphan'), one row per queue for speed.
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_lease_until)
-       SELECT 'subagent', 'dream-inline-cap-' || i, 'waiting',
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_lease_until)
+       SELECT '{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-cap-' || i, 'waiting',
               now() - interval '2 hours', now() - interval '2 hours', now() - interval '1 hour'
          FROM generate_series(1, 101) AS i`,
     );
@@ -399,8 +457,8 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
     // the 101st never gets classified. Status stays ok but the message and
     // details must still surface the unclassified remainder.
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_lease_until)
-       SELECT 'subagent', 'dream-inline-live-' || i, 'waiting',
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_lease_until)
+       SELECT '{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-live-' || i, 'waiting',
               now() - interval '2 hours', now(), now() + interval '30 minutes'
          FROM generate_series(1, 101) AS i`,
     );
@@ -415,12 +473,12 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
     // Owner job still waiting (not claimed, no lock) → verdict not_orphan:
     // doctor must say "inspect the owner", never advertise cancellation.
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at) VALUES ('dream-cycle', 'default', 'waiting', now() - interval '3 hours')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at) VALUES ('{"version":1,"kind":"application"}'::jsonb, 'dream-cycle', 'default', 'waiting', now() - interval '3 hours')`,
     );
     const owner = await base.executeRaw<{ id: number }>(`SELECT max(id)::int AS id FROM minion_jobs`);
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token)
-       VALUES ('subagent', 'dream-inline-owner-pending', 'waiting', now() - interval '2 hours', now() - interval '2 hours', $1, 'tok')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-owner-pending', 'waiting', now() - interval '2 hours', now() - interval '2 hours', $1, 'tok')`,
       [owner[0].id],
     );
     const check = await computeOrphanedPrivateQueueCheck(pgLike);
@@ -439,12 +497,12 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
     // the engine-aware remediation must name the dream trigger (a supervisor
     // command is impossible advice — no worker process can ever run there).
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at) VALUES ('dream-cycle', 'default', 'completed', now() - interval '3 hours')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at) VALUES ('{"version":1,"kind":"application"}'::jsonb, 'dream-cycle', 'default', 'completed', now() - interval '3 hours')`,
     );
     const owner = await base.executeRaw<{ id: number }>(`SELECT max(id)::int AS id FROM minion_jobs`);
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until)
-       VALUES ('subagent', 'dream-inline-pglite-recoverable', 'waiting', now() - interval '2 hours', now() - interval '2 hours', $1, 'tok', now() - interval '1 hour')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until)
+       VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-pglite-recoverable', 'waiting', now() - interval '2 hours', now() - interval '2 hours', $1, 'tok', now() - interval '1 hour')`,
       [owner[0].id],
     );
     const check = await computeOrphanedPrivateQueueCheck(base as unknown as BrainEngine);
@@ -457,12 +515,12 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
   it('waiting_jobs counts FLAGGED queues only — live-lease-suppressed waiting rows are excluded (749a7dcb)', async () => {
     // Recoverable orphan with 3 waiting rows (terminal owner, expired lease).
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at) VALUES ('dream-cycle', 'default', 'completed', now() - interval '3 hours')`,
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at) VALUES ('{"version":1,"kind":"application"}'::jsonb, 'dream-cycle', 'default', 'completed', now() - interval '3 hours')`,
     );
     const owner = await base.executeRaw<{ id: number }>(`SELECT max(id)::int AS id FROM minion_jobs`);
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until)
-       SELECT 'subagent', 'dream-inline-orphan-n', 'waiting',
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_owner_job_id, private_queue_owner_token, private_queue_lease_until)
+       SELECT '{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-orphan-n', 'waiting',
               now() - interval '2 hours', now() - interval '2 hours', $1, 'tok', now() - interval '1 hour'
          FROM generate_series(1, 3)`,
       [owner[0].id],
@@ -470,8 +528,8 @@ describe('orphaned private dream queues — classify cap, buckets, flagged-only 
     // Aged candidate suppressed by a live lease, carrying 2 waiting rows that
     // must NOT leak into waiting_jobs (pre-fix it summed N+M during the scan).
     await base.executeRaw(
-      `INSERT INTO minion_jobs (name, queue, status, created_at, updated_at, private_queue_lease_until)
-       SELECT 'subagent', 'dream-inline-lively-m', 'waiting',
+      `INSERT INTO minion_jobs (submission_authority, name, queue, status, created_at, updated_at, private_queue_lease_until)
+       SELECT '{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-lively-m', 'waiting',
               now() - interval '2 hours', now() - interval '2 hours', now() + interval '30 minutes'
          FROM generate_series(1, 2)`,
     );

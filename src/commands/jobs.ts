@@ -1,3 +1,4 @@
+import { authorizeLegacyJobs, parseLegacyJobIds } from '../core/minions/authorize-legacy.ts';
 /**
  * CLI handler for `gbrain jobs` subcommands.
  * Thin wrapper around MinionQueue and MinionWorker.
@@ -8,6 +9,9 @@ import type { FactsBackstopResult } from '../core/facts/backstop.ts';
 // Leaf module (no flag surface of its own) — see that file for why this
 // isn't imported from extract-conversation-facts.ts directly (#4135).
 import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
+import { assertEmbedNotStalled } from '../core/embed-stall.ts';
+import { assertEmbedBackfillQueueAdmission } from '../core/minions/embed-backfill-admission.ts';
+import { isProtectedJobName } from '../core/minions/protected-names.ts';
 import { MinionQueue, deriveWedgeSignal } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
 import {
@@ -15,6 +19,7 @@ import {
   JOB_CHILD_EXIT_USAGE,
 } from '../core/minions/worker-exit-codes.ts';
 import { CHILD_ENV, resolveChildCliInvocation } from '../core/minions/job-isolation.ts';
+import { withFactsAbsorbHaltCooldown } from '../core/minions/llm-halt-cooldown.ts';
 import { runChildJobEntry } from '../core/minions/run-child.ts';
 import type { MinionHandler, MinionJob, MinionJobStatus } from '../core/minions/types.ts';
 import type { PaceKeyOverrides } from '../core/pace-mode.ts';
@@ -90,6 +95,12 @@ export function factsAbsorbShouldRetry(
   return classification === 'keyed' && factsAbsorbUnavailable(result);
 }
 
+// Job names whose handlers call the LLM gateway: registerBuiltinJob wraps
+// them with refreshGatewayForJob so file-plane keys + DB-plane model config
+// reach a long-lived worker. Drift guard: test/jobs-gateway-refresh-set.test.ts
+// pins this set against the registerBuiltinJob call sites — a gateway-using
+// handler registered via bare worker.register() runs with a stale gateway
+// (the #3387 chronicle_extract silent-no_events class).
 const GATEWAY_REFRESH_JOB_NAMES = new Set([
   'embed',
   'extract-conversation-facts',
@@ -103,8 +114,20 @@ const GATEWAY_REFRESH_JOB_NAMES = new Set([
   'extract_facts',
   'extract-atoms-drain',
   'embed-backfill',
+  // connector-sync's PGLite embed kickoff calls runEmbedCore inline (the
+  // embedding gateway), so it must see a refreshed gateway config like the
+  // other embed jobs — otherwise a worker booted before `config set` embeds
+  // nothing on the catch-up.
+  'connector-sync',
   'extract-takes-from-pages',
   'embed-catch-up',
+  // #3387: chronicle_extract's judge is a gateway chat call — without the
+  // refresh a worker booted before `config set` never saw the DB-plane chat
+  // model and every extraction silently returned no_events.
+  'chronicle_extract',
+  // Open-loop commitment extraction (google source kind): same judge shape
+  // as chronicle_extract, same stale-gateway failure class.
+  'loops_extract',
 ]);
 
 function registerBuiltinJob(
@@ -333,6 +356,7 @@ export function formatJobDetail(job: MinionJob): string {
 const JOBS_HELP = `gbrain jobs — Minions job queue
 
 USAGE
+  gbrain jobs authorize-legacy --ids 12,34 [--expect <snapshot_digest> --yes] [--json]
   gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
                             [--delay Nms] [--max-attempts N] [--max-stalled N]
                             [--max-waiting N]
@@ -547,6 +571,16 @@ OPTIONS
   --refresh-ms=N   Refresh cadence in ms (default 1000). Equals form only —
                    'watch' does not accept a space-separated value.
 `,
+  'authorize-legacy': `gbrain jobs authorize-legacy — review old queued work locally
+
+USAGE
+  gbrain jobs authorize-legacy --ids 12,34 --json
+  gbrain jobs authorize-legacy --ids 12,34 --expect <snapshot_digest> --yes --json
+
+Stop producers and workers and drain active jobs first. The first command only
+previews; apply requires the exact reviewed snapshot digest and --yes. Dependencies
+are shown but never implicitly authorized. IDs, data, schedule and retries persist.
+`,
   prune: `gbrain jobs prune — delete old terminal jobs
 
 USAGE
@@ -623,8 +657,15 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
   const queue = new MinionQueue(engine);
 
   switch (sub) {
+    case 'authorize-legacy': {
+      const ids = parseLegacyJobIds(parseFlag(args, '--ids'));
+      const preview = args.includes('--dry-run');
+      const result = await authorizeLegacyJobs(engine, ids, preview ? undefined : parseFlag(args, '--expect'), !preview && args.includes('--yes'));
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     case 'submit': {
-      const name = args[1];
+      const name = args[1]?.trim();
       if (!name) {
         console.error('Error: job name required. Usage: gbrain jobs submit <name>');
         process.exit(1);
@@ -677,12 +718,18 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       const queueName = parseFlag(args, '--queue') ?? 'default';
       const dryRun = hasFlag(args, '--dry-run');
       const follow = hasFlag(args, '--follow');
-      // v0.36.5.0: --redact-secrets is a CLI convenience that merges
-      // `redact_secrets: true` into the params before validation. Equivalent
-      // to passing it in --params JSON; flag form is faster to type.
-      if (hasFlag(args, '--redact-secrets') && name.trim() === 'shell') {
+      // v0.36.5.0: --redact-secrets merges the equivalent --params JSON convenience.
+      if (hasFlag(args, '--redact-secrets') && name === 'shell') {
         data.redact_secrets = true;
       }
+
+      // Dry-run reports real admission; follow starts and awaits an inline worker.
+      const trusted = {
+        ...(isProtectedJobName(name) ? { allowProtectedSubmit: true } : {}),
+        ...(follow && name === 'embed-backfill' ? { allowPgliteInlineWorker: true } : {}),
+      };
+      try { assertEmbedBackfillQueueAdmission(engine, name, data, trusted); }
+      catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
       if (dryRun) {
         console.log(`[DRY RUN] Would submit job:`);
@@ -708,25 +755,15 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         return;
       }
 
-      try {
-        await queue.ensureSchema();
-      } catch (e) {
-        console.error(e instanceof Error ? e.message : String(e));
-        process.exit(1);
-      }
-
-      // The CLI path is a trusted submitter. Pass {allowProtectedSubmit: true}
-      // ONLY for protected names, not blanket-set for every submission, so any
-      // future protected name forces explicit opt-in at the call site.
-      const { isProtectedJobName } = await import('../core/minions/protected-names.ts');
-      const trusted = isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
+      try { await queue.ensureSchema(); }
+      catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
       // v0.35.8.0: pre-enqueue shell-job validation. Validates `inherit:`
       // closed enum, rejects secret env-keys, fail-fasts on missing config.
       // Throws UnrecoverableError BEFORE `queue.add` so a bad payload never
       // lands in `minion_jobs.data`. Defense-in-depth re-validation happens
       // in the worker handler. See: src/core/minions/handlers/shell-validate.ts
-      if (name.trim() === 'shell') {
+      if (name === 'shell') {
         try {
           const { validateShellJobParams } = await import('../core/minions/handlers/shell-validate.ts');
           validateShellJobParams(data);
@@ -755,7 +792,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       // Submission audit log (operational trace, not forensic insurance).
       try {
         const { logShellSubmission } = await import('../core/minions/handlers/shell-audit.ts');
-        if (name.trim() === 'shell') {
+        if (name === 'shell') {
           const inheritNames = Array.isArray(data.inherit)
             ? (data.inherit as unknown[]).filter((s): s is string => typeof s === 'string')
             : undefined;
@@ -777,7 +814,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       // regardless of the submitter's own `GBRAIN_ALLOW_SHELL_JOBS` — the submitter
       // env is a weak proxy for the worker env (they may run on different machines),
       // so the warning remains useful any time the job might sit in 'waiting'.
-      if (!follow && name.trim() === 'shell') {
+      if (!follow && name === 'shell') {
         process.stderr.write(
           `\n⚠  Shell jobs require GBRAIN_ALLOW_SHELL_JOBS=1 on the worker process.\n` +
           `   Your job was queued (id=${job.id}) but will sit in 'waiting' until a\n` +
@@ -1969,23 +2006,23 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       const cliPath = parseFlag(args, '--cli-path') ?? resolveGbrainCliPath();
 
       // --detach: fork a background supervisor, print PID payload, exit 0.
-      // Implementation: re-exec the same CLI as a detached child without --detach,
-      // inheriting stderr (so JSONL events still flow to the parent's tail-f
-      // if they wanted to follow logs) but detaching stdin/stdout.
+      // #4418: the child gets a DURABLE stderr sink (audit-dir log, null-device
+      // fallback) instead of inheriting the invoker's stderr — an inherited
+      // capture pipe closing killed the worker (SIGPIPE 141) and then the
+      // supervisor itself on their next stderr write. See detached-stderr.ts.
       if (detach) {
-        const { spawn } = await import('child_process');
-        const childArgs = process.argv.slice(2).filter(a => a !== '--detach');
-        const child = spawn(process.execPath, [process.argv[1], ...childArgs], {
-          detached: true,
-          stdio: ['ignore', 'ignore', 'inherit'],
-          env: process.env,
-        });
-        child.unref();
+        const { spawnDetachedSupervisor } = await import('../core/minions/detached-stderr.ts');
+        const started = spawnDetachedSupervisor(
+          process.execPath,
+          process.argv[1],
+          process.argv.slice(2).filter(a => a !== '--detach'),
+        );
         const payload = {
           event: 'started',
-          supervisor_pid: child.pid,
+          supervisor_pid: started.pid,
           pid_file: pidFile,
           detached: true,
+          ...(started.stderrPath ? { stderr_log: started.stderrPath } : {}),
         };
         console.log(JSON.stringify(payload));
         process.exit(0);
@@ -2126,7 +2163,7 @@ export async function registerBuiltinHandlers(
     let result;
     try {
       result = await performSync(engine, {
-        repoPath, sourceId, noPull, noEmbed, noExtract,
+        repoPath, sourceId, noPull, noEmbed, noExtract, signal: job.signal,
         concurrency: concurrencyOverride,
         ...(githubItem ? { githubItem } : {}),
       });
@@ -2148,6 +2185,10 @@ export async function registerBuiltinHandlers(
       throw err;
     }
 
+    // A cancelled durable job must not complete or schedule follow-up work,
+    // even when a direct sync interruption has a resumable partial result.
+    if (job.signal?.aborted) throw job.signal.reason ?? new Error('Sync job cancelled');
+
     // v0.40 D22: auto_embed_backfill defaults TRUE when sourceId is set AND
     // the feature flag is enabled. Submits a child embed-backfill job
     // (fire-and-forget — D15.1) so stale chunks get embedded async without
@@ -2166,9 +2207,11 @@ export async function registerBuiltinHandlers(
               : 'sync_handler',
           });
           if (submission.status === 'submitted') {
-            embedJobId = submission.jobId ?? null;
-          } else {
+            embedJobId = submission.jobId;
+          } else if (submission.status === 'cooldown' || submission.status === 'spend_capped' || submission.status === 'no_worker_surface') {
             embedSkipReason = submission.status;
+          } else {
+            submission satisfies never;
           }
         } else {
           embedSkipReason = 'feature_flag_disabled';
@@ -2229,6 +2272,9 @@ export async function registerBuiltinHandlers(
         job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
       },
     });
+    // #4599 (X6): a stall-watchdog abort is an error RESULT from core; the
+    // handler layer converts it to a FAILED JOB (throw) — never process.exit.
+    assertEmbedNotStalled(embedResult);
     // Report what happened, not a constant. `embedded: true` claimed a dry run
     // had embedded, which is the same lie in miniature: `gbrain jobs get`
     // showed it. `embedded` stays the key it always was and stays truthy on a
@@ -2246,7 +2292,7 @@ export async function registerBuiltinHandlers(
     const target = typeof job.data.dir === 'string' ? job.data.dir : '.';
     // issue #1678: reuse the worker's live engine for lint's content-sanity
     // DB lift so it doesn't create + disconnect a competing engine.
-    const result = await runLintCore({ target, fix: !!job.data.fix, dryRun: !!job.data.dryRun, engine });
+    const result = await runLintCore({ target, fix: !!job.data.fix, dryRun: !!job.data.dryRun, engine, signal: job.signal });
     return result;
   });
 
@@ -2296,7 +2342,10 @@ export async function registerBuiltinHandlers(
   // LLM spend per page; no shell). Enqueued by the put_page chronicle backstop
   // and by `gbrain chronicle backfill`. Idempotent (content-addressed event
   // slugs + projection upsert), so a retry re-runs to the same state.
-  worker.register('chronicle_extract', async (job) => {
+  // #3387: registered via registerBuiltinJob (gateway-refresh wrap) — the
+  // judge is a gateway chat call, so a stale worker gateway meant silent
+  // no_events for every extraction.
+  registerBuiltinJob(worker, engine, 'chronicle_extract', async (job) => {
     const slug = typeof job.data.slug === 'string' ? job.data.slug : undefined;
     if (!slug) throw new Error('chronicle_extract job requires data.slug');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
@@ -2309,6 +2358,19 @@ export async function registerBuiltinHandlers(
       tz,
       signal: (job as { signal?: AbortSignal }).signal,
     });
+  });
+
+  // Open-loop commitment/decision extraction over google-source email pages
+  // (src/core/google/loops-extract.ts). Enqueued by runGoogleSync on trickle
+  // threads within the recent window, idempotency-keyed per page revision,
+  // capped per sweep. Kill switch: config loops.extraction_enabled.
+  registerBuiltinJob(worker, engine, 'loops_extract', async (job) => {
+    const slug = typeof job.data.slug === 'string' ? job.data.slug : undefined;
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    if (!slug || !sourceId) throw new Error('loops_extract job requires data.slug and data.sourceId');
+    const threadId = typeof job.data.threadId === 'string' ? job.data.threadId : undefined;
+    const { runLoopsExtract } = await import('../core/google/loops-extract.ts');
+    return await runLoopsExtract(engine, { slug, sourceId, ...(threadId ? { threadId } : {}) });
   });
 
   // v0.41.39 (#1700) — enrich. NOT in PROTECTED_JOB_NAMES: per-call cost is
@@ -2352,7 +2414,7 @@ export async function registerBuiltinHandlers(
     const { runLintCore } = await import('./lint.ts');
     const target = typeof job.data.dir === 'string' ? job.data.dir : '.';
     // issue #1678: reuse the worker's live engine (see 'lint' handler).
-    return await runLintCore({ target, fix: true, dryRun: false, engine });
+    return await runLintCore({ target, fix: true, dryRun: false, engine, signal: job.signal });
   });
 
   worker.register('integrity-auto', async () => {
@@ -2377,7 +2439,10 @@ export async function registerBuiltinHandlers(
     const importArgs: string[] = [];
     if (job.data.dir) importArgs.push(String(job.data.dir));
     if (job.data.noEmbed) importArgs.push('--no-embed');
-    await runImport(engine, importArgs);
+    const result = await runImport(engine, importArgs, { signal: job.signal, sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined });
+    if (result.errors > 0) {
+      throw new Error(`Import failed for ${result.errors} file(s); fix rejected documents and retry the job.`);
+    }
     return { imported: true };
   });
 
@@ -2426,7 +2491,12 @@ export async function registerBuiltinHandlers(
     const dir = typeof job.data.dir === 'string'
       ? job.data.dir
       : (await engine.getConfig('sync.repo_path')) ?? '.';
-    return await runExtractCore(engine, { mode, dir, dryRun: !!job.data.dryRun });
+    // #3957: thread the job's source id into the fs-walk extractors. Without
+    // it the batch rows default to source_id='default' and the pages JOIN
+    // drops every row on a non-'default' brain (silent "created 0"), and the
+    // full-walk watermark stamp targets the wrong source.
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    return await runExtractCore(engine, { mode, dir, dryRun: !!job.data.dryRun, sourceId });
   });
 
   worker.register('backlinks', async (job) => {
@@ -2447,19 +2517,19 @@ export async function registerBuiltinHandlers(
   // Local patch 2026-06-11: durable facts:absorb. One-shot CLI processes
   // (capture/put/sync) can't finish the extraction chat before their exit
   // drain aborts it, so backstop.ts submits this job instead and the
-  // long-lived worker does the LLM work here. Inline mode: errors throw,
-  // so minion retry/backoff handles transient gateway failures and real
-  // failures stay visible in `gbrain jobs list --status failed`. In the
-  // gateway-refresh set so the worker re-stamps model config (and re-folds
-  // file-plane keys) before every extraction job.
-  registerBuiltinJob(worker, engine, 'facts-absorb', async (job) => {
+  // long-lived worker does the LLM work here. Inline mode: errors throw, so
+  // minion retry/backoff handles transient failures and real ones stay visible
+  // in `gbrain jobs list --status failed`. In the gateway-refresh set (model
+  // config re-stamped per job). #4310: wrapped in the provider-halt cooldown
+  // (llm-halt-cooldown.ts) — a globally-broken provider defers the queue.
+  registerBuiltinJob(worker, engine, 'facts-absorb', withFactsAbsorbHaltCooldown(async (job) => {
     const slug = typeof job.data.slug === 'string' ? job.data.slug : '';
     if (!slug) throw new Error('facts-absorb job requires data.slug');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : 'default';
     const page = await engine.getPage(slug, { sourceId });
     if (!page) return { skipped: 'page_missing', slug, sourceId };
-    const { runFactsBackstop } = await import('../core/facts/backstop.ts');
-    const KNOWN_SOURCES = ['sync:import', 'mcp:put_page', 'mcp:extract_facts', 'file_upload', 'code_import'] as const;
+    const { runFactsBackstop, coerceNotabilityFilter } = await import('../core/facts/backstop.ts');
+    const KNOWN_SOURCES = ['sync:import', 'mcp:put_page', 'mcp:extract_facts', 'file_upload', 'code_import', 'hook:writeback'] as const;
     const source = (KNOWN_SOURCES as readonly string[]).includes(job.data.source as string)
       ? (job.data.source as typeof KNOWN_SOURCES[number])
       : 'mcp:put_page';
@@ -2476,22 +2546,25 @@ export async function registerBuiltinHandlers(
         sessionId: typeof job.data.sessionId === 'string' ? job.data.sessionId : null,
         source,
         mode: 'inline',
-        notabilityFilter: job.data.notabilityFilter === 'high-only' ? 'high-only' : 'all',
+        notabilityFilter: coerceNotabilityFilter(job.data.notabilityFilter),
         visibility: job.data.visibility === 'world' ? 'world' : 'private',
         ...(typeof job.data.model === 'string' && job.data.model ? { model: job.data.model } : {}),
       },
-    );
+    ).catch(async (err: unknown) => {
+      const { writeFactsAbsorbFailure } = await import('../core/facts/absorb-log.ts');
+      await writeFactsAbsorbFailure(engine, slug, err, sourceId);
+      throw err;
+    });
     // Execution-time chat_unavailable in a KEYED worker is config drift —
     // throw (typed) so minion retry/backoff parks it as a VISIBLE, re-runnable
     // failure instead of consuming the job and silently losing the facts. A
-    // KEYLESS worker completes the job as a calm skip (its execution-time
-    // gate already printed the keyless note; a retry loop would turn every
-    // page write into failed-job noise). The retry conversion lives HERE, not
-    // in the shared pipeline — the same pipeline serves the extract_facts op,
+    // KEYLESS worker completes the job as a calm skip (its execution-time gate
+    // already printed the keyless note; a retry loop would turn every page
+    // write into failed-job noise). The retry conversion lives HERE, not in
+    // the shared pipeline — the same pipeline serves the extract_facts op,
     // which must return its keyless envelope instead of throwing. The
-    // classification runs in the WORKER process: availability decisions
-    // belong to the process that executes (the submitting hook subprocess may
-    // have a deliberately neutered env).
+    // classification runs in the WORKER process (the submitting hook
+    // subprocess may have a deliberately neutered env).
     if (factsAbsorbUnavailable(result)) {
       const { classifyUnavailable } = await import('../core/facts/backstop.ts');
       const jobModel = typeof job.data.model === 'string' && job.data.model ? job.data.model : undefined;
@@ -2501,7 +2574,7 @@ export async function registerBuiltinHandlers(
       }
     }
     return result;
-  });
+  }));
 
   // Autopilot-cycle handler: delegates to runCycle. Shares the exact same
   // phase set and ordering as `gbrain dream` and autopilot's inline path —
@@ -2878,7 +2951,8 @@ export async function registerBuiltinHandlers(
   // the per-source lock) the job completes `{ deferred: true }` and retries
   // next tick instead of failing — cooperative interleave (CODEX accepted).
   registerBuiltinJob(worker, engine, 'extract-atoms-drain', async (job) => {
-    const { runExtractAtomsDrainForSource } = await import('../core/cycle/extract-atoms-drain.ts');
+    const { formatDrainProviderFailure, runExtractAtomsDrainForSource } =
+      await import('../core/cycle/extract-atoms-drain.ts');
     const { LockUnavailableError } = await import('../core/db-lock.ts');
     const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
     const windowSeconds =
@@ -2902,10 +2976,7 @@ export async function registerBuiltinHandlers(
       // handler failure. Partial success (>=1 item extracted) keeps
       // completing normally, unchanged.
       if (result.status === 'provider_failure') {
-        throw new Error(
-          `extract-atoms-drain: all provider calls failed this batch ` +
-          `(batches=${result.batches}, remaining=${result.remaining ?? '?'}) — retrying`,
-        );
+        throw new Error(formatDrainProviderFailure(result));
       }
       return result;
     } catch (e) {
@@ -2923,6 +2994,13 @@ export async function registerBuiltinHandlers(
   registerBuiltinJob(worker, engine, 'embed-backfill', async (job) => {
     const { makeEmbedBackfillHandler } = await import('../core/minions/handlers/embed-backfill.ts');
     return await makeEmbedBackfillHandler(engine)(job);
+  });
+  // connector-sync: fetch a chat provider's history and ingest it. Fetch+ingest
+  // needs no LLM, but the PGLite embed kickoff calls runEmbedCore inline, so
+  // it's in GATEWAY_REFRESH_JOB_NAMES (gateway refresh before the handler).
+  registerBuiltinJob(worker, engine, 'connector-sync', async (job) => {
+    const { makeConnectorSyncHandler } = await import('../core/minions/handlers/connector-sync.ts');
+    return await makeConnectorSyncHandler(engine)(job);
   });
 
   // v0.41.18.0 (A10, T7): extract-ner handler for the gbrain onboard
@@ -2976,7 +3054,7 @@ export async function registerBuiltinHandlers(
       priority?: 'recent';
       includeNullSignature?: boolean;
     };
-    return await runEmbedCore(engine, {
+    const catchUpResult = await runEmbedCore(engine, {
       stale: true,
       catchUp: true,
       batchSize: data.batchSize,
@@ -2986,6 +3064,9 @@ export async function registerBuiltinHandlers(
       // widening through; absent = grandfather clause stays (unchanged).
       includeNullSignature: !!data.includeNullSignature,
     });
+    // #4599 (X6): stall abort → failed job (throw), same as the embed handler.
+    assertEmbedNotStalled(catchUpResult);
+    return catchUpResult;
   });
 
   // v0.42 type-unification (T10): unify-types PROTECTED handler. Pack-upgrade

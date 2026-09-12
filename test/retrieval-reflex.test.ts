@@ -230,6 +230,49 @@ describe('context-engine assemble() — Retrieval Reflex integration', () => {
     });
   });
 
+  test('turn delivered via `prompt` with empty `messages` still fires the reflex (codex-app-server path)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-prompt',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // Runtimes like the codex-app-server (2026.7.x) deliver the current turn
+      // via `prompt` and leave `messages` empty. The reflex must still see it.
+      const res = await ce.assemble({
+        sessionId: 's-prompt',
+        messages: [],
+        prompt: 'what do you think about Alice Example?',
+      });
+      expect(res.systemPromptAddition).toContain('Brain pages mentioned this turn');
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('`prompt` is ignored when `messages` is non-empty (no double-count, back-compat)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const seen: string[] = [];
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-prompt-ignored',
+        resolveEntities: (candidates, opts) => {
+          seen.push(...candidates.map((c) => c.query));
+          return resolveEntitiesToPointers(engine, 'default', candidates, opts);
+        },
+      });
+      // `messages` carries the real turn; `prompt` names a DIFFERENT entity that
+      // must never reach the resolver whenever `messages` is non-empty.
+      const res = await ce.assemble({
+        sessionId: 's-prompt-ignored',
+        messages: [{ role: 'user', content: 'what do you think about Alice Example?' }],
+        prompt: 'tell me about Bob Nonexistent',
+      });
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+      expect(seen.join(' ')).not.toContain('Bob Nonexistent');
+    });
+  });
+
   test('no resolver available (PGLite, no serve/host) → no throw, live context still present', async () => {
     await withEnv(REFLEX_ON, async () => {
       const ce = createGBrainContextEngine({ workspaceDir: '/tmp/rr-test-ws-2' });
@@ -667,6 +710,88 @@ describe('v0.46.15 ship-review hardening (adversarial F1/F2 + stale-alias veto)'
       'default',
       extractCandidates('remind me what saoirse said'),
       { sourceIds: ['default', 'other'] },
+    );
+    expect(block).toBeNull();
+  });
+});
+
+describe('#3746 — cjk-title arm (pure-CJK weak norms probe exact title/slug)', () => {
+  test('japanese: unregistered-alias page resolves via exact title', async () => {
+    await seed('people/tanaka', '田中', '田中 is a partner at fund-a.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/tanaka');
+    expect(block!.pointers[0].arm).toBe('cjk-title');
+    expect(block!.pointers[0].confidence).toBeGreaterThanOrEqual(0.7); // survives the volunteer gate
+    expect(block!.pointers[0].matchedNorm).toBe(normalizeAlias('田中'));
+  });
+
+  test('korean: registered CJK alias resolves through the alias arm (0.9)', async () => {
+    await seed('people/kim-chulsoo', 'Kim Chulsoo', 'A founder.');
+    await engine.setPageAliases('people/kim-chulsoo', 'default', [normalizeAlias('김철수')]);
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('김철수 미팅 노트 보여줘'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/kim-chulsoo');
+    expect(block!.pointers[0].arm).toBe('alias');
+  });
+
+  test('chinese: exact CJK slug resolves when the title differs', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('王小明', 'default', 'person', 'Wang Xiaoming', 'A researcher.', '')`,
+      [],
+    );
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('给我看看王小明的笔记'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('王小明');
+    expect(block!.pointers[0].arm).toBe('cjk-title');
+  });
+
+  test('no matching page → resolves nothing (junk grams never fabricate)', async () => {
+    await seed('people/unrelated', 'Unrelated Person', 'Nothing CJK here.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('ambiguous gram (two pages share the title) injects nothing', async () => {
+    await seed('people/tanaka-a', '田中', 'First 田中.');
+    await seed('people/tanaka-b', '田中', 'Second 田中.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('kill switch: lexicalArms=false disables the cjk-title arm', async () => {
+    await seed('people/tanaka', '田中', '田中 is a partner.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      { lexicalArms: false },
     );
     expect(block).toBeNull();
   });

@@ -20,7 +20,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync, chmodSync, statSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { detectExecutionEnvironment } from '../core/execution-env.ts';
-import { join, dirname, isAbsolute } from 'path';
+import { join, dirname, isAbsolute, resolve as resolvePath } from 'path';
 import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
@@ -45,6 +45,7 @@ import { detectInstallMethod } from './upgrade.ts';
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
+import { loadAllSources, sourceConfigHasRemoteUrl, sourceLocalPathSkipWarning, relativeSourceLocalPathSkipWarning } from '../core/sources-load.ts';
 import { resolveAutopilotDispatchTimeoutMs } from './autopilot-timeout.ts';
 import {
   autopilotRemediationIdempotencyKey,
@@ -65,6 +66,7 @@ import {
   MIGRATE_PAUSE_MARKER_PREFIX,
 } from '../core/autopilot-paths.ts';
 export { autopilotLockPath, autopilotDisabledMarkerPath, autopilotPausedMarkerPath, autopilotLaunchdLabel };
+export { relativeSourceLocalPathSkipWarning as relativeLocalPathSkipWarning };
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -270,7 +272,10 @@ export function decideLockAcquisition(
   lockPath: string,
   currentPid: number,
   deps: AutopilotLockProbeDeps = {},
-): { action: 'acquire' } | { action: 'exit'; holderPid: number } | { action: 'takeover'; reason: string } {
+):
+  | { action: 'acquire' }
+  | { action: 'exit'; holderPid: number; holderState: 'alive-autopilot' | 'alive-foreign' | 'alive-unknown' }
+  | { action: 'takeover'; reason: string } {
   if (!existsSync(lockPath)) return { action: 'acquire' };
 
   let raw = '';
@@ -283,15 +288,21 @@ export function decideLockAcquisition(
   const holderPid = Number.parseInt(raw, 10);
   const holder = classifyAutopilotLockHolder(holderPid, currentPid, deps);
 
-  if (holder.state === 'alive-autopilot' || holder.state === 'alive-unknown') {
-    return { action: 'exit', holderPid };
+  if (holder.state === 'alive-autopilot') {
+    return { action: 'exit', holderPid, holderState: holder.state };
   }
-  if (holder.state === 'alive-foreign') {
+  if (holder.state === 'alive-foreign' || holder.state === 'alive-unknown') {
+    // #4300: an alive PID whose command we can't identify as gbrain autopilot
+    // (recycled PID after reboot, or a /proc-less + ps-restricted host) gets
+    // the same age-gated takeover as a known-foreign holder. A fresh lock is
+    // still respected; only a stale one (past the grace window) is stolen —
+    // otherwise a single recycled PID bricks the daemon forever.
     const lockAgeMs = autopilotLockAgeMs(lockPath);
     if (lockAgeMs !== null && lockAgeMs >= AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS) {
-      return { action: 'takeover', reason: `foreign pid ${raw || '<empty>'} with stale lock` };
+      const kind = holder.state === 'alive-foreign' ? 'foreign' : 'unidentifiable';
+      return { action: 'takeover', reason: `${kind} pid ${raw || '<empty>'} with stale lock` };
     }
-    return { action: 'exit', holderPid };
+    return { action: 'exit', holderPid, holderState: holder.state };
   }
   if (holder.state === 'self') {
     return { action: 'takeover', reason: `own pid ${raw || '<empty>'}` };
@@ -603,7 +614,17 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     mkdirSync(gbrainHomePath(), { recursive: true });
     const decision = decideLockAcquisition(lockPath, process.pid);
     if (decision.action === 'exit') {
-      console.error(`Another autopilot instance is running (pid ${decision.holderPid}). Exiting.`);
+      // #4300: say WHY we refused, loudly, so a bricked daemon is diagnosable
+      // from launchd/systemd logs without strace-ing the lock probe.
+      const detail =
+        decision.holderState === 'alive-autopilot'
+          ? 'a live gbrain autopilot process'
+          : decision.holderState === 'alive-unknown'
+            ? 'a live process whose command line could not be inspected (fresh lock — will become stealable once stale)'
+            : 'a live non-gbrain process holding a fresh lock (will become stealable once stale)';
+      console.error(
+        `[autopilot] refusing to start: lock ${lockPath} is held by pid ${decision.holderPid} — ${detail}. Exiting.`,
+      );
       process.exit(0);
     }
     if (decision.action === 'takeover') {
@@ -798,6 +819,11 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   // Parser-probe fixture warning is once-per-process, not once-per-cycle
   // (compiled-binary installs have no source tree; don't spam the log).
   let parserProbeFixtureWarned = false;
+  // #2608: once-per-process no-chat-provider warning. A keyless daemon used
+  // to run every cycle "green" while all LLM phases silently no-op'd
+  // (chronicle reported no_events, propose_takes skipped, …) — the operator
+  // had no signal that shell-profile keys never reached launchd/systemd.
+  let noChatProviderWarned = false;
   // v0.37.7.0 #1162 — counter for consecutive reconnect failures.
   // Reset on every successful health probe or reconnect. Threshold
   // controlled by GBRAIN_AUTOPILOT_MAX_RECONNECT_FAILS env (default 30).
@@ -833,6 +859,25 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     // Refresh the lock mtime so another cron-fired autopilot doesn't
     // declare the instance stale after 10 minutes (Codex C).
     try { utimesSync(lockPath, new Date(), new Date()); } catch { /* best-effort */ }
+
+    // #2608: loud once-per-process signal when no chat provider is servable.
+    // Without this a keyless daemon looks healthy forever while every LLM
+    // phase quietly skips.
+    if (!noChatProviderWarned) {
+      noChatProviderWarned = true;
+      try {
+        const { isAvailable } = await import('../core/ai/gateway.ts');
+        if (!isAvailable('chat')) {
+          console.error(
+            `[autopilot] WARN: no chat provider is available to this daemon — LLM-dependent ` +
+            `phases (chronicle event extraction, propose_takes, synthesize, …) will skip. ` +
+            `Shell-profile exports often do not reach launchd/systemd: put KEY=value lines in ` +
+            `${join(gbrainHomePath(), 'env')} (sourced by the wrapper), then re-run ` +
+            '`gbrain autopilot --install` to reload the daemon.',
+          );
+        }
+      } catch { /* gateway unconfigured — the cycle surfaces its own errors */ }
+    }
 
     // Post-migration convergence: if the file-plane engine identity changed
     // since boot, this process is connected to the wrong engine. Exit through
@@ -1022,7 +1067,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
       // poll-only deployments.
       try {
         const { MinionQueue } = await import('../core/minions/queue.ts');
-        const { computeRecommendations, embeddingProviderConfigured, HOSTED_EMBED_KEY_CONFIG } = await import('../core/brain-score-recommendations.ts');
+        const { computeRecommendations, embeddingProviderConfigured, HOSTED_EMBED_KEY_CONFIG, chatApiKeyConfigured } = await import('../core/brain-score-recommendations.ts');
         const queue = new MinionQueue(engine);
         const slotMs = Math.floor(Date.now() / (baseInterval * 1000)) * baseInterval * 1000;
         const slot = new Date(slotMs).toISOString();
@@ -1036,12 +1081,24 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         try {
           const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
           if (await isFederatedV2Enabled(engine)) {
-            const { loadAllSources, sourceConfigHasRemoteUrl } = await import('../core/sources-load.ts');
             const sources = await loadAllSources(engine);
             const intervalMs = baseInterval * 1000;
             const now = Date.now();
             for (const src of sources) {
               if (!src.local_path) continue;
+              // A local_path this machine cannot use — relative (#3696: cwd is
+              // launchd's, not the registering shell's) or absent on disk and
+              // not a managed clone sync can re-create — would sync a phantom
+              // path. Skip loudly (sourceLocalPathSkipWarning carries the
+              // fix); under --json the skip is an NDJSON event like every
+              // other daemon line on stderr, never bare prose in the stream.
+              const skipWarn = sourceLocalPathSkipWarning(src.id, src.local_path, undefined, src.config);
+              if (skipWarn) {
+                process.stderr.write(
+                  (jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, reason: skipWarn }) : skipWarn) + '\n',
+                );
+                continue;
+              }
               const lastSyncMs = src.last_sync_at ? new Date(src.last_sync_at).getTime() : 0;
               const ageMs = now - lastSyncMs;
               if (ageMs < intervalMs) continue; // fresh enough
@@ -1129,12 +1186,20 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                 }
 
                 if (submittedToday < maxJobsToday) {
-                  const { loadAllSources } = await import('../core/sources-load.ts');
                   const { countExtractAtomsBacklog } = await import('../core/cycle/extract-atoms.ts');
                   const sources = await loadAllSources(engine);
                   for (const src of sources) {
                     if (submittedToday >= maxJobsToday) break; // brain-wide daily cap (fairness)
                     if (!src.local_path) continue;
+                    // Same unavailable-path skip (relative / missing on this
+                    // machine) as the freshness loop above, same --json shape.
+                    const skipWarn = sourceLocalPathSkipWarning(src.id, src.local_path, undefined, src.config);
+                    if (skipWarn) {
+                      process.stderr.write(
+                        (jsonMode ? JSON.stringify({ event: 'freshness_source_path_skipped', source_id: src.id, reason: skipWarn }) : skipWarn) + '\n',
+                      );
+                      continue;
+                    }
                     const backlog = await countExtractAtomsBacklog(engine, src.id);
                     if (backlog === null || backlog <= threshold) continue;
                     // Time-sloted key (CODEX #2): a static key would block the
@@ -1227,7 +1292,12 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             const cfgField = HOSTED_EMBED_KEY_CONFIG[envVar];
             return !!(process.env[envVar] || (cfgField ? embedKeyCfg[cfgField] : undefined));
           }),
-          hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || await engine.getConfig('anthropic_api_key')),
+          // #3944: env + FILE plane via the shared helper — the same probe
+          // doctor's loadRecommendationContext uses. Reading the DB plane
+          // here (engine.getConfig) reported a chat key "configured" that
+          // doctor's planner (file plane, per the #2662 rule above) said was
+          // missing, so autopilot dispatched chat jobs doctor called blocked.
+          hasChatApiKey: chatApiKeyConfigured(fileCfg),
         };
         // v0.41.18.0 (A5 + A19 + A22, T15): consult onboard recommendations
         // ALONGSIDE doctor's brain-score recommendations. Onboard's 4 new
@@ -1273,7 +1343,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           // codex P1-3). Fresh-install brains with no sources rows fall
           // back to the legacy single autopilot-cycle so existing
           // behavior is preserved.
-          const { dispatchPerSource, dispatchGlobalMaintenance, resolveEffectiveFanoutMax } = await import('./autopilot-fanout.ts');
+          const { dispatchPerSource, dispatchGlobalMaintenance, maybeDispatchConnectorSyncs, resolveEffectiveFanoutMax } = await import('./autopilot-fanout.ts');
           // #2194 fix #1: clamp fan-out to the worker's effective concurrency
           // (reserve ≥1 slot), gated on a LIVE supervisor so a stale audit row
           // can't shrink throughput (codex #9/D5). autopilot-cycle jobs run on
@@ -1309,6 +1379,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
               if (jsonMode) process.stderr.write(JSON.stringify({ event: 'global_maintenance_dispatch_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
             }
           }
+          // Opt-in scheduled chat-connector sync (OV#4). Credential-gated +
+          // auto_sync-gated: fires for nobody who hasn't explicitly enabled it.
+          try {
+            await maybeDispatchConnectorSyncs(engine, queue, { slot, timeoutMs: fullCycleTimeoutMs, jsonMode });
+          } catch (e) {
+            if (jsonMode) process.stderr.write(JSON.stringify({ event: 'connector_sync_dispatch_failed', error: e instanceof Error ? e.message : String(e) }) + '\n');
+          }
           // On restart the process-local clock starts overdue. If persisted
           // source timestamps say every source is fresh, advance the local
           // clock too; otherwise a non-empty targeted plan would be skipped
@@ -1318,7 +1395,14 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           // keep that behavior, or an all-coalesced tick (single-flight
           // suppression) would retake the full-cycle branch every tick and
           // starve the targeted-plan path for the whole in-flight window.
-          if (result.dispatched.length > 0 || result.coalesced.length > 0 || result.legacy_fallback || result.all_sources_fresh) {
+          // (all_sources_handled subsumes all_sources_fresh: fresh + locally
+          // skipped === every source.)
+          if (
+            result.dispatched.length > 0 ||
+            result.coalesced.length > 0 ||
+            result.legacy_fallback ||
+            result.all_sources_handled
+          ) {
             lastFullCycleAt = Date.now();
           }
           if (jsonMode) {
@@ -1329,6 +1413,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
               skipped_fresh: result.skipped_fresh,
               skipped_cap: result.skipped_cap,
               skipped_cooldown: result.skipped_cooldown,
+              skipped_unavailable_path: result.skipped_unavailable_path,
               legacy_fallback: result.legacy_fallback,
               fanout_max: fanoutMax,
               score,
@@ -1338,7 +1423,8 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
               `[dispatch] fanout: ${result.dispatched.length} dispatched` +
               `${result.coalesced.length > 0 ? ` (${result.coalesced.length} coalesced onto in-flight)` : ''}, ` +
               `${result.skipped_fresh.length} fresh, ${result.skipped_cap.length} capped, ` +
-              `${result.skipped_cooldown.length} cooldown ` +
+              `${result.skipped_cooldown.length} cooldown, ` +
+              `${result.skipped_unavailable_path.length} unavailable-path ` +
               `(score=${score}, max=${fanoutMax})`,
             );
           }
@@ -1691,6 +1777,9 @@ rm -f '${q(strikes)}' 2>/dev/null || true
 `;
 }
 
+// Exported for tests (#2608): the emitted wrapper text is the contract —
+// key-channel regressions (rc-file || chains, missing env-file sourcing)
+// must be pinnable without installing a daemon.
 /**
  * #2608: contents of the install-time `<gbrainDir>/env` template. All lines
  * commented — the install must never ship a live secret. GBRAIN_HOME is
@@ -1773,7 +1862,12 @@ export function writeWrapperScript(repoPath: string, target: InstallTarget): str
 # subprocess). Source it first so secrets like GBRAIN_DATABASE_URL or any
 # OPENAI/ANTHROPIC keys exported in zshenv reach autopilot.
 [ -f ~/.zshenv ] && source ~/.zshenv 2>/dev/null
-source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
+# #2608: source zshrc AND bashrc independently. The old \`zshrc || bashrc\`
+# chain only reached bashrc when sourcing zshrc FAILED — on a machine with
+# both files (default macOS + a bash-managed key setup) the bashrc keys
+# never loaded and every LLM phase silently no-op'd.
+[ -f ~/.zshrc ] && source ~/.zshrc 2>/dev/null
+[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null
 # gbrain-owned env file (#2608), additive to the profiles above: daemon
 # shells are non-interactive, so exports that live only in an interactive
 # rc file never reach them — and the ~/.bashrc guard below means even
@@ -1797,18 +1891,61 @@ source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
 # or which init file the OS loaded.
 export PATH=${runtimePathPrefix}"$HOME/.bun/bin:$PATH"
 ${process.env.GBRAIN_HOME ? `# Baked at install: the supervisor does not pass the installer's env, and\n# without this the daemon would read/write a different home than the\n# install that configured it.\nexport GBRAIN_HOME='${(process.env.GBRAIN_HOME).replace(/'/g, "'\\''")}'\n` : ''}
-${generateSelfDisableGuard(repoPath, target)}exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}'
+${generateSelfDisableGuard(repoPath, target)}# #3696: daemon cwd = the repo, so any legacy RELATIVE sources.local_path /
+# sync.repo_path row resolves against it instead of a phantom path under the
+# supervisor's cwd. Done HERE — after the guard has proven the repo exists —
+# and NOT via launchd's plist WorkingDirectory: launchd chdir()s before exec,
+# so a deleted repo would fail every respawn and the self-disable guard above
+# could never run. Fail-open (|| true): a repo deleted between the guard and
+# this line still starts the daemon, and the dispatch loops skip relative
+# paths loudly.
+cd '${safeRepoPath}' 2>/dev/null || true
+# #4728: the CLI path below was resolved ONCE at --install. On the
+# ephemeral-container target the container layer is wiped on every deploy, so
+# a CLI that lived there vanishes while this wrapper (on the volume) survives,
+# and bash's bare "No such file or directory" named no remedy. The baked path
+# stays primary; only once it is gone do we fall back to PATH — the same
+# resolution the daemon already applies at run time when it spawns its worker
+# child (resolveGbrainCliPath -> which gbrain), so this adds no lookup
+# semantics the install did not already rely on. \`type -P\` only returns an
+# executable file on PATH, ignoring any \`gbrain\` shell function or alias the
+# rc files sourced above may have defined. Logs go to stdout: that is the
+# autopilot.log sink on all four targets (same choice as the boot warning).
+if [ ! -x '${safeGbrainPath}' ]; then
+  _resolved=$(type -P gbrain 2>/dev/null)
+  if [ -n "$_resolved" ]; then
+    echo "$(date -u +%FT%TZ) [autopilot] baked CLI path is gone:" '${safeGbrainPath}' "- using $_resolved"
+    exec "$_resolved" autopilot --repo '${safeRepoPath}'
+  fi
+  echo "$(date -u +%FT%TZ) [autopilot] gbrain CLI not found at" '${safeGbrainPath}' "nor on PATH; re-run: gbrain autopilot --install"
+  exit 1
+fi
+exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}'
 `;
   writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   return wrapperPath;
 }
 
 async function installDaemon(engine: BrainEngine, args: string[]) {
-  const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
-  if (!repoPath) {
+  // #677: on a PGLite brain the autopilot daemon would hold the single-writer
+  // DB lock for its lifetime — every other gbrain process (serve, search,
+  // sweep, embed) then fails to connect. Refuse with guidance; --force for
+  // operators who genuinely want a daemon-owned brain.
+  const guardMsg = pgliteDaemonGuardMessage(engine.kind, args.includes('--force'));
+  if (guardMsg) {
+    console.error(guardMsg);
+    process.exit(1);
+  }
+  const rawRepoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
+  if (!rawRepoPath) {
     console.error('No repo path. Use --repo or run gbrain sync --repo first.');
     process.exit(1);
   }
+  // #3696: the daemon runs with an arbitrary cwd (launchd: `/`), so a
+  // relative `--repo .` baked into the wrapper script resolves to a phantom
+  // path at daemon runtime. Resolve NOW, against the installer's cwd.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- rawRepoPath is the local operator's own --repo CLI arg or the operator-written sync.repo_path config row; installDaemon is reachable only via `gbrain autopilot --install` on the trusted local CLI (never MCP/remote), and absolutizing it here IS the #3696 fix
+  const repoPath = resolvePath(rawRepoPath);
 
   const forcedTarget = parseArg(args, '--target') as InstallTarget | undefined;
   const target: InstallTarget = forcedTarget ?? detectInstallTarget();
@@ -1817,6 +1954,15 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
   const noInject = args.includes('--no-inject');
 
   const wrapperPath = writeWrapperScript(repoPath, target);
+  // #2608: tell the operator about the deterministic key channel — launchd/
+  // systemd don't inherit the login shell env, and rc-file interactive guards
+  // routinely swallow exports, so "it works in my terminal" keys often never
+  // reach the daemon.
+  console.log(
+    `API keys: the daemon sources ${join(gbrainHomePath(), 'env')} (plain KEY=value lines, ` +
+    `auto-exported) in addition to your shell profile. If LLM phases report no provider, put ` +
+    'ANTHROPIC_API_KEY=... (or your provider\'s key) there and re-run `gbrain autopilot --install`.',
+  );
   // A fresh install clears any prior self-disable AND any leaked pause, so a
   // reinstall does not report "disabled" forever or park itself from day one
   // on a marker some dead migration left behind.
@@ -1844,8 +1990,40 @@ async function installDaemon(engine: BrainEngine, args: string[]) {
   }
 }
 
+/**
+ * #677 — PGLite install guard, pure (the unit-test surface). A PGLite brain
+ * is single-writer: a daemonized autopilot holds the exclusive DB lock 24/7,
+ * so every OTHER gbrain process (`serve`, `search`, `sweep --once`,
+ * `embed --stale`) fails to connect for as long as the daemon lives. The
+ * supported PGLite background story is `gbrain serve` (resident sweep +
+ * serve-delegated sync/sweep over IPC). Returns the refusal message, or null
+ * when the install may proceed (postgres engine, or explicit --force).
+ */
+export function pgliteDaemonGuardMessage(engineKind: string, force: boolean): string | null {
+  if (engineKind !== 'pglite' || force) return null;
+  return (
+    `gbrain autopilot --install: this brain runs on PGLite (single-writer). A daemonized ` +
+    `autopilot would hold the exclusive DB lock 24/7 and block every other gbrain ` +
+    `process (serve, search, sweep, embed) for as long as it runs.\n` +
+    `  Recommended: run \`gbrain serve\` instead — it owns the lock, runs the resident ` +
+    `maintenance sweep, and delegates \`gbrain sync\`/\`gbrain sweep --once\` through its ` +
+    `IPC socket.\n` +
+    `  To install the daemon anyway (dedicated-brain setups), re-run with --force.`
+  );
+}
+
 // v0.37.7.0 #1162 — pure function for plist generation so tests can
 // assert ThrottleInterval/KeepAlive shape without an installed daemon.
+// #3696: WorkingDirectory pins the daemon's cwd away from launchd's `/`
+// default — but it MUST be a spawn-safe path, NEVER the repo. launchd
+// chdir()s before exec, so a WorkingDirectory that stops existing makes
+// every (re)spawn fail: after a repo deletion the wrapper — and its
+// self-disable guard — would never run again, leaving a zombie KeepAlive
+// job that can never take itself out of rotation. $HOME exists for the
+// job's whole lifetime; the WRAPPER cd's into the repo AFTER the guard has
+// proven it exists (writeWrapperScript), which is what makes legacy
+// RELATIVE sources.local_path / sync.repo_path rows resolve against the
+// repo instead of a phantom path.
 export function generateLaunchdPlist(wrapperPath: string, home: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1855,6 +2033,7 @@ export function generateLaunchdPlist(wrapperPath: string, home: string): string 
   <key>ProgramArguments</key><array>
     <string>${escapeXml(wrapperPath)}</string>
   </array>
+  <key>WorkingDirectory</key><string>${escapeXml(home)}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <!--

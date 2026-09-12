@@ -20,6 +20,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
+  configureGateway,
   resetGateway,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
@@ -326,6 +327,7 @@ describe('runExtractConversationFactsCore', () => {
   let mainChatCalls = 0;
   let chatStopReason: ChatResult['stopReason'] = 'end';
   let chatTextOverride: string | null = null;
+  let embeddedTexts: string[] = [];
   let fallbackCalls = 0;
   let fallbackContents: string[] = [];
   let fallbackControlError: Error | null = null;
@@ -410,9 +412,10 @@ describe('runExtractConversationFactsCore', () => {
 
     // Deterministic embedding stub.
     __setEmbedTransportForTests(
-      (async () => ({
-        embeddings: [Array.from({ length: 1536 }, () => 0.1)],
-      })) as never,
+      (async ({ values }: { values: string[] }) => {
+        embeddedTexts.push(...values);
+        return { embeddings: values.map(() => Array.from({ length: 1536 }, () => 0.1)) };
+      }) as never,
     );
   });
 
@@ -430,6 +433,7 @@ describe('runExtractConversationFactsCore', () => {
     mainChatCalls = 0;
     chatStopReason = 'end';
     chatTextOverride = null;
+    embeddedTexts = [];
     fallbackCalls = 0;
     fallbackContents = [];
     fallbackControlError = null;
@@ -528,6 +532,60 @@ describe('runExtractConversationFactsCore', () => {
     expect(result.pages_processed).toBe(1);
     expect(result.facts_inserted).toBe(0);
     expect(result.segments_processed).toBeGreaterThanOrEqual(1);
+  });
+
+  test('historical backfill embeds and retains high, medium, low, and absent-tier facts', async () => {
+    // Regression target: passing high-only admission into the historical
+    // extractor call would suppress low (and absent-tier) facts before embed.
+    chatTextOverride = JSON.stringify({
+      facts: [
+        { fact: 'historical-high', kind: 'event', notability: 'high' },
+        { fact: 'historical-medium', kind: 'fact', notability: 'medium' },
+        { fact: 'historical-low', kind: 'fact', notability: 'low' },
+        { fact: 'historical-absent', kind: 'fact' },
+      ],
+    });
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-small',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'test' },
+    });
+    await engine.putPage('conversations/historical-tier-coverage', {
+      type: 'conversation',
+      title: 'Historical tier coverage',
+      compiled_truth: [
+        fmt('Alice Example', '2024-03-15', '9:00 AM', 'first message'),
+        fmt('Bob Demo', '2024-03-15', '9:05 AM', 'second message'),
+      ].join('\n'),
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/historical-tier-coverage',
+      sleepMs: 0,
+    });
+    const rows = await engine.executeRaw<{ fact: string; notability: string; has_embedding: boolean }>(
+      `SELECT fact, notability, embedding IS NOT NULL AS has_embedding
+       FROM facts WHERE source = $1 ORDER BY row_num`,
+      [PER_SEGMENT_SOURCE_PREFIX],
+    );
+
+    expect(result.facts_extracted).toBe(4);
+    expect(result.facts_inserted).toBe(4);
+    expect(embeddedTexts).toEqual([
+      'historical-high',
+      'historical-medium',
+      'historical-low',
+      'historical-absent',
+    ]);
+    expect(rows).toEqual([
+      { fact: 'historical-high', notability: 'high', has_embedding: true },
+      { fact: 'historical-medium', notability: 'medium', has_embedding: true },
+      { fact: 'historical-low', notability: 'low', has_embedding: true },
+      { fact: 'historical-absent', notability: 'medium', has_embedding: true },
+    ]);
   });
 
   test('dry-run does not write the extract_rollup_7d cache row', async () => {
@@ -835,6 +893,58 @@ describe('runExtractConversationFactsCore', () => {
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
   });
 
+  test('canonicalizes a raw LLM entity display name before writing facts.entity_slug', async () => {
+    chatTextOverride = JSON.stringify({
+      facts: [{
+        fact: 'Alice Example signed the offer letter.',
+        kind: 'event',
+        entity: 'Alice Example',
+        confidence: 1.0,
+        notability: 'high',
+      }],
+    });
+
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+
+    const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.entity_slug === 'people/alice-example')).toBe(true);
+  });
+
+  test('preserves an already-canonical LLM entity slug', async () => {
+    chatTextOverride = JSON.stringify({
+      facts: [{
+        fact: 'Alice Example started the new role.',
+        kind: 'event',
+        entity: 'people/alice-example',
+        confidence: 1.0,
+        notability: 'high',
+      }],
+    });
+
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+
+    const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.entity_slug === 'people/alice-example')).toBe(true);
+  });
+
   test('terminal outcome skips a completed page after checkpoint GC', async () => {
     await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
@@ -979,12 +1089,27 @@ describe('runExtractConversationFactsCore', () => {
       slug: 'conversations/imessage/alice-example',
       sleepMs: 0,
     });
-    expect(first.pages_processed).toBe(1);
+    // #4869: an unfinished page is a failed claim, not a processed one —
+    // pages_failed is what drives CLI exit 1 / the cycle 'warn' status.
+    expect(first.pages_processed).toBe(0);
+    expect(first.pages_failed).toBe(1);
     const terminals = await engine.executeRaw<{ count: string | number }>(
       `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
       [TERMINAL_AUDIT_SOURCE],
     );
     expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+    // Partial facts stay durable for the delete-first replay; no completion
+    // checkpoint key is minted for the old snapshot.
+    const partial = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(Number(partial[0]?.count ?? 0)).toBe(2);
+    const cpKeys = await engine.executeRaw<{ ckey: string }>(
+      `SELECT jsonb_array_elements_text(completed_keys) AS ckey FROM op_checkpoints
+        WHERE op = 'extract-conversation-facts'`,
+    );
+    expect(cpKeys.some((r) => r.ckey.startsWith('default|conversations/imessage/alice-example|'))).toBe(false);
 
     const retry = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
@@ -993,6 +1118,8 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(retry.pages_skipped_completed).toBe(0);
     expect(retry.pages_processed).toBe(1);
+    expect(retry.pages_failed).toBe(0);
+    expect(retry.orphan_facts_cleaned).toBe(2);
   });
 
   test('raw transcript sidecar edits invalidate the durable outcome', async () => {

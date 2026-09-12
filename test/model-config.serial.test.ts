@@ -15,9 +15,15 @@ import {
   TIER_DEFAULTS,
   PROVIDER_TIER_DEFAULTS,
   isAnthropicProvider,
+  isOpenRouterAnthropic,
+  isOpenRouterSubagentFamily,
   _resetDeprecationWarningsForTest,
 } from '../src/core/model-config.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { withEnv } from './helpers/with-env.ts';
 
 class StubEngine {
   readonly kind = 'pglite' as const;
@@ -187,9 +193,27 @@ describe('resolveModel — 6-tier precedence', () => {
 });
 
 describe('resolveModel — v0.31.12 tier system', () => {
-  test('models.default beats tier override', async () => {
+  test('models.tier.<tier> beats models.default (#3873 — specific over generic)', async () => {
     stub.set('models.default', 'opus');
     stub.set('models.tier.reasoning', 'haiku');
+    const m = await resolveModel(stub as never, {
+      tier: 'reasoning',
+      fallback: 'sonnet',
+    });
+    expect(m).toBe(DEFAULT_ALIASES.haiku);
+  });
+
+  test('models.default still applies when the call has no tier (#3873)', async () => {
+    stub.set('models.default', 'opus');
+    stub.set('models.tier.reasoning', 'haiku');
+    const m = await resolveModel(stub as never, {
+      fallback: 'sonnet',
+    });
+    expect(m).toBe(DEFAULT_ALIASES.opus);
+  });
+
+  test('models.default still applies when the tier has no override (#3873)', async () => {
+    stub.set('models.default', 'opus');
     const m = await resolveModel(stub as never, {
       tier: 'reasoning',
       fallback: 'sonnet',
@@ -284,6 +308,28 @@ describe('resolveModel — v0.31.12 tier system', () => {
     // widen the guard).
     expect(isAnthropicProvider('openai/gpt-5')).toBe(false);
     expect(isAnthropicProvider('google/gemini-3-pro')).toBe(false);
+    // OpenRouter Anthropic is a proxy route, not the Messages API.
+    expect(isAnthropicProvider('openrouter:anthropic/claude-haiku-4.5')).toBe(false);
+  });
+
+  test('isOpenRouterAnthropic matches only openrouter:anthropic/… routes', () => {
+    expect(isOpenRouterAnthropic('openrouter:anthropic/claude-haiku-4.5')).toBe(true);
+    expect(isOpenRouterAnthropic('openrouter:anthropic/claude-sonnet-4.6')).toBe(true);
+    expect(isOpenRouterAnthropic('openrouter:openai/gpt-5.2')).toBe(false);
+    expect(isOpenRouterAnthropic('openrouter:deepseek/deepseek-chat')).toBe(false);
+    expect(isOpenRouterAnthropic('anthropic:claude-sonnet-4-6')).toBe(false);
+    expect(isOpenRouterAnthropic('')).toBe(false);
+  });
+
+  test('isOpenRouterSubagentFamily matches the OR families with a live abort/retry pin', () => {
+    expect(isOpenRouterSubagentFamily('openrouter:anthropic/claude-haiku-4.5')).toBe(true);
+    expect(isOpenRouterSubagentFamily('openrouter:deepseek/deepseek-v4-flash')).toBe(true);
+    expect(isOpenRouterSubagentFamily('openrouter:DeepSeek/deepseek-chat')).toBe(true);
+    expect(isOpenRouterSubagentFamily('openrouter:openai/gpt-5.2')).toBe(false);
+    expect(isOpenRouterSubagentFamily('openrouter:google/gemini-3-flash-preview')).toBe(false);
+    expect(isOpenRouterSubagentFamily('deepseek:deepseek-v4-flash')).toBe(false);
+    expect(isOpenRouterSubagentFamily('anthropic:claude-sonnet-4-6')).toBe(false);
+    expect(isOpenRouterSubagentFamily('')).toBe(false);
   });
 
   test('alias-chain conflict: forward + reverse for same id (Codex F6)', async () => {
@@ -458,6 +504,64 @@ describe('providerKeyReady + resolveEffectiveChatModel (shared runtime/report re
     });
     expect(resolveEffectiveChatModel(null, { OPENAI_API_KEY: 'sk-test' })).toEqual({
       model: openaiStaticTierFallback().reasoning, source: 'tier_default',
+    });
+  });
+});
+
+// ─── #3813: no anthropic/openai key + a SERVABLE file-plane pin ────────────
+// resolveTierDefault walked PROVIDER_TIER_DEFAULTS (anthropic, openai) and
+// returned the Anthropic TIER_DEFAULTS floor when neither key was present —
+// even when ~/.gbrain/config.json pinned a servable third provider (the
+// DeepSeek-only install from the issue). Every bare `resolveTierDefault(tier)`
+// caller (extract_atoms, facts classify, page-summary, ...) then called a
+// provider with no key. Real config.json under a temp GBRAIN_HOME: the
+// no-env branch is the code path under test, so no injected env here.
+describe('resolveTierDefault — servable file-plane pin beats the Anthropic floor when no anthropic/openai key (#3813)', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-model-config-pin-'));
+    mkdirSync(join(home, '.gbrain'));
+    writeFileSync(
+      join(home, '.gbrain', 'config.json'),
+      JSON.stringify({
+        engine: 'pglite',
+        expansion_model: 'deepseek:deepseek-v4-flash',
+        chat_model: 'deepseek:deepseek-v4-pro',
+      }),
+    );
+    process.env.GBRAIN_HOME = home;
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test('DEEPSEEK_API_KEY only → utility follows expansion_model, other tiers follow chat_model', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: 'sk-test' }, () => {
+      expect(resolveTierDefault('utility')).toBe('deepseek:deepseek-v4-flash');
+      expect(resolveTierDefault('reasoning')).toBe('deepseek:deepseek-v4-pro');
+      expect(resolveTierDefault('deep')).toBe('deepseek:deepseek-v4-pro');
+    });
+  });
+
+  test('no key at all → the pin is unservable → TIER_DEFAULTS unchanged', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: undefined }, () => {
+      expect(resolveTierDefault('utility')).toBe(TIER_DEFAULTS.utility);
+      expect(resolveTierDefault('reasoning')).toBe(TIER_DEFAULTS.reasoning);
+    });
+  });
+
+  test('ANTHROPIC_API_KEY present → key walk wins, the pin is ignored (keyed routing unchanged)', async () => {
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-ant-test', DEEPSEEK_API_KEY: 'sk-test' }, () => {
+      expect(resolveTierDefault('utility')).toBe(TIER_DEFAULTS.utility);
+      expect(resolveTierDefault('reasoning')).toBe(TIER_DEFAULTS.reasoning);
+    });
+  });
+
+  test('injected env stays hermetic: no config read, so no pin', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: 'sk-test' }, () => {
+      expect(resolveTierDefault('utility', { DEEPSEEK_API_KEY: 'sk-test' })).toBe(TIER_DEFAULTS.utility);
     });
   });
 });

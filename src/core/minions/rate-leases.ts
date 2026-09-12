@@ -96,13 +96,16 @@ export async function acquireLease(
       return { acquired: false, activeCount, maxConcurrent };
     }
 
-    const rows = await tx.executeRaw<{ id: number }>(
+    const rows = await tx.executeRaw<{ id: number | bigint }>(
       `INSERT INTO subagent_rate_leases (key, owner_job_id, expires_at)
        VALUES ($1, $2, now() + ($3::double precision * interval '1 millisecond'))
        RETURNING id`,
       [key, ownerJobId, ttlMs],
     );
-    const leaseId = rows[0]!.id;
+    // BIGSERIAL arrives as a native BigInt on Postgres (postgres.js
+    // `types: { bigint }`); PGLite hands back a Number. Coerce once here so
+    // `leaseId` is honestly a number for every caller.
+    const leaseId = Number(rows[0]!.id);
     return { acquired: true, leaseId, activeCount: activeCount + 1, maxConcurrent };
   });
 }
@@ -161,7 +164,12 @@ export async function renewLeaseWithBackoff(engine: BrainEngine, leaseId: number
  * cross-cutting error type (subagent.ts re-exports it for compatibility).
  */
 export class RateLeaseUnavailableError extends Error {
-  constructor(public key: string, public active: number, public max: number) {
+  /**
+   * Optional caller-suggested requeue delay (ms). #4310: the global-LLM-halt
+   * cooldown defers jobs for the REMAINING cooldown, not the 1-3s lease
+   * bounce — worker.ts honors this when present, else leaseFullBackoffMs().
+   */
+  constructor(public key: string, public active: number, public max: number, public retryInMs?: number) {
     super(`rate lease "${key}" full (${active}/${max})`);
     this.name = 'RateLeaseUnavailableError';
   }

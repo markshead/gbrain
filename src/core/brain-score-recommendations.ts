@@ -4,6 +4,7 @@ import { canonicalLookup } from './model-pricing.ts';
 import { lookupEmbeddingPrice, estimateCostFromChars } from './embedding-pricing.ts';
 import { getRecipe } from './ai/recipes/index.ts';
 import { parseModelId } from './ai/model-resolver.ts';
+import { getGatewayAnthropicKeySnapshot } from './ai/anthropic-key.ts';
 
 /**
  * v0.40.x: env-var name → file/DB config field, for hosted embedding providers
@@ -55,6 +56,29 @@ export const HOSTED_EMBED_KEY_CONFIG: Record<string, string> = {
  * Uses the recipe registry (pure data), not the gateway runtime, so this
  * module stays free of AI-SDK coupling and works before engine.connect().
  */
+/**
+ * #3944: chat-key presence for the remediation planner, judged on the planes
+ * both planner surfaces can rely on — process env, the FILE config plane,
+ * and the gateway env snapshot (a DB-plane key that loadConfigWithEngine
+ * already merged into the RUNNING gateway, i.e. a key that is actually
+ * serving chat right now). NOT a raw `engine.getConfig()` read: a DB-only
+ * key that never reached the gateway is unusable on planner paths, and the
+ * raw read is what diverged autopilot from doctor pre-#3944 (doctor's
+ * planner judges the file plane, #2662 is the same rule for embed keys).
+ * The snapshot keeps both surfaces CONVERGENT — it flows through this one
+ * shared helper — while a genuinely-usable key no longer reads as missing.
+ * Shared by loadRecommendationContext and the autopilot dispatch loop.
+ */
+export function chatApiKeyConfigured(
+  fileCfg: { anthropic_api_key?: unknown } | null | undefined,
+): boolean {
+  return !!(
+    process.env.ANTHROPIC_API_KEY ||
+    fileCfg?.anthropic_api_key ||
+    getGatewayAnthropicKeySnapshot()
+  );
+}
+
 export function embeddingProviderConfigured(
   embeddingModel: string | undefined,
   resolveKey: (envVar: string) => boolean,
@@ -303,7 +327,10 @@ export function computeRecommendations(
   // and noExtract:true after T5 lands → extract job is the materializer).
   // ---------------------------------------------------------------------
   if (ctx.repoPath && health.stale_pages > 0) {
-    const params = { mode: 'all', dir: ctx.repoPath };
+    // #3957: carry the source id so the extract job's fs-walk rows land in
+    // (and its watermark stamp targets) the brain source that owns repoPath —
+    // not the 'default' fallback that silently no-ops on federated brains.
+    const params = { mode: 'all', dir: ctx.repoPath, ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}) };
     out.push({
       id: 'extract.all',
       job: 'extract',

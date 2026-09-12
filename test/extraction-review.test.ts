@@ -32,7 +32,7 @@ import {
   PROVENANCE_AUTO_EXTRACTED,
 } from '../src/core/extraction-review.ts';
 import { enrichEntity, extractAndEnrich } from '../src/core/enrichment-service.ts';
-import { rrfFusion, hybridSearch } from '../src/core/search/hybrid.ts';
+import { rrfFusion, hybridSearch, stampUnverifiedExtractions } from '../src/core/search/hybrid.ts';
 import { buildSourceFactorCase } from '../src/core/search/sql-ranking.ts';
 import { operationsByName, OperationError, type OperationContext } from '../src/core/operations.ts';
 import { checkUnverifiedExtractions } from '../src/commands/doctor.ts';
@@ -72,6 +72,7 @@ beforeEach(async () => {
   await engine.executeRaw('DELETE FROM links');
   await engine.executeRaw('DELETE FROM timeline_entries');
   await engine.executeRaw('DELETE FROM pages');
+  await engine.executeRaw('DELETE FROM slug_aliases');
 });
 
 function ctx(over: Partial<OperationContext> = {}): OperationContext {
@@ -175,6 +176,32 @@ describe('rrfFusion compiled-truth boost skip', () => {
 // ---------------------------------------------------------------------------
 
 describe('enrichEntity trust lane', () => {
+  test('resolves slug aliases before checking or writing entity pages', async () => {
+    await engine.putPage('people/aditya-vikram-singh', {
+      title: 'Aditya Vikram Singh',
+      type: 'person',
+      compiled_truth: '# Aditya Vikram Singh',
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+       VALUES ('default', 'people/avsingh', 'people/aditya-vikram-singh')`,
+    );
+
+    const result = await enrichEntity(engine, {
+      entityName: 'Avsingh',
+      entityType: 'person',
+      context: 'canonical identity mention',
+      sourceSlug: 'notes/daily',
+    }, { trusted: true });
+
+    expect(result.slug).toBe('people/aditya-vikram-singh');
+    expect(result.action).toBe('updated');
+    expect(await engine.getPage('people/avsingh')).toBeNull();
+    expect(await engine.getPage('people/aditya-vikram-singh')).not.toBeNull();
+  });
+
   test('default (opts omitted) → fail-closed quarantine markers', async () => {
     const r = await enrichEntity(engine, {
       entityName: 'Mallory Fake',
@@ -232,15 +259,93 @@ describe('enrichEntity trust lane', () => {
     expect(real.score / fake.score).toBeCloseTo(1.2, 5);
   });
 
-  test('getUnverifiedExtractionPageIds returns only marked pages', async () => {
+  test('getUnverifiedExtractionPageIds flags only quarantined pages as unverified', async () => {
     await enrichEntity(engine, { entityName: 'Fake Guy', entityType: 'person', context: 'c', sourceSlug: 's' });
     await enrichEntity(engine, { entityName: 'Real Guy', entityType: 'person', context: 'c', sourceSlug: 's' }, { trusted: true });
     const fake = await engine.getPage('people/fake-guy');
     const real = await engine.getPage('people/real-guy');
-    const set = await engine.getUnverifiedExtractionPageIds([fake!.id, real!.id]);
-    expect(set.has(fake!.id)).toBe(true);
-    expect(set.has(real!.id)).toBe(false);
+    const marks = await engine.getUnverifiedExtractionPageIds([fake!.id, real!.id]);
+    expect(marks.get(fake!.id)).toEqual({ unverified: true, status: 'unverified' });
+    // Trusted write carries no status frontmatter at all → no entry.
+    expect(marks.has(real!.id)).toBe(false);
     expect((await engine.getUnverifiedExtractionPageIds([])).size).toBe(0);
+  });
+
+  test('#4220: non-quarantine statuses (draft/superseded/restricted) surface without the unverified flag', async () => {
+    const statuses = ['draft', 'superseded', 'restricted'] as const;
+    const ids: number[] = [];
+    for (const status of statuses) {
+      await engine.putPage(`notes/status-${status}`, {
+        type: 'note',
+        title: `Status ${status}`,
+        compiled_truth: `A ${status} page.`,
+        timeline: '',
+        frontmatter: { status },
+      });
+      const page = await engine.getPage(`notes/status-${status}`);
+      ids.push(page!.id);
+    }
+    // A page whose status is 'unverified' but WITHOUT auto-extracted
+    // provenance must surface the status while staying un-flagged: the
+    // quarantine lane requires the marker pair.
+    await engine.putPage('notes/status-user-unverified', {
+      type: 'note',
+      title: 'User unverified',
+      compiled_truth: 'User-authored page reusing the status key.',
+      timeline: '',
+      frontmatter: { status: 'unverified' },
+    });
+    const userPage = await engine.getPage('notes/status-user-unverified');
+    ids.push(userPage!.id);
+
+    const marks = await engine.getUnverifiedExtractionPageIds(ids);
+    expect(marks.get(ids[0]!)).toEqual({ unverified: false, status: 'draft' });
+    expect(marks.get(ids[1]!)).toEqual({ unverified: false, status: 'superseded' });
+    expect(marks.get(ids[2]!)).toEqual({ unverified: false, status: 'restricted' });
+    expect(marks.get(userPage!.id)).toEqual({ unverified: false, status: 'unverified' });
+  });
+
+  test('#4220: stampUnverifiedExtractions stamps SearchResult.status always, unverified only for stubs', async () => {
+    await enrichEntity(engine, { entityName: 'Stamp Fake', entityType: 'person', context: 'c', sourceSlug: 's' });
+    await engine.putPage('notes/stamp-draft', {
+      type: 'note',
+      title: 'Stamp Draft',
+      compiled_truth: 'draft body',
+      timeline: '',
+      frontmatter: { status: 'draft' },
+    });
+    await engine.putPage('notes/stamp-clean', {
+      type: 'note',
+      title: 'Stamp Clean',
+      compiled_truth: 'clean body',
+      timeline: '',
+      frontmatter: {},
+    });
+    const stub = await engine.getPage('people/stamp-fake');
+    const draft = await engine.getPage('notes/stamp-draft');
+    const clean = await engine.getPage('notes/stamp-clean');
+
+    const mk = (page: { id: number; slug: string }): SearchResult => ({
+      slug: page.slug,
+      page_id: page.id,
+      title: page.slug,
+      type: 'note',
+      chunk_text: 'x',
+      chunk_source: 'compiled_truth',
+      chunk_id: 0,
+      chunk_index: 0,
+      score: 1,
+      stale: false,
+    });
+    const results = [mk(stub!), mk(draft!), mk(clean!)];
+    await stampUnverifiedExtractions(engine, results);
+
+    expect(results[0]!.status).toBe('unverified');
+    expect(results[0]!.unverified).toBe(true);
+    expect(results[1]!.status).toBe('draft');
+    expect(results[1]!.unverified).toBeUndefined();
+    expect(results[2]!.status).toBeUndefined();
+    expect(results[2]!.unverified).toBeUndefined();
   });
 });
 
@@ -520,13 +625,15 @@ describe('e2e: hostile transcript', () => {
     const real = await engine.getPage('people/zorbulon-realperson');
 
     // 3. Chunk both with equal lexical relevance (distinct texts — identical
-    //    ones would be Jaccard-deduped). Enrichment stubs are chunked by the
-    //    normal reindex/import pipeline later; seed what it would write.
+    //    ones would be Jaccard-deduped). Replace the imported stub's chunk
+    //    and seed the control's chunk with comparable lexical evidence.
     await engine.upsertChunks(stub!.slug, [{ chunk_index: 0, chunk_text: 'zorbulon pivot details from the injected meeting', chunk_source: 'compiled_truth', token_count: 7 }]);
     await engine.upsertChunks(real!.slug, [{ chunk_index: 0, chunk_text: 'zorbulon launch update in my own written notes', chunk_source: 'compiled_truth', token_count: 7 }]);
 
-    // 4. Search. No embedding provider configured → keyword(+title) fusion path.
-    const results = await hybridSearch(engine, 'zorbulon', { limit: 10 });
+    // 4. Select the low-detail authority lane explicitly. The default detail
+    // gives all chunks equal footing; only low enables compiled-truth boost.
+    // No embedding provider configured → keyword(+title) fusion path.
+    const results = await hybridSearch(engine, 'zorbulon', { limit: 10, detail: 'low' });
     const fake = results.find((r) => r.slug === stub!.slug);
     const legit = results.find((r) => r.slug === real!.slug);
     expect(fake).toBeDefined();
@@ -536,7 +643,7 @@ describe('e2e: hostile transcript', () => {
     expect(fake!.unverified).toBe(true);
     expect(legit!.unverified).toBeUndefined();
     // …and stripped of entity authority: the verified page outranks the
-    // injected stub despite identical chunk text (2x compiled-truth boost +
+    // injected stub despite equal lexical relevance (2x compiled-truth boost +
     // people/ source-boost apply only to the verified page).
     expect(legit!.score).toBeGreaterThan(fake!.score);
   });
