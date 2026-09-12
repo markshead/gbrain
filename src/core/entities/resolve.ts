@@ -612,6 +612,13 @@ async function tryNamespaceStripped(
     // (c) exact (not fuzzy) title match on a non-document page, unique —
     //     `companies/evergy` → the page titled "Evergy". Equality, so a
     //     single token is safe here; fuzzy stays refused for it.
+    //     Only for NAMESPACED input (0.50 merge): a bare token (`kiwi`) has no
+    //     invented prefix to strip, and upstream's prefix expansion below owns
+    //     that shape together with its cross-directory ambiguity gate
+    //     (`people/kiwi-example` + `hosts/kiwi` must refuse, not pick the one
+    //     whose title happens to equal the token). Bare hyphenated slugs still
+    //     resolve through arm (a) above (`mark-shead` → `people/mark-shead`).
+    if (!raw.includes('/')) continue;
     try {
       const rows = await engine.executeRaw<{ slug: string }>(
         `SELECT slug FROM pages
