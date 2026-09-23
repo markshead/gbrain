@@ -141,6 +141,14 @@ describe('validatePageSlug', () => {
     expect(() => validatePageSlug('notes/.hidden')).toThrow(OperationError);
   });
 
+  it('accepts a hyphen-LED segment after the first (YouTube ids like -tgg7bkveoo; local patch)', () => {
+    expect(() => validatePageSlug('ks/meetings/2022-07-19/source/audio-transcript/-tgg7bkveoo')).not.toThrow();
+    expect(() => validatePageSlug('a/-b')).not.toThrow();
+    expect(() => validatePageSlug('-tgg7bkveoo')).toThrow(OperationError);      // first segment stays strict
+    expect(() => validatePageSlug('-a/b')).toThrow(OperationError);
+    expect(() => validatePageSlug('a/-/../b')).toThrow(OperationError);        // traversal still fenced
+  });
+
   it('rejects dot-LED segments (dots are continuation-only)', () => {
     expect(() => validatePageSlug('notes/.hidden')).toThrow(OperationError);
     expect(() => validatePageSlug('.git/config')).toThrow(OperationError);

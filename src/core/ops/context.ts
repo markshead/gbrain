@@ -95,6 +95,12 @@ export function validateUploadPath(filePath: string, root: string, strict = true
 // them recreates the un-updatable-synced-page class this widen closes.
 // Dot stays continuation-only — `..` traversal remains impossible.
 const OP_PAGE_SLUG_SEG = `[${SLUG_WORD_CHARS}_][${SLUG_WORD_CHARS}._\\-]*`;
+// Local patch 2026-09-22 (gbn Q13): a hyphen may LEAD a segment after the first. YouTube video
+// ids can start with '-' (e.g. `-tgg7bkveoo`), and gbn keys audio-transcript pages on the
+// recording's id, so 7 live pages were un-updatable by every write path (capture failed closed).
+// The first segment keeps the strict lead (no '-foo' slug that a CLI could read as an option);
+// dots stay continuation-only, so `..` traversal is still impossible.
+const OP_PAGE_SLUG_TAIL_SEG = `[${SLUG_WORD_CHARS}_\\-][${SLUG_WORD_CHARS}._\\-]*`;
 
 /**
  * Allowlist validator for page slugs. Rejects URL-encoded traversal, backslashes,
@@ -112,7 +118,7 @@ export function validatePageSlug(slug: string): void {
   // #3417: letters/numbers from any script allowed in segments (u flag required
   // for the \p{...} classes in OP_PAGE_SLUG_SEG). Shape rules (word-char lead,
   // dot/underscore/hyphen continuation) preserved.
-  if (!new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_SEG})*$`, 'iu').test(slug)) {
+  if (!new RegExp(`^${OP_PAGE_SLUG_SEG}(\\/${OP_PAGE_SLUG_TAIL_SEG})*$`, 'iu').test(slug)) {
     throw new OperationError('invalid_params', `Invalid page_slug: ${slug} (allowed: letters/numbers in any script, with '.', '_', '-' after the first character of a segment, forward-slash separated segments)`);
   }
 }
