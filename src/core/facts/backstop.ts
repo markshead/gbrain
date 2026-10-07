@@ -619,6 +619,13 @@ async function runPipelineBodyInner(
   };
   const survived: SurvivedFact[] = [];
 
+  // Local patch 2026-10-06 (gbxheld): drop facts whose entity is a newsroom person or body
+  // on this brain's deny list (gbx only; a brain without the config key is unaffected).
+  const { loadNewsroomEntityGuard, checkNewsroomEntity, logNewsroomEntityGuardDrops } =
+    await import('./newsroom-entity-guard.ts');
+  const newsroomGuard = await loadNewsroomEntityGuard(ctx.engine);
+  const guardDrops: Array<{ entity: string; key: string; gbnSlug: string }> = [];
+
   for (const f of facts) {
     if (abortSignal?.aborted) break;
 
@@ -630,6 +637,12 @@ async function runPipelineBodyInner(
       : null;
     const resolvedSlug = resolved?.slug ?? null;
     const resolutionSource = resolved?.source ?? null;
+
+    const guardDecision = checkNewsroomEntity(newsroomGuard, f.entity_slug, resolvedSlug);
+    if (guardDecision.blocked) {
+      guardDrops.push({ entity: f.entity_slug ?? '', key: guardDecision.key ?? '', gbnSlug: guardDecision.gbnSlug ?? '' });
+      continue;
+    }
 
     // Dedup against DB candidates (correct per Codex Q7: fence rows
     // have no embeddings; FS lock + sync invariant means DB == fence
@@ -662,6 +675,8 @@ async function runPipelineBodyInner(
 
     survived.push({ f, resolvedSlug, resolutionSource });
   }
+
+  await logNewsroomEntityGuardDrops(ctx.engine, ctx.sourceId, input.pageSlug ?? input.ref ?? ctx.sessionId ?? 'turn', guardDrops);
 
   if (survived.length === 0) {
     return { inserted, duplicate, superseded, fact_ids, entity_slugs: [] };

@@ -1,0 +1,205 @@
+{
+ "guard": {
+  "version": 2,
+  "deny": {
+   "alice-example": "people/alice-example",
+   "alice-q-example": "people/alice-example",
+   "acme-county-commission": "xx/acme-county/commission",
+   "xx-acme-county-commission": "xx/acme-county/commission",
+   "usd-999": "xx/usd-999",
+   "xx-usd-999": "xx/usd-999",
+   "bob-example": "people/bob-example",
+   "carol-example": "people/carol-example"
+  },
+  "allow_keys": [
+   "bob-example"
+  ],
+  "allow_slugs": [
+   "people/carol-example-acme-com",
+   "clients/carol-example"
+  ]
+ },
+ "normalize": [
+  [
+   "Alice \"Q\" Example",
+   "alice-q-example"
+  ],
+  [
+   "people/alice-example",
+   "people-alice-example"
+  ],
+  [
+   "Acme County  Commission",
+   "acme-county-commission"
+  ],
+  [
+   "Smith & Sons",
+   "smith-and-sons"
+  ],
+  [
+   "  O'Brien  ",
+   "obrien"
+  ],
+  [
+   "﻿clients/alice-example",
+   "clients-alice-example"
+  ],
+  [
+   "",
+   ""
+  ]
+ ],
+ "decide": [
+  {
+   "raw": "alice-example",
+   "resolved": null,
+   "blocked": true,
+   "why": "bare person slug"
+  },
+  {
+   "raw": "people/alice-example",
+   "resolved": "people/alice-example",
+   "blocked": true,
+   "why": "namespaced person slug, last segment"
+  },
+  {
+   "raw": "Alice \"Q\" Example",
+   "resolved": null,
+   "blocked": true,
+   "why": "display name with nickname"
+  },
+  {
+   "raw": "xx/acme-county/commission",
+   "resolved": null,
+   "blocked": true,
+   "why": "government body full slug"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "blocked": true,
+   "why": "government body title"
+  },
+  {
+   "raw": "schools/usd-999",
+   "resolved": null,
+   "blocked": true,
+   "why": "government body under an invented namespace (last segment)"
+  },
+  {
+   "raw": "commission",
+   "resolved": null,
+   "blocked": false,
+   "why": "single generic token is never a key"
+  },
+  {
+   "raw": "bob-example",
+   "resolved": null,
+   "blocked": false,
+   "why": "allow_keys (ad campaign person)"
+  },
+  {
+   "raw": "carol-example",
+   "resolved": "clients/carol-example",
+   "blocked": false,
+   "why": "stored slug is on the exact allow list"
+  },
+  {
+   "raw": "carol-example",
+   "resolved": "people/carol-example-acme-com",
+   "blocked": false,
+   "why": "stored slug is an allowed email-keyed page"
+  },
+  {
+   "raw": "ad-creation/carol-example",
+   "resolved": null,
+   "blocked": true,
+   "why": "a namespace prefix alone never allows (v2)"
+  },
+  {
+   "raw": "ad-creation/alice-example",
+   "resolved": "people/alice-example",
+   "blocked": true,
+   "why": "only the stored identity can allow (sweep parity)"
+  },
+  {
+   "raw": "﻿clients/alice-example",
+   "resolved": null,
+   "blocked": true,
+   "why": "BOM is not whitespace in either implementation"
+  },
+  {
+   "raw": "  clients/carol-example  ",
+   "resolved": null,
+   "blocked": false,
+   "why": "ASCII whitespace is trimmed before the allow-list check"
+  },
+  {
+   "raw": "dave-example",
+   "resolved": "people/dave-example",
+   "blocked": false,
+   "why": "not on the deny list"
+  },
+  {
+   "raw": null,
+   "resolved": null,
+   "blocked": false,
+   "why": "no entity"
+  },
+  {
+   "raw": "news-pipeline/index",
+   "resolved": "news-pipeline/index",
+   "blocked": false,
+   "why": "business/pipeline page"
+  },
+  {
+   "raw": "alice-example",
+   "resolved": "clients/zed-example",
+   "blocked": true,
+   "why": "mis-resolved into an unlisted clients/ slug stays blocked"
+  }
+ ],
+ "invalid_configs": [
+  null,
+  "",
+  "   ",
+  "{not json",
+  "[]",
+  "\"x\"",
+  "{\"version\": 2, \"deny\": []}",
+  "{\"version\": 2, \"deny\": {}}",
+  "{\"deny\": {\"alice-example\": \"p\"}}",
+  "{\"version\": 3, \"deny\": {\"alice-example\": \"p\"}}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": 7}}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": {\"alice-example\": true}}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": 1}",
+  "{\"version\": 1, \"deny\": {\"alice-example\": \"p\"}}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slug_prefixes\": [\"clients/\"]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": [\"clients/x\", 3]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": null}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}"
+ ],
+ "generator_keys": [
+  [
+   "O'Brien Example",
+   [
+    "obrien-example",
+    "o-brien-example"
+   ]
+  ],
+  [
+   "José Example",
+   [
+    "jos-example",
+    "jose-example"
+   ]
+  ],
+  [
+   "Đăng Example",
+   [
+    "ng-example",
+    "dang-example"
+   ]
+  ]
+ ]
+}
