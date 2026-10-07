@@ -4,7 +4,7 @@
  * This box runs two brains: gbx (business, the default) and gbn (newsroom). Newsroom people
  * (officials, residents, meeting speakers) and government bodies belong only in gbn. gbx pages
  * that are legitimate pipeline records still name them, and the gbx facts extractor turned those
- * mentions into person facts in gbx (2026-09-19: six facts about a Fort Scott resident from one
+ * mentions into person facts in gbx (2026-09-19: six facts about one local resident from one
  * method lesson).
  *
  * The guard drops a fact before insert when its entity is on a deny list built from gbn, unless
@@ -55,7 +55,7 @@ export function trimAscii(s: string): string {
 /**
  * Normalize an entity string to a comparison key. Lowercase, quotes and apostrophes dropped,
  * `&` read as "and", every other run of characters outside [a-z0-9] collapsed to a single `-`.
- * `Kevin "Skitch" Allen` -> `kevin-skitch-allen`; `people/joe-allen` -> `people-joe-allen`.
+ * `Alice "Q" Example` -> `alice-q-example`; `people/alice-example` -> `people-alice-example`.
  * Must stay identical to `norm()` in ~/.claude/bin/gbx-newsroom-entity-guard.
  */
 export function normalizeEntityKey(s: string): string {

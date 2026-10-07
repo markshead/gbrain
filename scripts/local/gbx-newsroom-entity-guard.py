@@ -1,7 +1,7 @@
-#!/home/markshead/.venvs/sky/bin/python -I
+#!/usr/bin/env python3
 """gbx-newsroom-entity-guard — keep newsroom people and government bodies out of gbx facts.
 
-Mark, 2026-10-06: newsroom people belong in gbn, never gbx (gbx `meta/two-brain-governance`).
+Owner decision, 2026-10-06: newsroom people belong in gbn, never gbx (gbx `meta/two-brain-governance`).
 The gbrain fork's facts extractor drops a fact whose entity is on a deny list stored in gbx config
 `facts.newsroom_entity_guard` (src/core/facts/newsroom-entity-guard.ts). This script builds that
 list from gbn and sweeps up facts that slipped past it.
@@ -21,12 +21,13 @@ import datetime, json, os, re, sys
 
 CONFIG_KEY = 'facts.newsroom_entity_guard'
 ENV_FILE = os.path.expanduser('~/.config/gbrain/env')
-SNAPSHOT = os.path.expanduser('~/.gbrain/newsroom-entity-guard.json')
-LOG = os.path.expanduser('~/.claude/logs/gbx-newsroom-guard.log')
-BACKUP_DIR = os.path.expanduser('~/backups/gbrain')
+SNAPSHOT = os.environ.get('GBX_GUARD_SNAPSHOT') or os.path.expanduser('~/.gbrain/newsroom-entity-guard.json')
+# Overridable for the integration test (scripts/local/test-gbx-newsroom-entity-guard-pg.sh).
+LOG = os.environ.get('GBX_GUARD_LOG') or os.path.expanduser('~/.claude/logs/gbx-newsroom-guard.log')
+BACKUP_DIR = os.environ.get('GBX_GUARD_BACKUP_DIR') or os.path.expanduser('~/backups/gbrain')
 FIXTURE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'test', 'fixtures', 'newsroom-entity-guard-cases.json')
 
-# Mark's default allowlist (2026-10-06): email-keyed people/*, clients/*, ad-creation/*, and anyone
+# The owner's default allowlist (2026-10-06): email-keyed people/*, clients/*, ad-creation/*, and anyone
 # who appears in ad campaigns. Email-keyed pages end in the email's domain.
 # Allowed entity pages are listed EXACTLY (v2): every gbx clients/* page and every email-keyed
 # people/* page (title carries the address). A namespace prefix alone never allows. `refresh`
@@ -34,8 +35,16 @@ FIXTURE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 
 # Sanity floors: refuse to publish a list much smaller than expected (a broken gbn query would
 # otherwise publish a near-empty list that silently lets everything through).
 FLOOR_PEOPLE, FLOOR_BODIES, MAX_SHRINK = 400, 40, 0.20
-# The brain's owner is never a newsroom entity in gbx.
-ALWAYS_ALLOW_KEYS = ['mark-shead']
+# Operator-reviewed extra allow keys (e.g. the brain's owner), one per line, kept OUTSIDE the
+# repo so no real name is checked in. Missing file = none.
+EXTRA_ALLOW_FILE = os.environ.get('GBX_GUARD_EXTRA_ALLOW') or os.path.expanduser('~/.config/gbrain/newsroom-guard-allow.txt')
+
+
+def extra_allow_keys():
+    try:
+        return {norm(l.split('#', 1)[0]) for l in open(EXTRA_ALLOW_FILE) if norm(l.split('#', 1)[0])}
+    except FileNotFoundError:
+        return set()
 
 
 # ---- matching (must mirror src/core/facts/newsroom-entity-guard.ts) ----
@@ -137,8 +146,11 @@ def env():
 
 def conns():
     import psycopg2
-    e = env()
-    return psycopg2.connect(e['XERIC_DATABASE_URL']), psycopg2.connect(e['NEWSROOM_DATABASE_URL'])
+    xu, nu = os.environ.get('GBX_GUARD_XERIC_URL'), os.environ.get('GBX_GUARD_NEWSROOM_URL')
+    if not (xu and nu):
+        e = env()
+        xu, nu = e['XERIC_DATABASE_URL'], e['NEWSROOM_DATABASE_URL']
+    return psycopg2.connect(xu), psycopg2.connect(nu)
 
 
 def log(msg):
@@ -183,7 +195,7 @@ def build(gx, gn):
         for k in ks:
             deny.setdefault(k, slug)
 
-    allow, reasons = set(ALWAYS_ALLOW_KEYS), {}
+    allow, reasons = extra_allow_keys(), {}
     # (a) anyone who appears in an ad campaign: a gbn person named (or wikilinked) in gbx ad-creation/*
     cx.execute("select slug, lower(compiled_truth || ' ' || coalesce(timeline, '')) from pages "
                "where deleted_at is null and source_id = 'default' and slug like 'ad-creation/%%'")
