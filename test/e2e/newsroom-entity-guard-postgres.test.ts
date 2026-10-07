@@ -80,6 +80,9 @@ describe.skipIf(skip)('newsroom entity guard on Postgres', () => {
       { engine: view(), sourceId: 'default', sessionId: null, source: 'mcp:put_page', mode: 'inline' });
     const rows = await engine.executeRaw<{ fact: string }>(`SELECT fact FROM facts WHERE fact LIKE '${TAG} body via%' ORDER BY fact`);
     expect(rows.map((x) => x.fact)).toEqual([`${TAG} body via pipeline`]);
+    // writer -> sweep invariant: the stored context is the source page the guard decided on
+    const ctxRows = await engine.executeRaw<{ context: string | null }>(`SELECT context FROM facts WHERE fact = $1`, [`${TAG} body via pipeline`]);
+    expect(ctxRows[0]?.context).toBe(`news-pipeline/${TAG}`);
   });
 
   test('writeSingleFact refuses a guarded entity', async () => {

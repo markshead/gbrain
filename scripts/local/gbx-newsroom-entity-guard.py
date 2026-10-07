@@ -137,7 +137,8 @@ def parse_guard(raw):
     if not isinstance(o, dict) or o.get('version') != 2 or 'allow_slug_prefixes' in o:
         return None
     bp = _str_list(o.get('body_allow_source_prefixes', _ABSENT))
-    if bp is None or any(not trim_ascii(x).endswith('/') or trim_ascii(x) == '/' for x in bp):
+    bs = _str_list(o.get('body_slugs', _ABSENT))
+    if bp is None or bs is None or any(not trim_ascii(x).endswith('/') or trim_ascii(x) == '/' for x in bp):
         return None
     d = o.get('deny')
     if not isinstance(d, dict):
@@ -157,7 +158,8 @@ def parse_guard(raw):
     return {'deny': deny,
             'allow_keys': {norm(k) for k in ak if norm(k)},
             'allow_slugs': {trim_ascii(s) for s in sl if trim_ascii(s)},
-            'body_prefixes': [trim_ascii(x) for x in bp]}
+            'body_prefixes': [trim_ascii(x) for x in bp],
+            'body_slugs': {trim_ascii(x) for x in bs if trim_ascii(x)}}
 
 
 def decide(g, raw, resolved, source_page=None):
@@ -178,7 +180,7 @@ def decide(g, raw, resolved, source_page=None):
         for k in candidate_keys(s):
             if k in g['deny']:
                 src = trim_ascii(source_page) if isinstance(source_page, str) else ''
-                if src and not g['deny'][k].startswith('people/') and any(src.startswith(p) for p in g['body_prefixes']):
+                if src and g['deny'][k] in g['body_slugs'] and any(src.startswith(p) for p in g['body_prefixes']):
                     return (False, None, None)
                 return (True, k, g['deny'][k])
     return (False, None, None)
@@ -307,6 +309,7 @@ def build(gx, gn):
         'allow_keys': sorted(allow),
         'allow_slugs': sorted(allow_slugs),
         'body_allow_source_prefixes': BODY_ALLOW_SOURCE_PREFIXES,
+        'body_slugs': sorted(s for s, v in per_ent.items() if v[1] != 'person'),
         'allow_reasons': reasons,
         'counts': {'gbn_people': sum(1 for v in per_ent.values() if v[1] == 'person'),
                    'gbn_bodies': sum(1 for v in per_ent.values() if v[1] != 'person'),
@@ -490,7 +493,12 @@ def cmd_test():
         if sorted(want) != got:
             bad += 1
             print('FAIL name_keys %r -> %r, want %r' % (inp, got, sorted(want)))
-    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs']) + len(cases.get('generator_keys', []))
+    for nc in cases.get('no_carveout_configs', []):
+        g2 = parse_guard(json.dumps(nc['config']))
+        if g2 is None or not decide(g2, nc['raw'], None, nc['source'])[0]:
+            bad += 1
+            print('FAIL no-carveout: %s' % nc['why'])
+    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs']) + len(cases.get('generator_keys', [])) + len(cases.get('no_carveout_configs', []))
     print('%d/%d passed' % (total - bad, total))
     sys.exit(1 if bad else 0)
 

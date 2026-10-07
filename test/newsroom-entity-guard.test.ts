@@ -55,6 +55,13 @@ describe('checkNewsroomEntity (shared cases)', () => {
       expect(checkNewsroomEntity(g, c.raw, c.resolved, c.source ?? null).blocked).toBe(c.blocked);
     });
   }
+  for (const nc of CASES.no_carveout_configs as Array<{ why: string; config: unknown; raw: string; source: string }>) {
+    test(nc.why, () => {
+      const g2 = parseNewsroomEntityGuard(JSON.stringify(nc.config));
+      expect(g2).not.toBeNull();
+      expect(checkNewsroomEntity(g2, nc.raw, null, nc.source).blocked).toBe(true);
+    });
+  }
   test('no guard never blocks', () => {
     expect(checkNewsroomEntity(null, 'alice-example', null).blocked).toBe(false);
   });

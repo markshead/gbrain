@@ -9,7 +9,8 @@
    "usd-999": "xx/usd-999",
    "xx-usd-999": "xx/usd-999",
    "bob-example": "people/bob-example",
-   "carol-example": "people/carol-example"
+   "carol-example": "people/carol-example",
+   "ghost-org": "orgs/ghost-org"
   },
   "allow_keys": [
    "bob-example"
@@ -21,6 +22,10 @@
   "body_allow_source_prefixes": [
    "news-pipeline/",
    "tools/"
+  ],
+  "body_slugs": [
+   "xx/acme-county/commission",
+   "xx/usd-999"
   ]
  },
  "normalize": [
@@ -203,6 +208,13 @@
    "source": "news-pipelinex/run",
    "blocked": true,
    "why": "source prefix match is segment-exact"
+  },
+  {
+   "raw": "ghost-org",
+   "resolved": null,
+   "source": "news-pipeline/run",
+   "blocked": true,
+   "why": "a non-person deny entry NOT on body_slugs gets no source carve-out"
   }
  ],
  "invalid_configs": [
@@ -225,7 +237,9 @@
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": null}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": \"news-pipeline/\"}",
-  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": [\"news-pipeline\"]}"
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": [\"news-pipeline\"]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": [\"news-pipeline/\", 3]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_slugs\": \"xx/a\"}"
  ],
  "generator_keys": [
   [
@@ -249,5 +263,32 @@
     "dang-example"
    ]
   ]
+ ],
+ "no_carveout_configs": [
+  {
+   "why": "valid config without the body fields keeps bodies blocked",
+   "config": {
+    "version": 2,
+    "deny": {
+     "acme-county-commission": "xx/acme-county/commission"
+    }
+   },
+   "raw": "Acme County Commission",
+   "source": "news-pipeline/run"
+  },
+  {
+   "why": "prefixes without body_slugs keep bodies blocked",
+   "config": {
+    "version": 2,
+    "deny": {
+     "acme-county-commission": "xx/acme-county/commission"
+    },
+    "body_allow_source_prefixes": [
+     "news-pipeline/"
+    ]
+   },
+   "raw": "Acme County Commission",
+   "source": "news-pipeline/run"
+  }
  ]
 }

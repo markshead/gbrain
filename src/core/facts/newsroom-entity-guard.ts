@@ -17,8 +17,9 @@
  *     "deny": { "<key>": "<gbn slug it came from>", ... },        non-empty object of strings
  *     "allow_keys": ["<key>", ...],                               optional array of strings
  *     "allow_slugs": ["people/x-acme-com", "clients/y", ...],     optional array of strings
- *     "body_allow_source_prefixes": ["news-pipeline/", ...] }    optional; each entry ends in "/"
- * A government-body fact (deny entry whose gbn slug is not people/...) is ALLOWED when the page it
+ *     "body_allow_source_prefixes": ["news-pipeline/", ...],     optional; each entry ends in "/"
+ *     "body_slugs": ["ks/x/commission", ...] }                   optional; the gbn slugs that are bodies
+ * A government-body fact (deny entry whose gbn slug is listed in body_slugs) is ALLOWED when the page it
  * was extracted from starts with one of body_allow_source_prefixes: pipeline and runbook facts that
  * merely name a body stay in gbx; civic facts about the body go to gbn (owner, 2026-10-07). People
  * are never allowed this way.
@@ -43,6 +44,7 @@ export interface NewsroomEntityGuard {
   allowKeys: Set<string>;
   allowSlugs: Set<string>;
   bodyAllowSourcePrefixes: string[];
+  bodySlugs: Set<string>;
 }
 
 export interface GuardDecision {
@@ -117,13 +119,15 @@ export function parseNewsroomEntityGuard(raw: string | null | undefined): Newsro
   const allowKeys = stringArray(o.allow_keys);
   const allowSlugs = stringArray(o.allow_slugs);
   const bodyPrefixes = stringArray(o.body_allow_source_prefixes);
-  if (!allowKeys || !allowSlugs || !bodyPrefixes) return null;
+  const bodySlugs = stringArray(o.body_slugs);
+  if (!allowKeys || !allowSlugs || !bodyPrefixes || !bodySlugs) return null;
   if (bodyPrefixes.some((p) => !trimAscii(p).endsWith('/') || trimAscii(p) === '/')) return null;
   return {
     deny,
     allowKeys: new Set(allowKeys.map(normalizeEntityKey).filter(Boolean)),
     allowSlugs: new Set(allowSlugs.map(trimAscii).filter(Boolean)),
     bodyAllowSourcePrefixes: bodyPrefixes.map(trimAscii),
+    bodySlugs: new Set(bodySlugs.map(trimAscii).filter(Boolean)),
   };
 }
 
@@ -150,7 +154,7 @@ export function checkNewsroomEntity(
       const gbnSlug = guard.deny.get(k);
       if (gbnSlug !== undefined) {
         const src = typeof sourcePage === 'string' ? trimAscii(sourcePage) : '';
-        if (src && !gbnSlug.startsWith('people/') && guard.bodyAllowSourcePrefixes.some((p) => src.startsWith(p))) {
+        if (src && guard.bodySlugs.has(gbnSlug) && guard.bodyAllowSourcePrefixes.some((p) => src.startsWith(p))) {
           return { blocked: false };
         }
         return { blocked: true, key: k, gbnSlug };
