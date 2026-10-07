@@ -291,6 +291,22 @@ def load_guard(gx):  # used by `check`
     return parse_guard(r[0] if r else None)
 
 
+def old_serve_count(since):
+    """How many `gbrain serve` processes started before `since` (they run pre-guard code)."""
+    if not since:
+        return None
+    import subprocess
+    try:
+        cut = datetime.datetime.fromisoformat(since.replace('Z', '+00:00'))
+        if cut.tzinfo is None:
+            cut = cut.astimezone()
+        age = (datetime.datetime.now(datetime.timezone.utc) - cut).total_seconds()
+        out = subprocess.run(['ps', '-eo', 'etimes=,args='], capture_output=True, text=True).stdout
+        return sum(1 for l in out.splitlines() if 'gbrain serve' in l and int(l.split(None, 1)[0]) > age)
+    except Exception:
+        return None
+
+
 def cmd_sweep(since, dry):
     gx, gn = conns()
     check_brains(gx, gn)
@@ -306,6 +322,7 @@ def cmd_sweep(since, dry):
         print('no guard configured; nothing to do')
         return
     g = parse_guard(r[0])
+    policy = __import__('hashlib').md5(r[0].encode()).hexdigest()[:12]
     if g is None:
         log('sweep: REFUSED, guard config is invalid')
         sys.exit('guard config is invalid; refusing to sweep')
@@ -319,6 +336,7 @@ def cmd_sweep(since, dry):
     print('%d active unfenced facts blocked by the guard%s' % (len(ids), ' (dry run)' if dry else ''))
     if not ids:
         gx.rollback()
+        log('sweep: 0 to expire (since=%s, policy=%s, old serve processes=%s)' % (since, policy, old_serve_count(since)))
         return
     c.execute("""select row_to_json(t) from (select id, source_id, entity_slug, fact, kind, visibility, notability,
                    context, valid_from, valid_until, expired_at, superseded_by, source, source_session, confidence,
@@ -344,7 +362,8 @@ def cmd_sweep(since, dry):
                   "and row_num is null", (fid, ent))
         n += c.rowcount
     gx.commit()
-    log('sweep: expired %d facts (since=%s); backup %s' % (n, since, path))
+    log('sweep: expired %d facts (since=%s, policy=%s, old serve processes=%s); backup %s'
+        % (n, since, policy, old_serve_count(since), path))
     print('expired %d; backup %s' % (n, path))
 
 
