@@ -64,6 +64,9 @@ done
     ('default','people/alice-example','F1 fenced alice row','test', 1, 'people/alice-example');"
   echo "insert into facts (source_id, entity_slug, fact, source, row_num, source_markdown_slug) values
     ('default','people/alice-example','A9 conversation alice row','cli:extract-conversation-facts', 5, 'sessions/example');"
+  echo "insert into facts (source_id, entity_slug, fact, source, context) values
+    ('default','ks/acme-county/commission','C2 pipeline run named the commission','test','news-pipeline/run-2026-09-01'),
+    ('default','ks/acme-county/commission','C3 civic fact from a locality page','test','localities/acme');"
   echo "insert into facts (source_id, entity_slug, fact, source, expired_at) values
     ('default','people/alice-example','E1 already expired','test', now() - interval '1 day');"
   echo "commit;"
@@ -81,6 +84,7 @@ eq "alice is denied" "$(P -d gbrain -c "select (value::jsonb->'deny') ? 'alice-e
 eq "single-token last segment is never a key" "$(P -d gbrain -c "select (value::jsonb->'deny') ? 'commission' from config where key='facts.newsroom_entity_guard'")" "f"
 eq "body full slug denied" "$(P -d gbrain -c "select (value::jsonb->'deny') ? 'ks-acme-county-commission' from config where key='facts.newsroom_entity_guard'")" "t"
 eq "ad-campaign person allowed" "$(P -d gbrain -c "select (value::jsonb->'allow_keys') ? 'bob-example' from config where key='facts.newsroom_entity_guard'")" "t"
+eq "body slugs are listed explicitly" "$(P -d gbrain -c "select (value::jsonb->'body_slugs') ? 'ks/acme-county/commission' from config where key='facts.newsroom_entity_guard'")" "t"
 eq "client page listed exactly" "$(P -d gbrain -c "select (value::jsonb->'allow_slugs') ? 'clients/carol-example' from config where key='facts.newsroom_entity_guard'")" "t"
 
 # wrong database name -> refused
@@ -96,7 +100,7 @@ P -d newsroom -c "update pages set deleted_at = null" >/dev/null
 
 # sweep dry run changes nothing
 "$PY" -I "$SCRIPT" sweep --dry-run >"$T/dry.out" 2>&1
-eq "dry run reports 4 blocked" "$(grep -o '^[0-9]* active unfenced facts' "$T/dry.out" | grep -o '^[0-9]*')" "4"
+eq "dry run reports 5 blocked" "$(grep -o '^[0-9]* active unfenced facts' "$T/dry.out" | grep -o '^[0-9]*')" "5"
 eq "dry run expires nothing" "$(P -d gbrain -c "select count(*) from facts where expired_at is not null")" "1"
 
 # advisory lock held by another session -> sweep refuses
@@ -119,12 +123,14 @@ eq "refresh warns about a never key that matches no one" "$(grep -c 'never-allow
 mkdir -p "$T/unreadable-never"
 if GBX_GUARD_NEVER_ALLOW="$T/unreadable-never" "$PY" -I "$SCRIPT" refresh --dry-run >"$T/never-bad.out" 2>&1; then bad "refresh refuses an unreadable never-allow file"; else grep -q "refusing: cannot read never-allow file" "$T/never-bad.out" && ok "refresh refuses an unreadable never-allow file" || bad "unreadable never-allow (wrong message: $(tail -1 "$T/never-bad.out"))"; fi
 
+eq "check CLI honours the source page" "$("$PY" -I "$SCRIPT" check 'Acme County Commission' '' 'news-pipeline/run' | cut -c1-6)" "(False"
+
 # real sweep
 "$PY" -I "$SCRIPT" sweep >"$T/sweep.out" 2>&1 || { bad "sweep runs"; cat "$T/sweep.out"; }
-eq "expired exactly A1, A2, A9 (conversation row), B1 (never-allow), C1" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at > now() - interval '1 minute'")" "A1,A2,A9,B1,C1"
-eq "allowed, fenced and other rows untouched" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at is null")" "D1,F1,K1"
+eq "expired exactly A1, A2, A9 (conversation row), B1 (never-allow), C1, C3 (civic body)" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at > now() - interval '1 minute'")" "A1,A2,A9,B1,C1,C3"
+eq "allowed, fenced, pipeline-body and other rows untouched" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at is null")" "C2,D1,F1,K1"
 bk=$(ls "$T/backups"/gbx-newsroom-guard-sweep-*.jsonl 2>/dev/null | head -1)
-eq "backup has 5 lossless rows" "$(wc -l < "$bk" | tr -d ' ')" "5"
+eq "backup has 6 lossless rows" "$(wc -l < "$bk" | tr -d ' ')" "6"
 eq "backup row carries full fact text and pre-expiry state" "$("$PY" -I -c "import json,sys; r=[json.loads(l) for l in open(sys.argv[1])]; print(all(x['expired_at'] is None and x['fact'] for x in r))" "$bk")" "True"
 
 # invalid config -> sweep refuses, nothing changes

@@ -50,9 +50,16 @@ describe('parseNewsroomEntityGuard', () => {
 
 describe('checkNewsroomEntity (shared cases)', () => {
   const g = parseNewsroomEntityGuard(GUARD_JSON);
-  for (const c of CASES.decide as Array<{ raw: string | null; resolved: string | null; blocked: boolean; why: string }>) {
+  for (const c of CASES.decide as Array<{ raw: string | null; resolved: string | null; source?: string | null; blocked: boolean; why: string }>) {
     test(`${c.why}: ${JSON.stringify(c.raw)} / ${JSON.stringify(c.resolved)} -> ${c.blocked ? 'blocked' : 'kept'}`, () => {
-      expect(checkNewsroomEntity(g, c.raw, c.resolved).blocked).toBe(c.blocked);
+      expect(checkNewsroomEntity(g, c.raw, c.resolved, c.source ?? null).blocked).toBe(c.blocked);
+    });
+  }
+  for (const nc of CASES.no_carveout_configs as Array<{ why: string; config: unknown; raw: string; source: string }>) {
+    test(nc.why, () => {
+      const g2 = parseNewsroomEntityGuard(JSON.stringify(nc.config));
+      expect(g2).not.toBeNull();
+      expect(checkNewsroomEntity(g2, nc.raw, null, nc.source).blocked).toBe(true);
     });
   }
   test('no guard never blocks', () => {
@@ -206,6 +213,18 @@ describe('pipeline (runFactsBackstop) with the guard set', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const log = await (engine as any).db.query("SELECT summary FROM ingest_log WHERE source_type = 'facts:guard' ORDER BY id DESC LIMIT 1");
     expect(log.rows[0].summary).toContain('newsroom_entity_guard: dropped 2');
+  });
+
+  test('a body fact extracted from a pipeline page is kept; from another page it is dropped', async () => {
+    await engine.setConfig(NEWSROOM_ENTITY_GUARD_CONFIG_KEY, GUARD_JSON);
+    chatStub([{ fact: 'guard-test-body: commission meets mondays', entity: 'Acme County Commission' }]);
+    const pipe = { ...page(), slug: 'news-pipeline/guard-body-' + Math.random().toString(36).slice(2, 7) };
+    const r1 = await runFactsBackstop(pipe, { ...ctx(), engine: freshEngineView() });
+    if (r1.mode === 'inline') expect(r1.inserted).toBe(1);
+    chatStub([{ fact: 'guard-test-body2: commission voted', entity: 'Acme County Commission' }]);
+    const other = { ...page(), slug: 'localities/guard-body-' + Math.random().toString(36).slice(2, 7) };
+    const r2 = await runFactsBackstop(other, { ...ctx(), engine: freshEngineView() });
+    if (r2.mode === 'inline') expect(r2.inserted).toBe(0);
   });
 
   test('no config key: nothing is dropped (gbn and upstream behaviour)', async () => {

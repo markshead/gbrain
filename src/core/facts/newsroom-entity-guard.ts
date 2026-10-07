@@ -16,7 +16,13 @@
  *   { "version": 2,
  *     "deny": { "<key>": "<gbn slug it came from>", ... },        non-empty object of strings
  *     "allow_keys": ["<key>", ...],                               optional array of strings
- *     "allow_slugs": ["people/x-acme-com", "clients/y", ...] }    optional array of strings
+ *     "allow_slugs": ["people/x-acme-com", "clients/y", ...],     optional array of strings
+ *     "body_allow_source_prefixes": ["news-pipeline/", ...],     optional; each entry ends in "/"
+ *     "body_slugs": ["ks/x/commission", ...] }                   optional; the gbn slugs that are bodies
+ * A government-body fact (deny entry whose gbn slug is listed in body_slugs) is ALLOWED when the page it
+ * was extracted from starts with one of body_allow_source_prefixes: pipeline and runbook facts that
+ * merely name a body stay in gbx; civic facts about the body go to gbn (owner, 2026-10-07). People
+ * are never allowed this way.
  * There are no prefix allows: a namespace alone never proves an entity is a business contact.
  * Absent or empty value = guard off. An invalid value = keep the last good list this process
  * loaded (none yet = off), so a bad edit can't silently switch the guard off for running workers.
@@ -37,6 +43,8 @@ export interface NewsroomEntityGuard {
   deny: Map<string, string>;
   allowKeys: Set<string>;
   allowSlugs: Set<string>;
+  bodyAllowSourcePrefixes: string[];
+  bodySlugs: Set<string>;
 }
 
 export interface GuardDecision {
@@ -110,11 +118,16 @@ export function parseNewsroomEntityGuard(raw: string | null | undefined): Newsro
   if (deny.size === 0) return null;
   const allowKeys = stringArray(o.allow_keys);
   const allowSlugs = stringArray(o.allow_slugs);
-  if (!allowKeys || !allowSlugs) return null;
+  const bodyPrefixes = stringArray(o.body_allow_source_prefixes);
+  const bodySlugs = stringArray(o.body_slugs);
+  if (!allowKeys || !allowSlugs || !bodyPrefixes || !bodySlugs) return null;
+  if (bodyPrefixes.some((p) => !trimAscii(p).endsWith('/') || trimAscii(p) === '/')) return null;
   return {
     deny,
     allowKeys: new Set(allowKeys.map(normalizeEntityKey).filter(Boolean)),
     allowSlugs: new Set(allowSlugs.map(trimAscii).filter(Boolean)),
+    bodyAllowSourcePrefixes: bodyPrefixes.map(trimAscii),
+    bodySlugs: new Set(bodySlugs.map(trimAscii).filter(Boolean)),
   };
 }
 
@@ -126,6 +139,7 @@ export function checkNewsroomEntity(
   guard: NewsroomEntityGuard | null,
   raw: string | null | undefined,
   resolvedSlug: string | null | undefined,
+  sourcePage?: string | null,
 ): GuardDecision {
   if (!guard) return { blocked: false };
   const r = typeof raw === 'string' ? trimAscii(raw) : '';
@@ -138,7 +152,13 @@ export function checkNewsroomEntity(
     if (!s) continue;
     for (const k of candidateKeys(s)) {
       const gbnSlug = guard.deny.get(k);
-      if (gbnSlug !== undefined) return { blocked: true, key: k, gbnSlug };
+      if (gbnSlug !== undefined) {
+        const src = typeof sourcePage === 'string' ? trimAscii(sourcePage) : '';
+        if (src && guard.bodySlugs.has(gbnSlug) && guard.bodyAllowSourcePrefixes.some((p) => src.startsWith(p))) {
+          return { blocked: false };
+        }
+        return { blocked: true, key: k, gbnSlug };
+      }
     }
   }
   return { blocked: false };
@@ -184,8 +204,9 @@ export async function isNewsroomGuardedEntity(
   engine: BrainEngine,
   raw: string | null | undefined,
   resolvedSlug?: string | null,
+  sourcePage?: string | null,
 ): Promise<GuardDecision> {
-  return checkNewsroomEntity(await loadNewsroomEntityGuard(engine), raw, resolvedSlug ?? null);
+  return checkNewsroomEntity(await loadNewsroomEntityGuard(engine), raw, resolvedSlug ?? null, sourcePage ?? null);
 }
 
 /**

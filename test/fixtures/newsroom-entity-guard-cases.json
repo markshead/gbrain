@@ -9,7 +9,8 @@
    "usd-999": "xx/usd-999",
    "xx-usd-999": "xx/usd-999",
    "bob-example": "people/bob-example",
-   "carol-example": "people/carol-example"
+   "carol-example": "people/carol-example",
+   "ghost-org": "orgs/ghost-org"
   },
   "allow_keys": [
    "bob-example"
@@ -17,6 +18,14 @@
   "allow_slugs": [
    "people/carol-example-acme-com",
    "clients/carol-example"
+  ],
+  "body_allow_source_prefixes": [
+   "news-pipeline/",
+   "tools/"
+  ],
+  "body_slugs": [
+   "xx/acme-county/commission",
+   "xx/usd-999"
   ]
  },
  "normalize": [
@@ -157,6 +166,55 @@
    "resolved": "clients/zed-example",
    "blocked": true,
    "why": "mis-resolved into an unlisted clients/ slug stays blocked"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": "news-pipeline/run-2026-09-01",
+   "blocked": false,
+   "why": "body fact from a pipeline page is allowed"
+  },
+  {
+   "raw": "schools/usd-999",
+   "resolved": null,
+   "source": "tools/usd-999/backfill",
+   "blocked": false,
+   "why": "body fact from a tools page is allowed"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": "localities/acme",
+   "blocked": true,
+   "why": "body fact from a non-pipeline page stays blocked"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": null,
+   "blocked": true,
+   "why": "body fact with no source page stays blocked"
+  },
+  {
+   "raw": "alice-example",
+   "resolved": null,
+   "source": "news-pipeline/run-2026-09-01",
+   "blocked": true,
+   "why": "a person stays blocked even from a pipeline page"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": "news-pipelinex/run",
+   "blocked": true,
+   "why": "source prefix match is segment-exact"
+  },
+  {
+   "raw": "ghost-org",
+   "resolved": null,
+   "source": "news-pipeline/run",
+   "blocked": true,
+   "why": "a non-person deny entry NOT on body_slugs gets no source carve-out"
   }
  ],
  "invalid_configs": [
@@ -177,7 +235,11 @@
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slug_prefixes\": [\"clients/\"]}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": [\"clients/x\", 3]}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": null}",
-  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}"
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": \"news-pipeline/\"}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": [\"news-pipeline\"]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": [\"news-pipeline/\", 3]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_slugs\": \"xx/a\"}"
  ],
  "generator_keys": [
   [
@@ -201,5 +263,32 @@
     "dang-example"
    ]
   ]
+ ],
+ "no_carveout_configs": [
+  {
+   "why": "valid config without the body fields keeps bodies blocked",
+   "config": {
+    "version": 2,
+    "deny": {
+     "acme-county-commission": "xx/acme-county/commission"
+    }
+   },
+   "raw": "Acme County Commission",
+   "source": "news-pipeline/run"
+  },
+  {
+   "why": "prefixes without body_slugs keep bodies blocked",
+   "config": {
+    "version": 2,
+    "deny": {
+     "acme-county-commission": "xx/acme-county/commission"
+    },
+    "body_allow_source_prefixes": [
+     "news-pipeline/"
+    ]
+   },
+   "raw": "Acme County Commission",
+   "source": "news-pipeline/run"
+  }
  ]
 }

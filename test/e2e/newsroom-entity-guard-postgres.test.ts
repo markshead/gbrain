@@ -64,6 +64,27 @@ describe.skipIf(skip)('newsroom entity guard on Postgres', () => {
     expect(rows.map((x) => x.fact)).toEqual([`${TAG} dave fixed it`]);
   });
 
+  test('a body fact from a pipeline page is kept on Postgres; from another page it is dropped', async () => {
+    const stub = (fact: string) => __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: JSON.stringify({ facts: [{ fact, kind: 'fact', entity: 'Acme County Commission', confidence: 1, notability: 'high' }] }),
+      blocks: [], stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub', providerId: 'test',
+    }));
+    const body = 'a pipeline note naming a county body in passing. '.repeat(4);
+    stub(`${TAG} body via pipeline`);
+    await runFactsBackstop({ slug: `news-pipeline/${TAG}`, type: 'note', compiled_truth: body, frontmatter: {} },
+      { engine: view(), sourceId: 'default', sessionId: null, source: 'mcp:put_page', mode: 'inline' });
+    stub(`${TAG} body via localities`);
+    await runFactsBackstop({ slug: `localities/${TAG}`, type: 'note', compiled_truth: body, frontmatter: {} },
+      { engine: view(), sourceId: 'default', sessionId: null, source: 'mcp:put_page', mode: 'inline' });
+    const rows = await engine.executeRaw<{ fact: string }>(`SELECT fact FROM facts WHERE fact LIKE '${TAG} body via%' ORDER BY fact`);
+    expect(rows.map((x) => x.fact)).toEqual([`${TAG} body via pipeline`]);
+    // writer -> sweep invariant: the stored context is the source page the guard decided on
+    const ctxRows = await engine.executeRaw<{ context: string | null }>(`SELECT context FROM facts WHERE fact = $1`, [`${TAG} body via pipeline`]);
+    expect(ctxRows[0]?.context).toBe(`news-pipeline/${TAG}`);
+  });
+
   test('writeSingleFact refuses a guarded entity', async () => {
     await expect(writeSingleFact(view(), 'default', { fact: `${TAG} remember alice`, provenance: 'test', entity: 'Alice Example' }))
       .rejects.toThrow(/newsroom_entity/);

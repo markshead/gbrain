@@ -12,7 +12,7 @@ list from gbn and sweeps up facts that slipped past it.
                                The guard runs inside each gbrain process, and long-lived `gbrain
                                serve` children keep old code until their session restarts; the
                                sweep (cron) covers that gap. --since limits it to newer facts.
-  check ENTITY [RESOLVED]      show the decision for one entity
+  check ENTITY [RESOLVED [SOURCE_PAGE]]  show the decision for one entity
   test                         run the shared fixture cases (same cases as the TypeScript tests)
 
 Runbook: gbx `infra/gbx-facts-newsroom-entity-guard`.
@@ -35,6 +35,10 @@ FIXTURE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 
 # Sanity floors: refuse to publish a list much smaller than expected (a broken gbn query would
 # otherwise publish a near-empty list that silently lets everything through).
 FLOOR_PEOPLE, FLOOR_BODIES, MAX_SHRINK = 400, 40, 0.20
+# Owner, 2026-10-07: government-body facts stay in gbx when they come from pipeline or runbook pages
+# ("gbn only unless it has to do with our runbooks and pipeline work"). People never pass this way.
+BODY_ALLOW_SOURCE_PREFIXES = ['news-pipeline/', 'tools/', 'infra/', 'method/', 'orchestration/', 'meta/',
+                              'fortscott-biz/', 'fortscott/', 'news-server/', 'design-docs/']
 # Operator-reviewed extra allow keys (e.g. the brain's owner), one per line, kept OUTSIDE the
 # repo so no real name is checked in. Missing file = none.
 EXTRA_ALLOW_FILE = os.environ.get('GBX_GUARD_EXTRA_ALLOW') or os.path.expanduser('~/.config/gbrain/newsroom-guard-allow.txt')
@@ -132,6 +136,10 @@ def parse_guard(raw):
         return None
     if not isinstance(o, dict) or o.get('version') != 2 or 'allow_slug_prefixes' in o:
         return None
+    bp = _str_list(o.get('body_allow_source_prefixes', _ABSENT))
+    bs = _str_list(o.get('body_slugs', _ABSENT))
+    if bp is None or bs is None or any(not trim_ascii(x).endswith('/') or trim_ascii(x) == '/' for x in bp):
+        return None
     d = o.get('deny')
     if not isinstance(d, dict):
         return None
@@ -149,10 +157,12 @@ def parse_guard(raw):
         return None
     return {'deny': deny,
             'allow_keys': {norm(k) for k in ak if norm(k)},
-            'allow_slugs': {trim_ascii(s) for s in sl if trim_ascii(s)}}
+            'allow_slugs': {trim_ascii(s) for s in sl if trim_ascii(s)},
+            'body_prefixes': [trim_ascii(x) for x in bp],
+            'body_slugs': {trim_ascii(x) for x in bs if trim_ascii(x)}}
 
 
-def decide(g, raw, resolved):
+def decide(g, raw, resolved, source_page=None):
     if not g:
         return (False, None, None)
     r = trim_ascii(raw) if isinstance(raw, str) else ''
@@ -169,6 +179,9 @@ def decide(g, raw, resolved):
             continue
         for k in candidate_keys(s):
             if k in g['deny']:
+                src = trim_ascii(source_page) if isinstance(source_page, str) else ''
+                if src and g['deny'][k] in g['body_slugs'] and any(src.startswith(p) for p in g['body_prefixes']):
+                    return (False, None, None)
                 return (True, k, g['deny'][k])
     return (False, None, None)
 
@@ -295,6 +308,8 @@ def build(gx, gn):
         'deny': dict(sorted(deny.items())),
         'allow_keys': sorted(allow),
         'allow_slugs': sorted(allow_slugs),
+        'body_allow_source_prefixes': BODY_ALLOW_SOURCE_PREFIXES,
+        'body_slugs': sorted(s for s, v in per_ent.items() if v[1] != 'person'),
         'allow_reasons': reasons,
         'counts': {'gbn_people': sum(1 for v in per_ent.values() if v[1] == 'person'),
                    'gbn_bodies': sum(1 for v in per_ent.values() if v[1] != 'person'),
@@ -407,10 +422,10 @@ def _sweep(gx, gn, since, dry):
     # conversation-extraction row (its row_num is only a bulk key; conversations carry no fence).
     # True fence rows are left to Phase B. FOR UPDATE holds the rows until commit; the UPDATE
     # re-checks the same predicate and entity_slug.
-    q = ("select id, entity_slug from facts where expired_at is null and entity_slug <> '' and "
+    q = ("select id, entity_slug, context from facts where expired_at is null and entity_slug <> '' and "
          + SWEEPABLE + (" and created_at >= %s" if since else "") + " for update skip locked")
     c.execute(q, [since] if since else [])
-    ids = [(fid, ent) for fid, ent in c.fetchall() if decide(g, ent, ent)[0]]
+    ids = [(fid, ent) for fid, ent, ctx in c.fetchall() if decide(g, ent, ent, ctx)[0]]
     print('%d active unfenced facts blocked by the guard%s' % (len(ids), ' (dry run)' if dry else ''))  # "unfenced" = sweepable
     if not ids:
         gx.rollback()
@@ -422,7 +437,7 @@ def _sweep(gx, gn, since, dry):
               ([i for i, _ in ids],))
     rows = [x[0] for x in c.fetchall()]
     for row in rows[:40]:
-        print('  %s %-30s -> gbn %-30s <%s> %s' % (row['id'], row['entity_slug'], decide(g, row['entity_slug'], row['entity_slug'])[2],
+        print('  %s %-30s -> gbn %-30s <%s> %s' % (row['id'], row['entity_slug'], decide(g, row['entity_slug'], row['entity_slug'], row['context'])[2],
                                                     row['context'], (row['fact'] or '')[:90]))
     if dry:
         gx.rollback()
@@ -451,9 +466,9 @@ def _sweep(gx, gn, since, dry):
     print('expired %d; backup %s' % (n, path))
 
 
-def cmd_check(ent, resolved):
+def cmd_check(ent, resolved, source=None):
     gx, _ = conns()
-    print(decide(load_guard(gx), ent, resolved))
+    print(decide(load_guard(gx), ent, resolved, source))
 
 
 def cmd_test():
@@ -465,7 +480,7 @@ def cmd_test():
             bad += 1
             print('FAIL norm %r -> %r, want %r' % (inp, norm(inp), want))
     for c in cases['decide']:
-        got = decide(g, c['raw'], c['resolved'])[0]
+        got = decide(g, c['raw'], c['resolved'], c.get('source'))[0]
         if got != c['blocked']:
             bad += 1
             print('FAIL decide %s: got %s' % (c['why'], got))
@@ -478,7 +493,12 @@ def cmd_test():
         if sorted(want) != got:
             bad += 1
             print('FAIL name_keys %r -> %r, want %r' % (inp, got, sorted(want)))
-    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs']) + len(cases.get('generator_keys', []))
+    for nc in cases.get('no_carveout_configs', []):
+        g2 = parse_guard(json.dumps(nc['config']))
+        if g2 is None or not decide(g2, nc['raw'], None, nc['source'])[0]:
+            bad += 1
+            print('FAIL no-carveout: %s' % nc['why'])
+    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs']) + len(cases.get('generator_keys', [])) + len(cases.get('no_carveout_configs', []))
     print('%d/%d passed' % (total - bad, total))
     sys.exit(1 if bad else 0)
 
@@ -494,7 +514,7 @@ def main(a):
     elif a[0] == 'sweep':
         cmd_sweep(since, dry)
     elif a[0] == 'check':
-        cmd_check(a[1], a[2] if len(a) > 2 else None)
+        cmd_check(a[1], a[2] if len(a) > 2 else None, a[3] if len(a) > 3 else None)
     elif a[0] == 'test':
         cmd_test()
     else:
