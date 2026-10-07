@@ -156,6 +156,35 @@ describe('loadNewsroomEntityGuard', () => {
       Date.now = realNow;
     }
   });
+
+  test('an explicit disable is not undone by a later read failure', async () => {
+    let value: string | null = GUARD_JSON;
+    let fail = false;
+    const fake = { getConfig: async () => { if (fail) throw new Error('db down'); return value; } };
+    const realNow = Date.now;
+    let clock = realNow();
+    Date.now = () => clock;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(await loadNewsroomEntityGuard(fake as any)).not.toBeNull();
+      value = '';
+      clock += 120_000;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(await loadNewsroomEntityGuard(fake as any)).toBeNull();
+      fail = true;
+      clock += 120_000;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(await loadNewsroomEntityGuard(fake as any)).toBeNull();
+      value = '{"version": 2, "deny": "broken"}';
+      fail = false;
+      clock += 120_000;
+      // invalid after an explicit disable: there is no last good list to fall back to
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(await loadNewsroomEntityGuard(fake as any)).toBeNull();
+    } finally {
+      Date.now = realNow;
+    }
+  });
 });
 
 describe('pipeline (runFactsBackstop) with the guard set', () => {

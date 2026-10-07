@@ -73,8 +73,12 @@ def candidate_keys(s):
     return keys
 
 
+_ABSENT = object()
+
+
 def _str_list(v):
-    if v is None:
+    # Absent field = empty list; explicit null or any non-list = invalid (same as the TypeScript side).
+    if v is _ABSENT:
         return []
     if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
         return None
@@ -103,7 +107,7 @@ def parse_guard(raw):
             deny[nk] = v
     if not deny:
         return None
-    ak, sl = _str_list(o.get('allow_keys')), _str_list(o.get('allow_slugs'))
+    ak, sl = _str_list(o.get('allow_keys', _ABSENT)), _str_list(o.get('allow_slugs', _ABSENT))
     if ak is None or sl is None:
         return None
     return {'deny': deny,
@@ -356,6 +360,12 @@ def cmd_sweep(since, dry):
             f.write(json.dumps(row, default=str) + '\n')
         f.flush()
         os.fsync(f.fileno())
+    # Make the new directory entry durable too, before any row is expired.
+    dfd = os.open(BACKUP_DIR, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
     n = 0
     for fid, ent in ids:
         c.execute("update facts set expired_at = now() where id = %s and expired_at is null and entity_slug = %s "

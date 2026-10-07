@@ -67,8 +67,9 @@ done
   echo "commit;"
 } | P -d gbrain >/dev/null
 
+: > "$T/extra-allow.txt"   # isolated: never read the operator's real allow file
 export GBX_GUARD_XERIC_URL="$X" GBX_GUARD_NEWSROOM_URL="$N" GBX_GUARD_LOG="$T/guard.log" \
-       GBX_GUARD_BACKUP_DIR="$T/backups" GBX_GUARD_SNAPSHOT="$T/snapshot.json"
+       GBX_GUARD_BACKUP_DIR="$T/backups" GBX_GUARD_SNAPSHOT="$T/snapshot.json" GBX_GUARD_EXTRA_ALLOW="$T/extra-allow.txt"
 mkdir -p "$T/backups"
 echo "== gbx-newsroom-entity-guard integration (real Postgres) =="
 

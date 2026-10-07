@@ -160,13 +160,15 @@ export async function loadNewsroomEntityGuard(engine: BrainEngine): Promise<News
   try {
     raw = await engine.getConfig(NEWSROOM_ENTITY_GUARD_CONFIG_KEY);
   } catch {
-    const kept = hit?.guard ?? lastGood.get(engine as object) ?? null;
+    // Keep exactly what this process last decided, including an explicit disable (null).
+    const kept = hit ? hit.guard : (lastGood.get(engine as object) ?? null);
     cache.set(engine as object, { at: now, guard: kept });
     return kept;
   }
   let guard: NewsroomEntityGuard | null;
   if (raw == null || !trimAscii(raw)) {
     guard = null;
+    lastGood.delete(engine as object); // explicit disable: nothing to fall back to afterwards
   } else {
     guard = parseNewsroomEntityGuard(raw) ?? lastGood.get(engine as object) ?? null;
   }

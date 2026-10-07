@@ -175,6 +175,8 @@
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": 1}",
   "{\"version\": 1, \"deny\": {\"alice-example\": \"p\"}}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slug_prefixes\": [\"clients/\"]}",
-  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": [\"clients/x\", 3]}"
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": [\"clients/x\", 3]}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": null}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}"
  ]
 }
