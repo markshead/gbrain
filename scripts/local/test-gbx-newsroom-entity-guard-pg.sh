@@ -69,9 +69,9 @@ done
   echo "commit;"
 } | P -d gbrain >/dev/null
 
-: > "$T/extra-allow.txt"   # isolated: never read the operator's real allow file
+: > "$T/extra-allow.txt"   # isolated: never read the operator's real allow/never-allow files
 export GBX_GUARD_XERIC_URL="$X" GBX_GUARD_NEWSROOM_URL="$N" GBX_GUARD_LOG="$T/guard.log" \
-       GBX_GUARD_BACKUP_DIR="$T/backups" GBX_GUARD_SNAPSHOT="$T/snapshot.json" GBX_GUARD_EXTRA_ALLOW="$T/extra-allow.txt"
+       GBX_GUARD_BACKUP_DIR="$T/backups" GBX_GUARD_SNAPSHOT="$T/snapshot.json" GBX_GUARD_EXTRA_ALLOW="$T/extra-allow.txt" GBX_GUARD_NEVER_ALLOW="$T/no-never-allow.txt"
 mkdir -p "$T/backups"
 echo "== gbx-newsroom-entity-guard integration (real Postgres) =="
 
@@ -105,12 +105,26 @@ sleep 2
 if "$PY" -I "$SCRIPT" sweep >"$T/locked.out" 2>&1; then bad "sweep refuses while another holds the lock"; else grep -q "another sweep is running" "$T/locked.out" && ok "sweep refuses while another holds the lock" || bad "sweep refuses while locked (wrong message: $(tail -1 "$T/locked.out"))"; fi
 wait
 
+# operator never-allow file removes a derived ad-campaign allow (owner, 2026-10-07: only people actually
+# pursued for ads are business contacts)
+# Per PERSON, not per key: a different spelling in the never file, plus a stray extra-allow entry for the
+# same person, must still leave no key of that person allowed. Plain refresh (no --allow-shrink).
+printf 'Bob Example  # prospect not pursued\nnobody-example  # matches no one\n' > "$T/never-allow.txt"
+printf 'bob-example\n' > "$T/extra-allow-bob.txt"
+GBX_GUARD_NEVER_ALLOW="$T/never-allow.txt" GBX_GUARD_EXTRA_ALLOW="$T/extra-allow-bob.txt" "$PY" -I "$SCRIPT" refresh >"$T/refresh2.out" 2>&1 || { bad "plain refresh with never-allow"; cat "$T/refresh2.out"; }
+eq "never-allow removes every key of bob from allow_keys" "$(P -d gbrain -c "select exists (select 1 from jsonb_array_elements_text(value::jsonb->'allow_keys') k where k like 'bob%') from config where key='facts.newsroom_entity_guard'")" "f"
+eq "bob stays on the deny list" "$(P -d gbrain -c "select (value::jsonb->'deny') ? 'bob-example' from config where key='facts.newsroom_entity_guard'")" "t"
+eq "refresh reports the override for bob" "$(grep -c 'never-allow (operator file) overrides' "$T/refresh2.out")" "1"
+eq "refresh warns about a never key that matches no one" "$(grep -c 'never-allow key matches no newsroom person: nobody-example' "$T/refresh2.out")" "1"
+mkdir -p "$T/unreadable-never"
+if GBX_GUARD_NEVER_ALLOW="$T/unreadable-never" "$PY" -I "$SCRIPT" refresh --dry-run >"$T/never-bad.out" 2>&1; then bad "refresh refuses an unreadable never-allow file"; else grep -q "refusing: cannot read never-allow file" "$T/never-bad.out" && ok "refresh refuses an unreadable never-allow file" || bad "unreadable never-allow (wrong message: $(tail -1 "$T/never-bad.out"))"; fi
+
 # real sweep
 "$PY" -I "$SCRIPT" sweep >"$T/sweep.out" 2>&1 || { bad "sweep runs"; cat "$T/sweep.out"; }
-eq "expired exactly A1, A2, A9 (conversation row), C1" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at > now() - interval '1 minute'")" "A1,A2,A9,C1"
-eq "allowed, fenced and other rows untouched" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at is null")" "B1,D1,F1,K1"
+eq "expired exactly A1, A2, A9 (conversation row), B1 (never-allow), C1" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at > now() - interval '1 minute'")" "A1,A2,A9,B1,C1"
+eq "allowed, fenced and other rows untouched" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at is null")" "D1,F1,K1"
 bk=$(ls "$T/backups"/gbx-newsroom-guard-sweep-*.jsonl 2>/dev/null | head -1)
-eq "backup has 4 lossless rows" "$(wc -l < "$bk" | tr -d ' ')" "4"
+eq "backup has 5 lossless rows" "$(wc -l < "$bk" | tr -d ' ')" "5"
 eq "backup row carries full fact text and pre-expiry state" "$("$PY" -I -c "import json,sys; r=[json.loads(l) for l in open(sys.argv[1])]; print(all(x['expired_at'] is None and x['fact'] for x in r))" "$bk")" "True"
 
 # invalid config -> sweep refuses, nothing changes

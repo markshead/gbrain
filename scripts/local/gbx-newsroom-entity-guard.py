@@ -40,11 +40,29 @@ FLOOR_PEOPLE, FLOOR_BODIES, MAX_SHRINK = 400, 40, 0.20
 EXTRA_ALLOW_FILE = os.environ.get('GBX_GUARD_EXTRA_ALLOW') or os.path.expanduser('~/.config/gbrain/newsroom-guard-allow.txt')
 
 
-def extra_allow_keys():
+# Operator "never allow" keys, one per line, also outside the repo: a person listed here is NOT allowed
+# even if an ad-campaign page names them (owner, 2026-10-07: only people actually pursued for ads are
+# business contacts; a prospect marked "not pursuing" stays a newsroom person). Missing file = none.
+NEVER_ALLOW_FILE = os.environ.get('GBX_GUARD_NEVER_ALLOW') or os.path.expanduser('~/.config/gbrain/newsroom-guard-never-allow.txt')
+
+
+def _key_file(path, what):
+    """Keys from an operator file (one per line, '#' comments). Missing = none; unreadable = refuse."""
     try:
-        return {norm(l.split('#', 1)[0]) for l in open(EXTRA_ALLOW_FILE) if norm(l.split('#', 1)[0])}
+        with open(path, encoding='utf-8') as f:
+            return {k for k in (norm(l.split('#', 1)[0]) for l in f) if k}
     except FileNotFoundError:
         return set()
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit('refusing: cannot read %s file %s (%s)' % (what, path, e.__class__.__name__))
+
+
+def never_allow_keys():
+    return _key_file(NEVER_ALLOW_FILE, 'never-allow')
+
+
+def extra_allow_keys():
+    return _key_file(EXTRA_ALLOW_FILE, 'extra-allow')
 
 
 # ---- matching (must mirror src/core/facts/newsroom-entity-guard.ts) ----
@@ -218,7 +236,8 @@ def build(gx, gn):
         for k in ks:
             deny.setdefault(k, slug)
 
-    allow, reasons = extra_allow_keys(), {}
+    never = never_allow_keys()
+    allow, reasons = extra_allow_keys() - never, {}
     # (a) anyone who appears in an ad campaign: a gbn person named (or wikilinked) in gbx ad-creation/*
     cx.execute("select slug, lower(compiled_truth || ' ' || coalesce(timeline, '')) from pages "
                "where deleted_at is null and source_id = 'default' and slug like 'ad-creation/%%'")
@@ -233,9 +252,26 @@ def build(gx, gn):
             if '[[' + slug.lower() + ']]' in txt or '[[' + slug.lower() + '|' in txt or \
                any(re.search(r'\b' + re.escape(n) + r'\b', txt) for n in names):
                 hits.add(p)
-        if hits:
+        if hits and (ks & never):
+            reasons[slug] = 'never-allow (operator file) overrides ad campaign page(s): ' + ', '.join(sorted(hits))
+        elif hits:
             allow |= ks
             reasons[slug] = 'appears in ad campaign page(s): ' + ', '.join(sorted(hits))
+    # never-allow is per PERSON: drop every key of anyone a never key names (covers other spellings and
+    # stray extra-allow entries); warn about never keys that name no newsroom person.
+    # Step (b) below never adds KEYS; it only lists exact business page slugs. A never-listed person who
+    # also has an email-keyed gbx contact page keeps that one page allowed: a business identity is
+    # separate from the newsroom person (gbx meta/two-brain-governance, "Cross-brain entities").
+    matched = set()
+    for slug, (title, typ, ks) in per_ent.items():
+        hit = ks & never
+        if hit:
+            matched |= hit
+            allow -= ks
+    for k in sorted(never - matched):
+        print('WARN never-allow key matches no newsroom person: %s' % k)
+        log('refresh: never-allow key matches no newsroom person: %s' % k)
+
     # (b) business pages with affirmative evidence, listed exactly: every clients/* page and every
     # email-keyed people/* page (title carries an address). A name-keyed gbx page gets NO pass on a
     # name collision: that is the very shape of the leak. Collisions are reported for review.
