@@ -106,6 +106,22 @@ export async function writeSingleFact(
   // resolver returned nothing (fail-closed — no live page was verified).
   const resolutionSource = resolved?.source ?? null;
 
+  // Local patch 2026-10-06 (gbxheld): refuse a fact about a newsroom person or body on a brain
+  // that carries the newsroom entity guard (gbx). The caller should write it to gbn instead.
+  if (entityRef) {
+    const { loadNewsroomEntityGuard, checkNewsroomEntity, logNewsroomEntityGuardDrops } =
+      await import('./newsroom-entity-guard.ts');
+    const decision = checkNewsroomEntity(await loadNewsroomEntityGuard(engine), entityRef, resolved?.slug ?? null);
+    if (decision.blocked) {
+      await logNewsroomEntityGuardDrops(engine, sourceId, input.sessionId ?? 'remember',
+        [{ entity: entityRef, key: decision.key ?? '', gbnSlug: decision.gbnSlug ?? '' }]);
+      const { verbError } = await import('../ops/contract.ts');
+      throw verbError('invalid_params',
+        `newsroom_entity: "${entityRef}" is a newsroom person or body${decision.gbnSlug ? ` (gbn ${decision.gbnSlug})` : ''}; facts about it are not kept in this brain.`,
+        'Write the fact to the newsroom brain (gbn) instead. Business contacts on the allowlist are unaffected.');
+    }
+  }
+
   // Embedding (NOT an LLM call): powers dedup + downstream recall. Fail-soft —
   // a missing/failing provider degrades dedup, never the write.
   let embedding: Float32Array | null = null;

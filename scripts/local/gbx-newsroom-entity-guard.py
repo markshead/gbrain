@@ -1,0 +1,386 @@
+#!/home/markshead/.venvs/sky/bin/python -I
+"""gbx-newsroom-entity-guard — keep newsroom people and government bodies out of gbx facts.
+
+Mark, 2026-10-06: newsroom people belong in gbn, never gbx (gbx `meta/two-brain-governance`).
+The gbrain fork's facts extractor drops a fact whose entity is on a deny list stored in gbx config
+`facts.newsroom_entity_guard` (src/core/facts/newsroom-entity-guard.ts). This script builds that
+list from gbn and sweeps up facts that slipped past it.
+
+  refresh [--dry-run]          rebuild the list from gbn and write it to gbx config
+  sweep [--since ISO] [--dry-run]
+                               expire active gbx facts whose entity the guard blocks (backup first).
+                               The guard runs inside each gbrain process, and long-lived `gbrain
+                               serve` children keep old code until their session restarts; the
+                               sweep (cron) covers that gap. --since limits it to newer facts.
+  check ENTITY [RESOLVED]      show the decision for one entity
+  test                         run the shared fixture cases (same cases as the TypeScript tests)
+
+Runbook: gbx `infra/gbx-facts-newsroom-entity-guard`.
+"""
+import datetime, json, os, re, sys
+
+CONFIG_KEY = 'facts.newsroom_entity_guard'
+ENV_FILE = os.path.expanduser('~/.config/gbrain/env')
+SNAPSHOT = os.path.expanduser('~/.gbrain/newsroom-entity-guard.json')
+LOG = os.path.expanduser('~/.claude/logs/gbx-newsroom-guard.log')
+BACKUP_DIR = os.path.expanduser('~/backups/gbrain')
+FIXTURE = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'test', 'fixtures', 'newsroom-entity-guard-cases.json')
+
+# Mark's default allowlist (2026-10-06): email-keyed people/*, clients/*, ad-creation/*, and anyone
+# who appears in ad campaigns. Email-keyed pages end in the email's domain.
+# Allowed entity pages are listed EXACTLY (v2): every gbx clients/* page and every email-keyed
+# people/* page (title carries the address). A namespace prefix alone never allows. `refresh`
+# runs daily, so new contacts are picked up.
+# Sanity floors: refuse to publish a list much smaller than expected (a broken gbn query would
+# otherwise publish a near-empty list that silently lets everything through).
+FLOOR_PEOPLE, FLOOR_BODIES, MAX_SHRINK = 400, 40, 0.20
+# The brain's owner is never a newsroom entity in gbx.
+ALWAYS_ALLOW_KEYS = ['mark-shead']
+
+
+# ---- matching (must mirror src/core/facts/newsroom-entity-guard.ts) ----
+def trim_ascii(s):
+    return s.strip(' \t\r\n')
+
+
+def norm(s):
+    s = (s or '').lower()
+    s = re.sub("['\"\u2018\u2019\u201c\u201d]", '', s)
+    s = s.replace('&', ' and ')
+    s = re.sub(r'[^a-z0-9]+', '-', s)
+    return s.strip('-')
+
+
+def candidate_keys(s):
+    keys = []
+    w = norm(s)
+    if w:
+        keys.append(w)
+    t = trim_ascii(s).rstrip('/')
+    if '/' in t:
+        last = norm(t[t.rindex('/') + 1:])
+        if last and last not in keys:
+            keys.append(last)
+    return keys
+
+
+def _str_list(v):
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        return None
+    return v
+
+
+def parse_guard(raw):
+    """Strict validation; anything invalid means no guard (the writer fails open, the sweep stops)."""
+    if raw is None or not trim_ascii(str(raw)):
+        return None
+    try:
+        o = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(o, dict) or o.get('version') != 2 or 'allow_slug_prefixes' in o:
+        return None
+    d = o.get('deny')
+    if not isinstance(d, dict):
+        return None
+    deny = {}
+    for k, v in d.items():
+        if not isinstance(v, str):
+            return None
+        nk = norm(k)
+        if nk:
+            deny[nk] = v
+    if not deny:
+        return None
+    ak, sl = _str_list(o.get('allow_keys')), _str_list(o.get('allow_slugs'))
+    if ak is None or sl is None:
+        return None
+    return {'deny': deny,
+            'allow_keys': {norm(k) for k in ak if norm(k)},
+            'allow_slugs': {trim_ascii(s) for s in sl if trim_ascii(s)}}
+
+
+def decide(g, raw, resolved):
+    if not g:
+        return (False, None, None)
+    r = trim_ascii(raw) if isinstance(raw, str) else ''
+    res = trim_ascii(resolved) if isinstance(resolved, str) else ''
+    stored = res or r
+    if not stored:
+        return (False, None, None)
+    if stored in g['allow_slugs']:
+        return (False, None, None)
+    if any(k in g['allow_keys'] for k in candidate_keys(stored)):
+        return (False, None, None)
+    for s in (r, res):
+        if not s:
+            continue
+        for k in candidate_keys(s):
+            if k in g['deny']:
+                return (True, k, g['deny'][k])
+    return (False, None, None)
+
+
+# ---- db ----
+def env():
+    out = {}
+    for line in open(ENV_FILE):
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        out[k.replace('export ', '').strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def conns():
+    import psycopg2
+    e = env()
+    return psycopg2.connect(e['XERIC_DATABASE_URL']), psycopg2.connect(e['NEWSROOM_DATABASE_URL'])
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, 'a') as f:
+        f.write('%s %s\n' % (datetime.datetime.now().astimezone().isoformat(timespec='seconds'), msg))
+
+
+def key_ok(k):
+    # Multi-token keys only: a single token ("mark", "commission") is far too generic.
+    return bool(k) and '-' in k and len(k) >= 5
+
+
+def title_name(t):
+    return re.sub(r'\s*\([^)]*\)', '', t or '').strip()
+
+
+GOV_TYPES = ('org', 'organization', 'government-body')
+
+
+def build(gx, gn):
+    cn, cx = gn.cursor(), gx.cursor()
+    cn.execute("""select slug, title, type from pages where deleted_at is null and (
+                    type = 'person' or (type = any(%s) and slug ~ '^(ks|mi)/'))""", (list(GOV_TYPES),))
+    ents = cn.fetchall()
+    cn.execute("""select a.slug, a.alias_norm from page_aliases a join pages p
+                    on p.slug = a.slug and p.source_id = a.source_id
+                  where p.deleted_at is null and (p.type = 'person' or (p.type = any(%s) and p.slug ~ '^(ks|mi)/'))""",
+               (list(GOV_TYPES),))
+    aliases = {}
+    for s, a in cn.fetchall():
+        aliases.setdefault(s, []).append(a)
+    deny, per_ent = {}, {}
+    for slug, title, typ in ents:
+        ks = {norm(slug.rsplit('/', 1)[-1]), norm(title_name(title))}
+        if typ != 'person':
+            ks.add(norm(slug))
+        for a in aliases.get(slug, []):
+            ks.add(norm(a))
+        ks = {k for k in ks if key_ok(k)}
+        per_ent[slug] = (title, typ, ks)
+        for k in ks:
+            deny.setdefault(k, slug)
+
+    allow, reasons = set(ALWAYS_ALLOW_KEYS), {}
+    # (a) anyone who appears in an ad campaign: a gbn person named (or wikilinked) in gbx ad-creation/*
+    cx.execute("select slug, lower(compiled_truth || ' ' || coalesce(timeline, '')) from pages "
+               "where deleted_at is null and source_id = 'default' and slug like 'ad-creation/%%'")
+    ad_text = cx.fetchall()
+    for slug, (title, typ, ks) in per_ent.items():
+        if typ != 'person':
+            continue
+        names = {title_name(title).lower()} | {a.replace('-', ' ') for a in aliases.get(slug, [])}
+        names = {n for n in names if len(n.split()) >= 2 and len(n) >= 6}
+        hits = set()
+        for p, txt in ad_text:
+            if '[[' + slug + ']]' in txt or '[[' + slug + '|' in txt or \
+               any(re.search(r'\b' + re.escape(n) + r'\b', txt) for n in names):
+                hits.add(p)
+        if hits:
+            allow |= ks
+            reasons[slug] = 'appears in ad campaign page(s): ' + ', '.join(sorted(hits))
+    # (b) business pages with affirmative evidence, listed exactly: every clients/* page and every
+    # email-keyed people/* page (title carries an address). A name-keyed gbx page gets NO pass on a
+    # name collision: that is the very shape of the leak. Collisions are reported for review.
+    cx.execute("select slug, title, type from pages where deleted_at is null and source_id = 'default' "
+               "and (slug like 'people/%%' or slug like 'clients/%%')")
+    allow_slugs, collisions = [], {}
+    for slug, title, typ in cx.fetchall():
+        business = (slug.startswith('people/') and '@' in (title or '')) or slug.startswith('clients/')
+        if business:
+            allow_slugs.append(slug)
+        hit = sorted(k for k in {norm(slug.rsplit('/', 1)[-1]), norm(title_name(title))} if k in deny)
+        if hit:
+            collisions[slug] = (business, hit)
+    for slug, (business, hit) in sorted(collisions.items()):
+        reasons['gbx:' + slug] = ('business page, own slug allowed' if business else 'NAME-KEYED, NOT allowed (review)') + \
+            ' — collides on ' + ', '.join(hit)
+    return {
+        'version': 2,
+        'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'generated_by': 'gbx-newsroom-entity-guard refresh',
+        'deny': dict(sorted(deny.items())),
+        'allow_keys': sorted(allow),
+        'allow_slugs': sorted(allow_slugs),
+        'allow_reasons': reasons,
+        'counts': {'gbn_people': sum(1 for v in per_ent.values() if v[1] == 'person'),
+                   'gbn_bodies': sum(1 for v in per_ent.values() if v[1] != 'person'),
+                   'deny_keys': len(deny), 'allow_keys': len(allow), 'allow_slugs': len(allow_slugs)},
+    }
+
+
+def check_brains(gx, gn):
+    """Refuse unless gx is the xeric brain (database `gbrain`) and gn is newsroom."""
+    a, b = gx.cursor(), gn.cursor()
+    a.execute("select current_database()")
+    b.execute("select current_database()")
+    dx, dn = a.fetchone()[0], b.fetchone()[0]
+    if dx != 'gbrain' or dn != 'newsroom':
+        sys.exit('refusing: expected gbx=gbrain and gbn=newsroom databases, got %s / %s' % (dx, dn))
+
+
+def cmd_refresh(dry):
+    gx, gn = conns()
+    check_brains(gx, gn)
+    g = build(gx, gn)
+    n = g['counts']
+    if n['gbn_people'] < FLOOR_PEOPLE or n['gbn_bodies'] < FLOOR_BODIES:
+        log('refresh: REFUSED, below floor %s' % json.dumps(n))
+        sys.exit('refusing to publish: gbn people/bodies below floor (%d/%d)' % (n['gbn_people'], n['gbn_bodies']))
+    cur = load_guard(gx)
+    if cur and len(g['deny']) < (1 - MAX_SHRINK) * len(cur['deny']) and '--allow-shrink' not in sys.argv:
+        log('refresh: REFUSED, deny list would shrink %d -> %d' % (len(cur['deny']), len(g['deny'])))
+        sys.exit('refusing to publish: deny list shrinks %d -> %d (>%d%%); rerun with --allow-shrink if intended'
+                 % (len(cur['deny']), len(g['deny']), int(MAX_SHRINK * 100)))
+    print(json.dumps(g['counts']))
+    for k, v in g['allow_reasons'].items():
+        print('allow  %-45s %s' % (k, v))
+    if parse_guard(json.dumps(g)) is None:
+        sys.exit('refusing to publish: the generated list does not validate')
+    if dry:
+        return
+    os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
+    json.dump(g, open(SNAPSHOT, 'w'), indent=1)
+    c = gx.cursor()
+    c.execute("insert into config (key, value) values (%s, %s) on conflict (key) do update set value = excluded.value",
+              (CONFIG_KEY, json.dumps(g)))
+    gx.commit()
+    c.execute("select length(value) from config where key = %s", (CONFIG_KEY,))
+    log('refresh: %s, config %d bytes' % (json.dumps(g['counts']), c.fetchone()[0]))
+    print('written to gbx config %s; snapshot %s' % (CONFIG_KEY, SNAPSHOT))
+
+
+def load_guard(gx):  # used by `check`
+    c = gx.cursor()
+    c.execute("select value from config where key = %s", (CONFIG_KEY,))
+    r = c.fetchone()
+    return parse_guard(r[0] if r else None)
+
+
+def cmd_sweep(since, dry):
+    gx, gn = conns()
+    check_brains(gx, gn)
+    c = gx.cursor()
+    # One sweep at a time, across hosts: a session-level Postgres advisory lock.
+    c.execute("select pg_try_advisory_lock(hashtext('gbx-newsroom-guard-sweep'))")
+    if not c.fetchone()[0]:
+        gx.rollback()
+        sys.exit('another sweep is running')
+    c.execute("select value from config where key = %s", (CONFIG_KEY,))
+    r = c.fetchone()
+    if r is None:
+        print('no guard configured; nothing to do')
+        return
+    g = parse_guard(r[0])
+    if g is None:
+        log('sweep: REFUSED, guard config is invalid')
+        sys.exit('guard config is invalid; refusing to sweep')
+    # Unfenced rows only (row_num IS NULL): a fenced row also lives in a page's markdown fence and is
+    # handled by hand. FOR UPDATE holds the rows until commit, so a concurrent change can't be
+    # overwritten by a stale decision; the UPDATE re-checks entity_slug as well.
+    q = ("select id, entity_slug from facts where expired_at is null and entity_slug <> '' "
+         "and row_num is null" + (" and created_at >= %s" if since else "") + " for update skip locked")
+    c.execute(q, [since] if since else [])
+    ids = [(fid, ent) for fid, ent in c.fetchall() if decide(g, ent, ent)[0]]
+    print('%d active unfenced facts blocked by the guard%s' % (len(ids), ' (dry run)' if dry else ''))
+    if not ids:
+        gx.rollback()
+        return
+    c.execute("""select row_to_json(t) from (select id, source_id, entity_slug, fact, kind, visibility, notability,
+                   context, valid_from, valid_until, expired_at, superseded_by, source, source_session, confidence,
+                   created_at, row_num, source_markdown_slug from facts where id = any(%s) order by id) t""",
+              ([i for i, _ in ids],))
+    rows = [x[0] for x in c.fetchall()]
+    for row in rows[:40]:
+        print('  %s %-30s -> gbn %-30s <%s> %s' % (row['id'], row['entity_slug'], decide(g, row['entity_slug'], row['entity_slug'])[2],
+                                                    row['context'], (row['fact'] or '')[:90]))
+    if dry:
+        gx.rollback()
+        return
+    stamp = datetime.datetime.now().strftime('%Y-%m-%dT%H%M%S')
+    path = os.path.join(BACKUP_DIR, 'gbx-newsroom-guard-sweep-%s-%d.jsonl' % (stamp, os.getpid()))
+    with open(path, 'x') as f:
+        for row in rows:
+            f.write(json.dumps(row, default=str) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    n = 0
+    for fid, ent in ids:
+        c.execute("update facts set expired_at = now() where id = %s and expired_at is null and entity_slug = %s "
+                  "and row_num is null", (fid, ent))
+        n += c.rowcount
+    gx.commit()
+    log('sweep: expired %d facts (since=%s); backup %s' % (n, since, path))
+    print('expired %d; backup %s' % (n, path))
+
+
+def cmd_check(ent, resolved):
+    gx, _ = conns()
+    print(decide(load_guard(gx), ent, resolved))
+
+
+def cmd_test():
+    cases = json.load(open(FIXTURE))
+    g = parse_guard(json.dumps(cases['guard']))
+    bad = 0
+    for inp, want in cases['normalize']:
+        if norm(inp) != want:
+            bad += 1
+            print('FAIL norm %r -> %r, want %r' % (inp, norm(inp), want))
+    for c in cases['decide']:
+        got = decide(g, c['raw'], c['resolved'])[0]
+        if got != c['blocked']:
+            bad += 1
+            print('FAIL decide %s: got %s' % (c['why'], got))
+    for raw in cases['invalid_configs']:
+        if parse_guard(raw) is not None:
+            bad += 1
+            print('FAIL parse_guard(%r) should be None' % raw)
+    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs'])
+    print('%d/%d passed' % (total - bad, total))
+    sys.exit(1 if bad else 0)
+
+
+def main(a):
+    if not a or a[0] in ('-h', '--help'):
+        print(__doc__)
+        return
+    dry = '--dry-run' in a
+    since = a[a.index('--since') + 1] if '--since' in a else None
+    if a[0] == 'refresh':
+        cmd_refresh(dry)
+    elif a[0] == 'sweep':
+        cmd_sweep(since, dry)
+    elif a[0] == 'check':
+        cmd_check(a[1], a[2] if len(a) > 2 else None)
+    elif a[0] == 'test':
+        cmd_test()
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

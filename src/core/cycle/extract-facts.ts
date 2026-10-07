@@ -544,6 +544,17 @@ export async function runExtractFacts(
       continue;
     }
 
+    // Local patch 2026-10-06 (gbxheld): a page whose entity is a newsroom person or body on this
+    // brain's guard list is not reconciled into the facts table (gbx only; no-op without the key).
+    {
+      const { isNewsroomGuardedEntity } = await import('../facts/newsroom-entity-guard.ts');
+      const decision = await isNewsroomGuardedEntity(engine, slug, slug);
+      if (decision.blocked) {
+        result.warnings.push(`${slug}: NEWSROOM_ENTITY_GUARD: fence not reconciled (gbn ${decision.gbnSlug ?? decision.key})`);
+        continue;
+      }
+    }
+
     const body = page.compiled_truth ?? '';
     const parsed = parseFactsFence(body);
     if (parsed.warnings.length > 0) {

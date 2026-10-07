@@ -1155,7 +1155,16 @@ async function processPage(
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
       }));
-      const ins = await state.engine.insertFacts(rows, { source_id: state.sourceId }); // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
+      // Local patch 2026-10-06 (gbxheld): drop rows about newsroom people or bodies on this brain's
+      // guard list (gbx only; no-op without the key). row_num numbering is kept as allocated.
+      const { isNewsroomGuardedEntity } = await import('../core/facts/newsroom-entity-guard.ts');
+      const keep: typeof rows = [];
+      for (const row of rows) {
+        if (!row.entity_slug || !(await isNewsroomGuardedEntity(state.engine, row.entity_slug, row.entity_slug)).blocked) keep.push(row);
+      }
+      const ins = keep.length > 0
+        ? await state.engine.insertFacts(keep, { source_id: state.sourceId }) // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
+        : { inserted: 0 };
       pageInsertedTotal += ins.inserted;
       state.result.facts_inserted += ins.inserted;
       rowNum += extracted.length;
