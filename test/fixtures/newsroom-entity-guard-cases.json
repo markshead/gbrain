@@ -17,6 +17,10 @@
   "allow_slugs": [
    "people/carol-example-acme-com",
    "clients/carol-example"
+  ],
+  "body_allow_source_prefixes": [
+   "news-pipeline/",
+   "tools/"
   ]
  },
  "normalize": [
@@ -157,6 +161,48 @@
    "resolved": "clients/zed-example",
    "blocked": true,
    "why": "mis-resolved into an unlisted clients/ slug stays blocked"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": "news-pipeline/run-2026-09-01",
+   "blocked": false,
+   "why": "body fact from a pipeline page is allowed"
+  },
+  {
+   "raw": "schools/usd-999",
+   "resolved": null,
+   "source": "tools/usd-999/backfill",
+   "blocked": false,
+   "why": "body fact from a tools page is allowed"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": "localities/acme",
+   "blocked": true,
+   "why": "body fact from a non-pipeline page stays blocked"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": null,
+   "blocked": true,
+   "why": "body fact with no source page stays blocked"
+  },
+  {
+   "raw": "alice-example",
+   "resolved": null,
+   "source": "news-pipeline/run-2026-09-01",
+   "blocked": true,
+   "why": "a person stays blocked even from a pipeline page"
+  },
+  {
+   "raw": "Acme County Commission",
+   "resolved": null,
+   "source": "news-pipelinex/run",
+   "blocked": true,
+   "why": "source prefix match is segment-exact"
   }
  ],
  "invalid_configs": [
@@ -177,7 +223,9 @@
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slug_prefixes\": [\"clients/\"]}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": [\"clients/x\", 3]}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": null}",
-  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}"
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": \"news-pipeline/\"}",
+  "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"body_allow_source_prefixes\": [\"news-pipeline\"]}"
  ],
  "generator_keys": [
   [

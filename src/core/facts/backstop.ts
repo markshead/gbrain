@@ -638,7 +638,7 @@ async function runPipelineBodyInner(
     const resolvedSlug = resolved?.slug ?? null;
     const resolutionSource = resolved?.source ?? null;
 
-    const guardDecision = checkNewsroomEntity(newsroomGuard, f.entity_slug, resolvedSlug);
+    const guardDecision = checkNewsroomEntity(newsroomGuard, f.entity_slug, resolvedSlug, ctx.sourceSlug ?? input.pageSlug ?? null);
     if (guardDecision.blocked) {
       guardDrops.push({ entity: f.entity_slug ?? '', key: guardDecision.key ?? '', gbnSlug: guardDecision.gbnSlug ?? '' });
       continue;

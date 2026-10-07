@@ -64,6 +64,8 @@ done
     ('default','people/alice-example','F1 fenced alice row','test', 1, 'people/alice-example');"
   echo "insert into facts (source_id, entity_slug, fact, source, row_num, source_markdown_slug) values
     ('default','people/alice-example','A9 conversation alice row','cli:extract-conversation-facts', 5, 'sessions/example');"
+  echo "insert into facts (source_id, entity_slug, fact, source, context) values
+    ('default','ks/acme-county/commission','C2 pipeline run named the commission','test','news-pipeline/run-2026-09-01');"
   echo "insert into facts (source_id, entity_slug, fact, source, expired_at) values
     ('default','people/alice-example','E1 already expired','test', now() - interval '1 day');"
   echo "commit;"
@@ -122,7 +124,7 @@ if GBX_GUARD_NEVER_ALLOW="$T/unreadable-never" "$PY" -I "$SCRIPT" refresh --dry-
 # real sweep
 "$PY" -I "$SCRIPT" sweep >"$T/sweep.out" 2>&1 || { bad "sweep runs"; cat "$T/sweep.out"; }
 eq "expired exactly A1, A2, A9 (conversation row), B1 (never-allow), C1" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at > now() - interval '1 minute'")" "A1,A2,A9,B1,C1"
-eq "allowed, fenced and other rows untouched" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at is null")" "D1,F1,K1"
+eq "allowed, fenced, pipeline-body and other rows untouched" "$(P -d gbrain -c "select string_agg(left(fact,2), ',' order by fact) from facts where expired_at is null")" "C2,D1,F1,K1"
 bk=$(ls "$T/backups"/gbx-newsroom-guard-sweep-*.jsonl 2>/dev/null | head -1)
 eq "backup has 5 lossless rows" "$(wc -l < "$bk" | tr -d ' ')" "5"
 eq "backup row carries full fact text and pre-expiry state" "$("$PY" -I -c "import json,sys; r=[json.loads(l) for l in open(sys.argv[1])]; print(all(x['expired_at'] is None and x['fact'] for x in r))" "$bk")" "True"
