@@ -102,5 +102,31 @@ describe('conversation facts extraction with the guard set', () => {
       [PER_SEGMENT_SOURCE_PREFIX],
     );
     expect(rows.map((r) => r.fact)).toEqual(['Dave took notes', 'It rained']);
+    const log = await engine.executeRaw<{ summary: string }>(
+      `SELECT summary FROM ingest_log WHERE source_type = 'facts:guard' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(log[0]?.summary ?? '').toContain('newsroom_entity_guard: dropped 1');
+  });
+
+  test('checks the RAW entity too: a newsroom name resolved into an unlisted clients/ page is dropped', async () => {
+    await engine.putPage('clients/zed-example', { type: 'company', title: 'Zed Example Co', compiled_truth: '# Zed', timeline: '', frontmatter: {} });
+    await engine.setPageAliases('clients/zed-example', 'default', ['alice example']);
+    const facts: ExtractedFact[] = [
+      { fact: 'Alice (mis-resolved) spoke', kind: 'event', entity_slug: 'Alice Example', source: 't', source_session: null, confidence: 1, notability: 'medium' },
+    ];
+    const spy = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await runExtractConversationFactsCore(engine, {
+        sourceId: 'default', slug: 'sessions/example', types: ['conversation'], sleepMs: 0,
+        extractor: async () => facts.map((f) => ({ ...f })),
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    const rows = await engine.executeRaw<{ fact: string }>(
+      `SELECT fact FROM facts WHERE source = $1 AND source_markdown_slug = 'sessions/example'`,
+      [PER_SEGMENT_SOURCE_PREFIX],
+    );
+    expect(rows.map((r) => r.fact)).toEqual([]);
   });
 });

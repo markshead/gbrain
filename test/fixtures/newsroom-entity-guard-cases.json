@@ -178,5 +178,28 @@
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": [\"clients/x\", 3]}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_keys\": null}",
   "{\"version\": 2, \"deny\": {\"alice-example\": \"p\"}, \"allow_slugs\": null}"
+ ],
+ "generator_keys": [
+  [
+   "O'Brien Example",
+   [
+    "obrien-example",
+    "o-brien-example"
+   ]
+  ],
+  [
+   "José Example",
+   [
+    "jos-example",
+    "jose-example"
+   ]
+  ],
+  [
+   "Đăng Example",
+   [
+    "ng-example",
+    "dang-example"
+   ]
+  ]
  ]
 }

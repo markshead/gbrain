@@ -1114,6 +1114,9 @@ async function processPage(
     segmentsThisPage++;
     state.result.facts_extracted += extracted.length;
 
+    // Local patch 2026-10-06 (gbxheld): keep each fact's RAW entity for the newsroom entity guard,
+    // which checks raw and resolved forms (resolution below overwrites entity_slug in place).
+    const rawEntities = extracted.map((f) => f.entity_slug);
     // This bulk path bypasses writeSingleFact and writes through insertFacts.
     // Canonicalize every extractor-provided entity via the shipped resolver
     // (alias_exact / prefix / fuzzy / slugify) while source scope is known.
@@ -1157,11 +1160,18 @@ async function processPage(
       }));
       // Local patch 2026-10-06 (gbxheld): drop rows about newsroom people or bodies on this brain's
       // guard list (gbx only; no-op without the key). row_num numbering is kept as allocated.
-      const { isNewsroomGuardedEntity } = await import('../core/facts/newsroom-entity-guard.ts');
+      const { isNewsroomGuardedEntity, logNewsroomEntityGuardDrops } = await import('../core/facts/newsroom-entity-guard.ts');
       const keep: typeof rows = [];
-      for (const row of rows) {
-        if (!row.entity_slug || !(await isNewsroomGuardedEntity(state.engine, row.entity_slug, row.entity_slug)).blocked) keep.push(row);
+      const drops: Array<{ entity: string; key: string; gbnSlug: string }> = [];
+      for (let i = 0; i < rows.length; i++) {
+        const raw = rawEntities[i] ?? null;
+        const d = raw || rows[i].entity_slug
+          ? await isNewsroomGuardedEntity(state.engine, raw, rows[i].entity_slug)
+          : { blocked: false };
+        if (d.blocked) drops.push({ entity: raw ?? rows[i].entity_slug ?? '', key: d.key ?? '', gbnSlug: d.gbnSlug ?? '' });
+        else keep.push(rows[i]);
       }
+      await logNewsroomEntityGuardDrops(state.engine, state.sourceId, page.slug, drops);
       const ins = keep.length > 0
         ? await state.engine.insertFacts(keep, { source_id: state.sourceId }) // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
         : { inserted: 0 };

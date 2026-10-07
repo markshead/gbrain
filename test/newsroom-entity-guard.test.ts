@@ -230,6 +230,12 @@ describe('writeSingleFact with the guard set', () => {
       writeSingleFact(freshEngineView(), 'default', { fact: 'guard-test-remember: alice is mayor', provenance: 'test', entity: 'Alice "Q" Example' }),
     ).rejects.toThrow(/newsroom_entity/);
   });
+  test('writes an entity whose stored slug is on allow_slugs', async () => {
+    await engine.setConfig(NEWSROOM_ENTITY_GUARD_CONFIG_KEY, GUARD_JSON);
+    const r = await writeSingleFact(freshEngineView(), 'default', { fact: 'guard-test-remember: client renewed', provenance: 'test', entity: 'clients/carol-example' });
+    expect(r.id).toBeGreaterThan(0);
+  });
+
   test('writes an allowed entity', async () => {
     await engine.setConfig(NEWSROOM_ENTITY_GUARD_CONFIG_KEY, GUARD_JSON);
     const r = await writeSingleFact(freshEngineView(), 'default', { fact: 'guard-test-remember: bob renewed', provenance: 'test', entity: 'bob-example' });

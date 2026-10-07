@@ -60,6 +60,25 @@ def norm(s):
     return s.strip('-')
 
 
+# gbrain's resolver slugifies differently from norm() (accents folded, apostrophes become '-').
+# Deny keys are generated in BOTH spellings so a stored, slugified entity still matches.
+# Mirrors slugify() in src/core/entities/resolve.ts and src/core/latin-fold.ts.
+_LATIN = {'đ': 'd', 'ð': 'd', 'ø': 'o', 'ł': 'l', 'ħ': 'h', 'ŧ': 't', 'ı': 'i', 'ß': 'ss', 'æ': 'ae', 'œ': 'oe', 'þ': 'th'}
+
+
+def slugify(s):
+    import unicodedata
+    s = unicodedata.normalize('NFKD', (s or '').lower())
+    s = re.sub('[\u0300-\u036f]', '', s)
+    s = ''.join(_LATIN.get(ch, ch) for ch in s)
+    return re.sub(r'[^a-z0-9]+', '-', s).strip('-')
+
+
+def name_keys(s):
+    """Generator-side keys for a name/slug segment: the runtime norm() form and the resolver form."""
+    return {k for k in (norm(s), slugify(s)) if k}
+
+
 def candidate_keys(s):
     keys = []
     w = norm(s)
@@ -189,11 +208,11 @@ def build(gx, gn):
         aliases.setdefault(s, []).append(a)
     deny, per_ent = {}, {}
     for slug, title, typ in ents:
-        ks = {norm(slug.rsplit('/', 1)[-1]), norm(title_name(title))}
+        ks = name_keys(slug.rsplit('/', 1)[-1]) | name_keys(title_name(title))
         if typ != 'person':
-            ks.add(norm(slug))
+            ks |= name_keys(slug)
         for a in aliases.get(slug, []):
-            ks.add(norm(a))
+            ks |= name_keys(a)
         ks = {k for k in ks if key_ok(k)}
         per_ent[slug] = (title, typ, ks)
         for k in ks:
@@ -211,7 +230,7 @@ def build(gx, gn):
         names = {n for n in names if len(n.split()) >= 2 and len(n) >= 6}
         hits = set()
         for p, txt in ad_text:
-            if '[[' + slug + ']]' in txt or '[[' + slug + '|' in txt or \
+            if '[[' + slug.lower() + ']]' in txt or '[[' + slug.lower() + '|' in txt or \
                any(re.search(r'\b' + re.escape(n) + r'\b', txt) for n in names):
                 hits.add(p)
         if hits:
@@ -295,6 +314,9 @@ def load_guard(gx):  # used by `check`
     return parse_guard(r[0] if r else None)
 
 
+SWEEPABLE = "(row_num is null or source like 'cli:extract-conversation-facts%%')"
+
+
 def old_serve_count(since):
     """How many `gbrain serve` processes started before `since` (they run pre-guard code)."""
     if not since:
@@ -313,6 +335,21 @@ def old_serve_count(since):
 
 def cmd_sweep(since, dry):
     gx, gn = conns()
+    try:
+        _sweep(gx, gn, since, dry)
+    finally:
+        try:
+            gx.rollback()
+            c = gx.cursor()
+            c.execute("select pg_advisory_unlock_all()")
+            gx.commit()
+        except Exception:
+            pass
+        gx.close()
+        gn.close()
+
+
+def _sweep(gx, gn, since, dry):
     check_brains(gx, gn)
     c = gx.cursor()
     # One sweep at a time, across hosts: a session-level Postgres advisory lock.
@@ -330,14 +367,15 @@ def cmd_sweep(since, dry):
     if g is None:
         log('sweep: REFUSED, guard config is invalid')
         sys.exit('guard config is invalid; refusing to sweep')
-    # Unfenced rows only (row_num IS NULL): a fenced row also lives in a page's markdown fence and is
-    # handled by hand. FOR UPDATE holds the rows until commit, so a concurrent change can't be
-    # overwritten by a stale decision; the UPDATE re-checks entity_slug as well.
-    q = ("select id, entity_slug from facts where expired_at is null and entity_slug <> '' "
-         "and row_num is null" + (" and created_at >= %s" if since else "") + " for update skip locked")
+    # Rows NOT owned by a page's markdown fence: row_num IS NULL (legacy DB-only rows) or a
+    # conversation-extraction row (its row_num is only a bulk key; conversations carry no fence).
+    # True fence rows are left to Phase B. FOR UPDATE holds the rows until commit; the UPDATE
+    # re-checks the same predicate and entity_slug.
+    q = ("select id, entity_slug from facts where expired_at is null and entity_slug <> '' and "
+         + SWEEPABLE + (" and created_at >= %s" if since else "") + " for update skip locked")
     c.execute(q, [since] if since else [])
     ids = [(fid, ent) for fid, ent in c.fetchall() if decide(g, ent, ent)[0]]
-    print('%d active unfenced facts blocked by the guard%s' % (len(ids), ' (dry run)' if dry else ''))
+    print('%d active unfenced facts blocked by the guard%s' % (len(ids), ' (dry run)' if dry else ''))  # "unfenced" = sweepable
     if not ids:
         gx.rollback()
         log('sweep: 0 to expire (since=%s, policy=%s, old serve processes=%s)' % (since, policy, old_serve_count(since)))
@@ -368,8 +406,8 @@ def cmd_sweep(since, dry):
         os.close(dfd)
     n = 0
     for fid, ent in ids:
-        c.execute("update facts set expired_at = now() where id = %s and expired_at is null and entity_slug = %s "
-                  "and row_num is null", (fid, ent))
+        c.execute("update facts set expired_at = now() where id = %s and expired_at is null and entity_slug = %s and "
+                  + SWEEPABLE, (fid, ent))
         n += c.rowcount
     gx.commit()
     log('sweep: expired %d facts (since=%s, policy=%s, old serve processes=%s); backup %s'
@@ -399,7 +437,12 @@ def cmd_test():
         if parse_guard(raw) is not None:
             bad += 1
             print('FAIL parse_guard(%r) should be None' % raw)
-    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs'])
+    for inp, want in cases.get('generator_keys', []):
+        got = sorted(name_keys(inp)) if 'name_keys' in globals() else []
+        if sorted(want) != got:
+            bad += 1
+            print('FAIL name_keys %r -> %r, want %r' % (inp, got, sorted(want)))
+    total = len(cases['normalize']) + len(cases['decide']) + len(cases['invalid_configs']) + len(cases.get('generator_keys', []))
     print('%d/%d passed' % (total - bad, total))
     sys.exit(1 if bad else 0)
 
