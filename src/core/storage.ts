@@ -43,6 +43,11 @@ export async function createStorage(config: StorageConfig): Promise<StorageBacke
       return new SupabaseStorage(config);
     }
     case 'local': {
+      // loadConfig() expands {database}; a literal token here means the config
+      // came through a path that skipped it — refuse rather than share a dir.
+      if (config.localPath?.includes('{database}')) {
+        throw new Error('storage.localPath still contains an unresolved {database} token');
+      }
       const { LocalStorage } = await import('./storage/local.ts');
       return new LocalStorage(config.localPath || '/tmp/gbrain-storage');
     }

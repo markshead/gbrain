@@ -857,7 +857,39 @@ export function loadConfig(): GBrainConfig | null {
     };
   }
 
+  // Resolved AFTER the env database override, so the store follows the
+  // database this process actually connects to.
+  if ((merged as GBrainConfig).storage !== undefined) {
+    (merged as GBrainConfig).storage = resolveStorageDatabaseToken(
+      (merged as GBrainConfig).storage,
+      (merged as GBrainConfig).database_url,
+    );
+  }
+
   return merged as GBrainConfig;
+}
+
+/**
+ * Expand a `{database}` token in `storage.localPath` to the database name in
+ * `databaseUrl`. One config.json can serve several brains that differ only by
+ * GBRAIN_DATABASE_URL; the token gives each its own file store, keyed to the
+ * database the process actually uses, so a forgotten per-brain env var cannot
+ * route one brain's files into another's store.
+ *
+ * Fails closed: if the token is present but no safe database name can be
+ * resolved, storage is dropped (returns undefined) and file_upload refuses
+ * with "No storage backend configured" rather than writing somewhere shared.
+ */
+export function resolveStorageDatabaseToken(storage: unknown, databaseUrl: string | undefined): unknown {
+  if (!storage || typeof storage !== 'object') return storage;
+  const localPath = (storage as { localPath?: unknown }).localPath;
+  if (typeof localPath !== 'string' || !localPath.includes('{database}')) return storage;
+  let name = '';
+  try {
+    if (databaseUrl) name = decodeURIComponent(new URL(databaseUrl).pathname.replace(/^\//, ''));
+  } catch { name = ''; }
+  if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name) || name.includes('..')) return undefined;
+  return { ...(storage as object), localPath: localPath.split('{database}').join(name) };
 }
 
 // #2119 read-side merge list re-exported so callers keep one config surface.
