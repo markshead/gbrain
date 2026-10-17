@@ -536,3 +536,56 @@ describe('storage precondition — the silent-no-op class (#4022)', () => {
     expect(src).toContain('${verified} files verified, ${mismatches} mismatches, ${missing} missing');
   });
 });
+
+describe('files verify covers every row (no fixed page cap)', () => {
+  test('more than 1000 rows are all checked', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-verify-many-'));
+    await engine.setConfig('sync.repo_path', repo);
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`EXIT:${code}`);
+    }) as never);
+    const logs: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.join(' ')); });
+    const errSpy = spyOn(console, 'error').mockImplementation((...a: unknown[]) => { logs.push(a.join(' ')); });
+    try {
+      const N = 1003;
+      for (let i = 0; i < N; i++) {
+        const rel = `many/f-${String(i).padStart(4, '0')}.txt`;
+        mkdirSync(join(repo, 'many'), { recursive: true });
+        writeFileSync(join(repo, rel), `n${i}`);
+        await engine.executeRaw(
+          `INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+           VALUES (NULL, $1, $2, 'text/plain', $3, $4, '{"storage":"git"}'::jsonb)`,
+          [basename(rel), rel, `n${i}`.length, fileHash(Buffer.from(`n${i}`))],
+        );
+      }
+      await runFiles(engine, ['verify']);
+      expect(logs.join('\n')).toContain(`${N} files verified, 0 mismatches, 0 missing`);
+    } finally {
+      logSpy.mockRestore(); errSpy.mockRestore(); exitSpy.mockRestore();
+      await engine.disconnect();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('LocalStorage.uploadFromPath', () => {
+  test('copies from disk without buffering and stays inside the root', async () => {
+    const { LocalStorage } = await import('../src/core/storage/local.ts');
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-local-copy-'));
+    const src = join(root, '..', `gbrain-src-${process.pid}.bin`);
+    writeFileSync(src, Buffer.alloc(1024 * 1024, 7));
+    try {
+      const s = new LocalStorage(root);
+      await s.uploadFromPath('page/a/big.bin', src);
+      expect(readFileSync(join(root, 'page/a/big.bin')).equals(readFileSync(src))).toBe(true);
+      await expect(s.uploadFromPath('../escape.bin', src)).rejects.toThrow('Path traversal blocked');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(src, { force: true });
+    }
+  });
+});
