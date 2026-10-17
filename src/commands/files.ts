@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync, lstatSync, existsSync, writeFileSync, unlinkSync, mkdirSync, copyFileSync } from 'fs';
+import { readFileSync, readdirSync, statSync, lstatSync, existsSync, writeFileSync, unlinkSync, mkdirSync, copyFileSync, openSync, readSync, closeSync } from 'fs';
 import { join, relative, extname, basename, dirname, resolve } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
@@ -41,8 +41,17 @@ export function getMimeType(filePath: string): string | null {
 }
 
 function fileHash(filePath: string): string {
-  const content = readFileSync(filePath);
-  return createHash('sha256').update(content).digest('hex');
+  // Streamed in 8 MiB reads: whole-file readFileSync fails (ENOMEM) on multi-GB media.
+  const hash = createHash('sha256');
+  const fd = openSync(filePath, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(8 * 1024 * 1024);
+    let n: number;
+    while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) hash.update(buf.subarray(0, n));
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 export function formatFileSizeKb(rawSizeBytes: number | bigint | string | null): string {
@@ -200,10 +209,16 @@ async function uploadFile(engine: BrainEngine, args: string[]) {
     return;
   }
 
-  const content = readFileSync(filePath);
-  const method = content.length >= SIZE_THRESHOLD ? 'TUS resumable' : 'standard';
-  console.log(`Uploading ${humanSize(stat.size)} via ${method}...`);
-  await storage.upload(storagePath, content, mimeType || undefined);
+  if (storage.uploadFromPath) {
+    // Backends that can copy from disk (local) never buffer the file in memory.
+    console.log(`Uploading ${humanSize(stat.size)} via file copy...`);
+    await storage.uploadFromPath(storagePath, filePath, mimeType || undefined);
+  } else {
+    const content = readFileSync(filePath);
+    const method = content.length >= SIZE_THRESHOLD ? 'TUS resumable' : 'standard';
+    console.log(`Uploading ${humanSize(stat.size)} via ${method}...`);
+    await storage.upload(storagePath, content, mimeType || undefined);
+  }
 
   // files.metadata is JSONB — bind a real object via executeRawJsonb instead
   // of casting a string into ::jsonb (the #2339 double-encode class).
@@ -484,7 +499,18 @@ async function syncFiles(engine: BrainEngine, dir?: string) {
 
 async function verifyFiles(engine: BrainEngine) {
   const sql = sqlQueryForEngine(engine);
-  const rows = await sql`SELECT * FROM files ORDER BY storage_path LIMIT 1000`;
+  // Every row, keyset-paginated: a fixed LIMIT silently skipped rows past the
+  // first page while still printing a pass/fail verdict for the whole brain.
+  const rows: any[] = [];
+  let after: string | null = null;
+  for (;;) {
+    const page: any[] = after === null
+      ? await sql`SELECT * FROM files ORDER BY storage_path LIMIT 1000`
+      : await sql`SELECT * FROM files WHERE storage_path > ${after} ORDER BY storage_path LIMIT 1000`;
+    rows.push(...page);
+    if (page.length < 1000) break;
+    after = String(page[page.length - 1].storage_path);
+  }
 
   if (rows.length === 0) {
     console.log('No files to verify.');

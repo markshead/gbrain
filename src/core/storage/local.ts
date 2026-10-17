@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, realpathSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, realpathSync, copyFileSync, renameSync } from 'fs';
 import { join, dirname, resolve } from 'path';
+import { randomBytes } from 'crypto';
 import type { StorageBackend } from '../storage.ts';
 
 /**
@@ -26,6 +27,18 @@ export class LocalStorage implements StorageBackend {
     const full = this.contained(path);
     mkdirSync(dirname(full), { recursive: true });
     writeFileSync(full, data);
+  }
+
+  async uploadFromPath(path: string, srcPath: string, _mime?: string): Promise<void> {
+    const full = this.contained(path);
+    mkdirSync(dirname(full), { recursive: true });
+    const tmp = `${full}.part-${process.pid}-${randomBytes(6).toString('hex')}`;
+    try {
+      copyFileSync(srcPath, tmp);
+      renameSync(tmp, full);
+    } finally {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    }
   }
 
   async download(path: string): Promise<Buffer> {

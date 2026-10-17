@@ -7,6 +7,8 @@
 
 export interface StorageBackend {
   upload(path: string, data: Buffer, mime?: string): Promise<void>;
+  /** Optional: store a file straight from disk without buffering it (multi-GB media). */
+  uploadFromPath?(path: string, srcPath: string, mime?: string): Promise<void>;
   download(path: string): Promise<Buffer>;
   delete(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
